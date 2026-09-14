@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compliance-fem"
+version = "0.2.0"
+description = "Plane-strain FEM compliance matrices for rectangular and layered-plate bodies"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Compliance FEM Contributors" }]
+dependencies = [
+    "gmsh>=4.11",
+    "scikit-fem>=12.0",
+    "meshio>=5.3",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "plotly>=5.18",
+    "orjson>=3.9",
+    "streamlit>=1.28",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+compliance-fem = "compliance_fem.cli:main"
+compliance-fem-contact-lookup = "compliance_fem.contact_lookup_cli:main"
+compliance-fem-query-contact = "compliance_fem.query_contact_lookup:main"
+visco-force-map = "compliance_fem.viscoelasticity.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

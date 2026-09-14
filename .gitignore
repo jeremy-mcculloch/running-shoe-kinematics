@@ -1,0 +1,7 @@
+outputs
+.cursor
+*/__pycache__
+*/*.egg-info
+*/*/__pycache__
+*/*/*/__pycache__
+
