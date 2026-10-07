@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from compliance_fem.viscoelasticity.factory import (
+    ElasticConfig,
     FractionalConfig,
     FungConfig,
     SLSConfig,
@@ -28,7 +29,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--model",
         required=True,
-        choices=("sls", "fractional", "fung"),
+        choices=("elastic", "sls", "fractional", "fung"),
         help="Constitutive model",
     )
     p.add_argument("--input", "-i", required=True, type=Path, help="Input CSV: time,Fx,Fy")
@@ -60,6 +61,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _config_from_args(args: argparse.Namespace, n_components: int):
+    if args.model == "elastic":
+        return ElasticConfig(n_components=n_components)
     if args.model == "sls":
         if args.g_inf is None or args.tau_r is None:
             raise SystemExit("SLS requires --g-inf and --tau-r")

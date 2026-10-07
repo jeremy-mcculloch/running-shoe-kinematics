@@ -16,7 +16,9 @@ See ``docs/viscoelasticity.md`` for mathematics, approximations, and CLI usage.
 from __future__ import annotations
 
 from compliance_fem.viscoelasticity.base import ViscoelasticForceMapper
+from compliance_fem.viscoelasticity.elastic import ElasticMaterial
 from compliance_fem.viscoelasticity.factory import (
+    ElasticConfig,
     FractionalConfig,
     FungConfig,
     MaterialConfig,
@@ -29,9 +31,11 @@ from compliance_fem.viscoelasticity.sls import SLSMaterial
 
 __all__ = [
     "ViscoelasticForceMapper",
+    "ElasticMaterial",
     "SLSMaterial",
     "FractionalMaterial",
     "FungMaterial",
+    "ElasticConfig",
     "SLSConfig",
     "FractionalConfig",
     "FungConfig",

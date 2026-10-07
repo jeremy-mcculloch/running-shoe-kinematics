@@ -1,10 +1,47 @@
-"""Cubic Euler–Bernoulli / Hermite plate assembly along the foam interface."""
+"""Cubic Euler–Bernoulli / Hermite plate assembly along the foam interface.
+
+Element frames
+--------------
+Plate nodes are ordered heel to toe. Element ``e`` joins nodes ``i -> j`` with
+
+    L_e = |X_j - X_i|,   t_e = (X_j - X_i) / L_e,   n_e = (-t_e,y, t_e,x),
+
+so ``n_e`` is ``t_e`` rotated +90 degrees (upward for a heel-to-toe plate).
+The element deflection is ``w = n_e . (u, v)`` and the nodal rotation DOF is
+``theta = dw/ds`` (counterclockwise positive), a frame-independent in-plane
+rotation shared by the elements meeting at a node. A straight plate passes a
+single ``(2,)`` normal; a curved plate passes one normal per element.
+Curvature is ``kappa = d^2 w / ds^2`` and the bending moment ``M = EI kappa``.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 from scipy import sparse
 from skfem import Basis
+
+
+def plate_element_frames(coords: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(lengths, tangents, normals)`` for consecutive plate nodes ``coords`` (2, n)."""
+    X = np.asarray(coords, dtype=float)
+    if X.ndim != 2 or X.shape[0] != 2 or X.shape[1] < 2:
+        raise ValueError("coords must have shape (2, n_plate) with n_plate >= 2.")
+    delta = np.diff(X, axis=1)
+    lengths = np.hypot(delta[0], delta[1])
+    if np.any(lengths <= 0.0):
+        raise ValueError("Plate element lengths must be positive.")
+    tangents = (delta / lengths).T
+    normals = np.column_stack([-tangents[:, 1], tangents[:, 0]])
+    return lengths, tangents, normals
+
+
+def _per_element(vec: np.ndarray, n_el: int, name: str) -> np.ndarray:
+    arr = np.asarray(vec, dtype=float)
+    if arr.shape == (2,):
+        return np.broadcast_to(arr, (n_el, 2))
+    if arr.shape == (n_el, 2):
+        return arr
+    raise ValueError(f"{name} must have shape (2,) or ({n_el}, 2); got {arr.shape}.")
 
 
 def hermite_bending_matrix(EI: float, length: float) -> np.ndarray:
@@ -86,14 +123,16 @@ def assemble_plate_bending(
     """Assemble the global plate bending matrix in the enlarged primal space.
 
     The enlarged vector is q = [d_foam, theta] with n_q = n_foam + n_plate.
-    Endpoint rotations are left free. When EI == 0 the plate rotation DOFs are
-    omitted (n_theta = 0) because they would otherwise form a spurious kernel.
+    Endpoint rotations are left free (natural condition: zero generalized end
+    moment). When EI == 0 the plate rotation DOFs are omitted (n_theta = 0)
+    because they would otherwise form a spurious kernel. ``n_p`` is one unit
+    normal (2,) for a straight plate or one per element (n_plate - 1, 2).
     """
     u_dofs = np.asarray(u_dofs, dtype=int)
     v_dofs = np.asarray(v_dofs, dtype=int)
     coords = np.asarray(coords, dtype=float)
-    n_p_vec = np.asarray(n_p, dtype=float).reshape(2)
     n_plate = int(u_dofs.size)
+    normals = _per_element(n_p, max(n_plate - 1, 0), "n_p")
     if v_dofs.size != n_plate:
         raise ValueError("u_dofs and v_dofs must have the same length.")
     if coords.shape != (2, n_plate):
@@ -128,7 +167,7 @@ def assemble_plate_bending(
             int(u_dofs[j]),
             int(v_dofs[j]),
             theta_j,
-            n_p_vec,
+            normals[i],
         )
         K_e = (T.T @ sparse.csc_matrix(K_p) @ T).tocoo()
         rows.extend(K_e.row.tolist())

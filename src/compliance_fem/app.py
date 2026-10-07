@@ -1,4 +1,4 @@
-"""Streamlit GUI for force-controlled contact-edge evaluation."""
+"""Streamlit GUI for force-controlled single-interval contact evaluation."""
 
 from __future__ import annotations
 
@@ -29,17 +29,26 @@ try:
 except Exception:
     pass
 
-from compliance_fem.config import RuntimeAngleConfig
+from compliance_fem.config import DEFAULT_LOWER_FOAM, DEFAULT_UPPER_FOAM, FOAM_MATERIALS, RuntimeAngleConfig
 from compliance_fem.contact_lookup import (
     LOOKUP_SCHEMA_VERSION,
     load_contact_lookup,
     save_contact_lookup,
 )
-from compliance_fem.contact_topology import ContactMode, ContactType
+from compliance_fem.contact_topology import (
+    CONTACT_MODE_LABELS,
+    ContactMode,
+    ContactType,
+    parse_contact_mode,
+    validate_interval,
+)
 from compliance_fem.corotation import transform_to_fixed_frame
 from compliance_fem.force_control import (
+    DISCONNECTED_CONTACT_WARNING,
+    NOT_AVAILABLE,
     Tolerances,
     angles_to_coefficients,
+    format_optional,
     evaluate_from_angles,
     export_evaluation_csv,
     export_selected_result,
@@ -102,9 +111,14 @@ def _canonical_model_params(
     softplus_a: float,
     softplus_kappa: float,
     reciprocity_tol: float,
+    measured: dict | None = None,
 ) -> dict[str, float | int]:
-    """Round floats so tiny slider noise does not bust the rebuild cache."""
-    return {
+    """Round floats so tiny slider noise does not bust the rebuild cache.
+
+    ``measured`` (measured-sole geometry only) adds the CSV path, a content hash
+    of the CSV, shoe length, foam assignment and mesh refinement settings.
+    """
+    out = {
         "L": round(float(L), 12),
         "h1_heel": round(float(h1_heel), 12),
         "h1_toe": round(float(h1_toe), 12),
@@ -124,6 +138,113 @@ def _canonical_model_params(
         "softplus_kappa": float(f"{float(softplus_kappa):.8e}"),
         "reciprocity_tol": float(f"{float(reciprocity_tol):.8e}"),
     }
+    if measured is not None:
+        csv_path = str(measured["geometry_csv"])
+        out.update(
+            {
+                "geometry_model": GEOMETRY_MODEL_MEASURED,
+                "geometry_csv": csv_path,
+                "geometry_csv_sha256": _file_sha256(csv_path),
+                "shoe_length_mm": round(float(measured["shoe_length_mm"]), 9),
+                "upper_foam_material": str(measured["upper_foam_material"]),
+                "lower_foam_material": str(measured["lower_foam_material"]),
+                "mesh_size_mm": round(float(measured["mesh_size_mm"]), 9),
+                "toe_refinement": round(float(measured["toe_refinement"]), 9),
+                "heel_corner_refinement": round(float(measured["heel_corner_refinement"]), 9),
+                "interface_refinement": round(float(measured["interface_refinement"]), 9),
+                "plate_end_refinement": round(float(measured["plate_end_refinement"]), 9),
+            }
+        )
+        for key in ("landmark_tolerance", "curvature_max_turn_deg", "min_angle_deg"):
+            if key in measured:
+                out[key] = float(f"{float(measured[key]):.10e}")
+    return out
+
+
+def _measured_draft_from_setup(setup, layered_model: dict) -> dict:
+    """Applied-model dict taking every measured-sole parameter from a JSON config.
+
+    Layered-only entries (thicknesses, nx, ny) keep their sidebar values. When
+    ``lookup.output_dir`` holds a lookup built from exactly this setup it is
+    loaded directly instead of rebuilding.
+    """
+    from compliance_fem.gui_params import gui_params_from_setup
+    from compliance_fem.measured_config_file import matching_prebuilt_lookup
+
+    p = gui_params_from_setup(setup)
+    out = _canonical_model_params(
+        L=setup.sole.L,
+        h1_heel=layered_model["h1_heel"],
+        h1_toe=layered_model["h1_toe"],
+        h2_heel=layered_model["h2_heel"],
+        h2_toe=layered_model["h2_toe"],
+        E1=p["E1"],
+        nu1=p["nu1"],
+        E_heel=p["E_heel"],
+        E_toe=p["E_toe"],
+        nu2=p["nu2"],
+        EI_plate=p["EI_plate"],
+        nx=layered_model["nx"],
+        ny1=layered_model["ny1"],
+        ny2=layered_model["ny2"],
+        element_order=layered_model["element_order"],
+        softplus_a=p["softplus_a"],
+        softplus_kappa=p["softplus_kappa"],
+        reciprocity_tol=p["reciprocity_tol"],
+        measured=p,
+    )
+    out["measured_config_file"] = str(setup.source_path)
+    prebuilt = matching_prebuilt_lookup(setup)
+    if prebuilt is not None:
+        out["prebuilt_lookup"] = str(prebuilt)
+    return out
+
+
+def _measured_config_export(draft_model: dict, setup) -> None:
+    """Download the current measured-sole parameters as a JSON config."""
+    from compliance_fem.gui_params import measured_setup_from_gui
+
+    try:
+        export = setup if setup is not None else measured_setup_from_gui(draft_model)
+        payload = json.dumps(export.to_dict(), indent=2) + "\n"
+    except (OSError, ValueError) as exc:
+        st.caption(f"Config export unavailable: {exc}")
+        return
+    st.download_button(
+        "Export measured-sole config (JSON)",
+        data=payload,
+        file_name="measured_sole_config.json",
+        mime="application/json",
+        key="gui_export_measured_config",
+        help="Writes every measured-sole parameter shown in the sidebar (absolute CSV path).",
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def _load_measured_setup(path: str, mtime: float):
+    from compliance_fem.measured_config_file import load_measured_sole_config
+
+    del mtime
+    return load_measured_sole_config(path)
+
+
+GEOMETRY_MODEL_LAYERED = "layered_plate"
+GEOMETRY_MODEL_MEASURED = "measured_sole"
+GEOMETRY_MODEL_LABELS = {
+    GEOMETRY_MODEL_LAYERED: "Layered plate (parametric thicknesses)",
+    GEOMETRY_MODEL_MEASURED: "Measured carbon-plated sole (CSV)",
+}
+DEFAULT_GEOMETRY_CSV = "data/geometry/sole_geometry_normalized.csv"
+DEFAULT_MEASURED_CONFIG = "configs/measured_sole_270mm.json"
+
+
+def _file_sha256(path: str) -> str:
+    import hashlib
+
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+    except OSError:
+        return "missing"
 
 PLATE_COLOR_OPTIONS = {
     "None": "none",
@@ -170,73 +291,44 @@ rotations.
 """
 
 CONTACT_MODE_HELP = """
-Three contiguous ground-contact topologies are stored: **heel** contact on
-`[0, l]`, **toe** contact on `[l, L]`, and **full** contact on `[0, L]`. The
-transition node `i` always belongs to the contact set.
+Ground contact is one contiguous interval of bottom nodes `I_ij = {i, ..., j}`
+(`0 <= i <= j < N_b`). Every interval is precomputed: **heel-attached**
+(`i = 0`), **toe-attached** (`j = N_b - 1`), **full** (both), and **interior**
+(neither end touches, e.g. a rocker or concave sole). The label is derived from
+`(i, j)`; all intervals use the same equations.
 
-**Auto** reads the two full-contact corner normal reactions first. Both
-compressive selects full contact immediately. A tensile heel corner routes the
-search to toe candidates, a tensile toe corner routes to heel candidates, and
-two tensile corners search both partial families. If no routed family is
-admissible the app reports that the supported topology family is insufficient -
-that happens when the true contact patch is an interior interval, which none of
-the three topologies can represent.
+**Auto** checks every interval with fixed-frame normal gaps on the free nodes
+and normal reactions on all contact nodes. It searches near the previous
+interval first, then widens, then searches globally. Continuity only breaks
+ties among admissible intervals. **Specific** forces one `(i, j)`.
 
-Full contact has no lift-off edge. Its basis modes are anchored at the numerical
-point `x_a = L/2`, which is a decomposition point only and is drawn distinctly
-from a real contact edge.
+The basis modes are anchored at the interval midpoint `x_a = (x_i + x_j)/2`
+on the reference bottom profile. This anchor is a numerical decomposition point
+(open grey cross), not a contact edge; the contact edges are `x_i` and `x_j`.
+
+The implementation supports one contiguous contact interval. If the normal
+reactions become tensile inside an otherwise active interval, or if two
+separated sole regions simultaneously contact the ground with a free region
+between them, a multi-interval contact model is required.
 """
 
 
 @st.cache_resource(show_spinner=False)
-def _build_layered_lookup(
-    L: float,
-    h1_heel: float,
-    h1_toe: float,
-    h2_heel: float,
-    h2_toe: float,
-    E1: float,
-    nu1: float,
-    E_heel: float,
-    E_toe: float,
-    nu2: float,
-    EI_plate: float,
-    nx: int,
-    ny1: int,
-    ny2: int,
-    element_order: int,
-    softplus_a: float,
-    softplus_kappa: float,
-    reciprocity_tol: float,
-):
+def _build_layered_lookup(params_json: str):
     """Rebuild FEM + lookup in a subprocess, then load the NPZ into this process.
 
+    ``params_json`` is the canonical model-parameter dict (layered or measured).
     Isolates Gmsh / SuperLU from Streamlit to avoid macOS native segfaults.
     """
     import hashlib
 
-    params = _canonical_model_params(
-        L=L,
-        h1_heel=h1_heel,
-        h1_toe=h1_toe,
-        h2_heel=h2_heel,
-        h2_toe=h2_toe,
-        E1=E1,
-        nu1=nu1,
-        E_heel=E_heel,
-        E_toe=E_toe,
-        nu2=nu2,
-        EI_plate=EI_plate,
-        nx=nx,
-        ny1=ny1,
-        ny2=ny2,
-        element_order=element_order,
-        softplus_a=softplus_a,
-        softplus_kappa=softplus_kappa,
-        reciprocity_tol=reciprocity_tol,
-    )
+    params = json.loads(params_json)
+    prebuilt = params.get("prebuilt_lookup")
+    if prebuilt and Path(prebuilt).is_file():
+        return load_contact_lookup(prebuilt)
+    key_payload = {"schema_version": LOOKUP_SCHEMA_VERSION, **params}
     key = hashlib.sha256(
-        json.dumps(params, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(key_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:20]
     cache_dir = Path(tempfile.gettempdir()) / "compliance_fem_gui_lookup_cache" / key
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -268,7 +360,7 @@ def _build_layered_lookup(
         )
         if proc.returncode != 0:
             raise RuntimeError(
-                "Layered lookup rebuild subprocess failed "
+                "Lookup rebuild subprocess failed "
                 f"(exit {proc.returncode}).\n"
                 f"stdout:\n{proc.stdout}\n"
                 f"stderr:\n{proc.stderr}"
@@ -289,6 +381,46 @@ _C2 = "#2ca02c"
 _C3 = "#d62728"
 _C5 = "#9467bd"
 _C6 = "#e377c2"
+
+
+MATERIAL_FILL_COLORS = {
+    "FFTurbo": "rgba(31, 119, 180, 0.28)",
+    "FFLeap": "rgba(255, 127, 14, 0.28)",
+}
+
+
+def _draw_measured_regions(fig, shape, _line, show_reference_geometry: bool) -> None:
+    """Measured sole: stored region loops, heel edge and foam interface (no thickness rebuild)."""
+    if show_reference_geometry:
+        for k, (name, (xr, yr)) in enumerate(shape.region_ref.items()):
+            _line(xr, yr, name="reference geometry" if k == 0 else None, color="black",
+                  width=1, dash="dash", legend=(k == 0))
+    for name, (xd, yd) in shape.region_def.items():
+        material = shape.region_materials.get(name, "")
+        fig.add_trace(
+            go.Scatter(
+                x=np.asarray(xd, dtype=float),
+                y=np.asarray(yd, dtype=float),
+                mode="lines",
+                fill="toself",
+                fillcolor=MATERIAL_FILL_COLORS.get(material, "rgba(127,127,127,0.25)"),
+                line=dict(width=0, color="rgba(0,0,0,0)"),
+                name=f"{name.replace('_', ' ')} ({material})" if material else name,
+                hoverinfo="skip",
+            )
+        )
+    if shape.heel_edge_def is not None:
+        _line(*shape.heel_edge_def, name="heel edge", color=_C0, width=1.5)
+    if shape.interface_def is not None:
+        _line(*shape.interface_def, name="foam interface", color="#7f7f7f", width=1.2, dash="dot")
+    if shape.toe_marker_xy is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=[shape.toe_marker_xy[0]], y=[shape.toe_marker_xy[1]], mode="markers",
+                name="point toe", marker=dict(symbol="star", size=9, color="#444444"),
+                hoverinfo="skip",
+            )
+        )
 
 
 def _draw_shape(
@@ -323,8 +455,12 @@ def _draw_shape(
             )
         )
 
+    measured = bool(getattr(shape, "is_measured", False))
+    if measured:
+        _draw_measured_regions(fig, shape, _line, show_reference_geometry)
+
     # Reference (undeformed, unrotated) geometry.
-    if show_reference_geometry:
+    if show_reference_geometry and not measured:
         if shape.y_plate_ref is None:
             _line(
                 [0, shape.L, shape.L, 0, 0],
@@ -364,20 +500,21 @@ def _draw_shape(
             )
 
     # Rotated / deformed foam fill.
-    poly_x = np.concatenate([x_bot_d, x_top_d[::-1], x_bot_d[:1]])
-    poly_y = np.concatenate([shape.y_bottom_def, shape.y_top_def[::-1], shape.y_bottom_def[:1]])
-    fig.add_trace(
-        go.Scatter(
-            x=poly_x,
-            y=poly_y,
-            mode="lines",
-            fill="toself",
-            fillcolor="rgba(31, 119, 180, 0.20)",
-            line=dict(width=0, color="rgba(0,0,0,0)"),
-            name="rotated/deformed",
-            hoverinfo="skip",
+    if not measured:
+        poly_x = np.concatenate([x_bot_d, x_top_d[::-1], x_bot_d[:1]])
+        poly_y = np.concatenate([shape.y_bottom_def, shape.y_top_def[::-1], shape.y_bottom_def[:1]])
+        fig.add_trace(
+            go.Scatter(
+                x=poly_x,
+                y=poly_y,
+                mode="lines",
+                fill="toself",
+                fillcolor="rgba(31, 119, 180, 0.20)",
+                line=dict(width=0, color="rgba(0,0,0,0)"),
+                name="rotated/deformed",
+                hoverinfo="skip",
+            )
         )
-    )
 
     # Plate: Hermite superposition when available, otherwise schematic interface.
     if shape.has_plate:
@@ -477,20 +614,21 @@ def _draw_shape(
 
     _line(x_top_d, shape.y_top_def, name="deformed top", color=_C0, width=2)
     _line(x_bot_d, shape.y_bottom_def, name="deformed bottom", color=_C1, width=2)
-    _line(
-        [x_bot_d[0], x_top_d[0]],
-        [shape.y_bottom_def[0], shape.y_top_def[0]],
-        color=_C0,
-        width=1.5,
-        legend=False,
-    )
-    _line(
-        [x_bot_d[-1], x_top_d[-1]],
-        [shape.y_bottom_def[-1], shape.y_top_def[-1]],
-        color=_C0,
-        width=1.5,
-        legend=False,
-    )
+    if not measured:
+        _line(
+            [x_bot_d[0], x_top_d[0]],
+            [shape.y_bottom_def[0], shape.y_top_def[0]],
+            color=_C0,
+            width=1.5,
+            legend=False,
+        )
+        _line(
+            [x_bot_d[-1], x_top_d[-1]],
+            [shape.y_bottom_def[-1], shape.y_top_def[-1]],
+            color=_C0,
+            width=1.5,
+            legend=False,
+        )
     if show_chord:
         _line(
             shape.chord_x,
@@ -501,8 +639,8 @@ def _draw_shape(
             dash="dashdot",
         )
 
-    # Ground line, contact interval, free interval(s), and the contact edge or
-    # the numerical full-contact anchor.
+    # Ground line, contact interval along the deformed (curved) bottom, free
+    # bottom segments, contact edges, and the numerical interval anchor.
     x_pad = 0.05 * shape.L
     _line(
         [-x_pad, shape.L + x_pad],
@@ -511,51 +649,73 @@ def _draw_shape(
         color="#4d4d4d",
         width=1,
     )
+    i_c, j_c = shape.contact_start_index, shape.contact_end_index
     span_lo, span_hi = shape.contact_span
     _line(
-        [span_lo, span_hi],
-        [shape.ground_y, shape.ground_y],
-        name=f"{shape.contact_type} contact [{span_lo:.3g}, {span_hi:.3g}]",
+        shape.contact_curve_x,
+        shape.contact_curve_y,
+        name=f"{shape.contact_type} contact {{{i_c}..{j_c}}}, x in [{span_lo:.3g}, {span_hi:.3g}]",
         color=_C3,
         width=6,
     )
-    for k, (free_lo, free_hi) in enumerate(shape.free_spans):
+    for k, (fx_c, fy_c) in enumerate(shape.free_curves):
         _line(
-            [free_lo, free_hi],
-            [shape.ground_y, shape.ground_y],
+            fx_c,
+            fy_c,
             name="free bottom" if k == 0 else None,
             color=_C2,
-            width=6,
+            width=3,
+            dash="dash",
             legend=(k == 0),
         )
-    if shape.is_anchor_only:
-        # Open square: x_a is a numerical basis anchor, not a lift-off edge.
+    if shape.contact_node_x is not None and shape.contact_node_x.size:
         fig.add_trace(
             go.Scatter(
-                x=[shape.anchor_x],
-                y=[shape.ground_y],
-                mode="markers",
-                name=f"numerical anchor x_a=L/2 (x_rot={shape.x_anchor_rot:.4g})",
-                marker=dict(
-                    symbol="square-open",
-                    size=11,
-                    color="#404040",
-                    line=dict(width=1.5, color="#404040"),
-                ),
+                x=shape.contact_node_x, y=shape.contact_node_y, mode="markers",
+                name="contact nodes", marker=dict(symbol="circle", size=5, color=_C3),
                 hoverinfo="skip",
             )
         )
-    else:
+    if shape.free_node_x is not None and shape.free_node_x.size:
         fig.add_trace(
             go.Scatter(
-                x=[shape.l],
-                y=[shape.ground_y],
-                mode="markers",
-                name=f"contact edge l (x_rot={shape.x_contact_rot:.4g})",
-                marker=dict(symbol="circle", size=9, color=_C3),
+                x=shape.free_node_x, y=shape.free_node_y, mode="markers",
+                name="free nodes", marker=dict(symbol="circle-open", size=5, color=_C2),
                 hoverinfo="skip",
             )
         )
+    for label, pt, sym in (
+        ("heel contact edge x_i", shape.heel_edge_xy, "triangle-right"),
+        ("toe contact edge x_j", shape.toe_edge_xy, "triangle-left"),
+    ):
+        if pt is not None:
+            fig.add_trace(
+                go.Scatter(
+                    x=[pt[0]], y=[pt[1]], mode="markers", name=label,
+                    marker=dict(symbol=sym, size=12, color=_C3, line=dict(width=1, color="black")),
+                    hoverinfo="skip",
+                )
+            )
+    adj = [p for p in (shape.heel_adjacent_xy, shape.toe_adjacent_xy) if p is not None]
+    if adj:
+        fig.add_trace(
+            go.Scatter(
+                x=[p[0] for p in adj], y=[p[1] for p in adj], mode="markers",
+                name="adjacent free nodes", marker=dict(symbol="diamond-open", size=10, color=_C2),
+                hoverinfo="skip",
+            )
+        )
+    # Open grey cross: the interval midpoint is a numerical anchor, not a contact edge.
+    fig.add_trace(
+        go.Scatter(
+            x=[shape.anchor_xy[0]],
+            y=[shape.anchor_xy[1]],
+            mode="markers",
+            name=f"neutral anchor x_a=(x_i+x_j)/2 (numerical; x_rot={shape.x_anchor_rot:.4g})",
+            marker=dict(symbol="x-thin-open", size=11, color="#7f7f7f", line=dict(width=2, color="#7f7f7f")),
+            hoverinfo="skip",
+        )
+    )
 
     # Applied / resultant force direction in the fixed frame.
     fx, fy = shape.force_vector
@@ -620,40 +780,21 @@ def _draw_shape(
     return fig
 
 
-def _diag_plot(x, y, xlabel, ylabel, title, admissible=None, selected=None):
-    fig, ax = plt.subplots(figsize=(6, 3))
-    ax.plot(x, y, "-o", markersize=3)
-    has_legend = False
-    if admissible is not None and np.any(admissible):
-        ax.plot(x[admissible], np.asarray(y)[admissible], "o", color="C2", label="admissible")
-        has_legend = True
-    if selected is not None and selected >= 0:
-        ax.axvline(x[selected], color="C3", ls="--", label="selected")
-        has_legend = True
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-    if has_legend:
-        ax.legend(fontsize=8)
-    fig.tight_layout()
-    return fig
-
-
 def _fmt_ms(seconds: float) -> str:
     return f"{1000.0 * seconds:.1f} ms"
 
 
 def main() -> None:
     st.set_page_config(page_title="Contact topology lookup", layout="wide")
-    st.title("Force-controlled contact evaluation (heel / full / toe, co-rotating top frame)")
+    st.title("Force-controlled single-interval contact evaluation (co-rotating top frame)")
     st.caption(
         "Geometry and materials rebuild the layered FEM compliance and contact lookup in-process. "
         "Fx, Fy in the sidebar are fixed-frame ground reaction forces: leftward/upward "
         "positive (solver top resultants use the opposite signs). φ is the absolute "
         "heel-to-toe chord angle and θ drives the single softplus shape mode through "
-        "α = tan(θ). Selection uses fixed-frame normal gaps, normal reactions, and the "
-        "two full-contact corner reactions only (never R_t, T_toe, or x_cm)."
+        "α = tan(θ). The contact set is one contiguous interval of bottom nodes; selection "
+        "uses fixed-frame normal gaps on every free node and normal reactions on every "
+        "contact node (never R_t, T_toe, or x_cm)."
     )
     with st.expander("What do φ and θ mean?", expanded=False):
         st.markdown(HELP_TEXT)
@@ -662,16 +803,81 @@ def main() -> None:
 
     with st.sidebar:
         with st.expander("Geometry", expanded=False):
-            L_mm = dual_linear(
-                "Shoe length (mm)",
-                key="gui_L_mm",
-                min_value=L_MM_MIN,
-                max_value=L_MM_MAX,
-                default=m_to_mm(DEFAULTS.L),
-                step=1.0,
-                fmt="%.1f",
+            geometry_model = st.radio(
+                "Geometry model",
+                list(GEOMETRY_MODEL_LABELS),
+                format_func=GEOMETRY_MODEL_LABELS.get,
+                index=0,
+                key="gui_geometry_model",
             )
+            is_measured = geometry_model == GEOMETRY_MODEL_MEASURED
+            measured_setup = None
+            if is_measured:
+                source = st.radio(
+                    "Measured-sole parameters from",
+                    ["Sidebar controls", "Config file (JSON)"],
+                    key="gui_measured_source",
+                    horizontal=True,
+                    help=(
+                        "Config file: shoe length, materials, plate EI, mesh, a and κ all come from "
+                        "the JSON file (the sidebar values for those are ignored)."
+                    ),
+                )
+                if source == "Config file (JSON)":
+                    config_path = st.text_input(
+                        "Config file", value=DEFAULT_MEASURED_CONFIG, key="gui_measured_config"
+                    )
+                    try:
+                        cfg_file = Path(config_path)
+                        measured_setup = _load_measured_setup(
+                            str(cfg_file.resolve()), cfg_file.stat().st_mtime
+                        )
+                    except (OSError, ValueError) as exc:
+                        st.error(f"Cannot use config: {exc}")
+                    if measured_setup is not None:
+                        s = measured_setup.sole
+                        st.caption(
+                            f"L = {s.shoe_length_mm:g} mm · {s.upper_foam_material} / {s.lower_foam_material} · "
+                            f"EI = {s.EI_plate:g} N·m² · mesh {s.mesh_size * 1e3:g} mm · "
+                            f"a = {measured_setup.a * 1e3:.1f} mm · κ = {measured_setup.kappa:g} 1/m"
+                        )
+                geometry_csv = st.text_input(
+                    "Geometry CSV",
+                    value=DEFAULT_GEOMETRY_CSV,
+                    key="gui_geometry_csv",
+                    help="Normalized sole CSV (x/L, y/L; heel-to-toe x, upward y).",
+                )
+                L_mm = dual_linear(
+                    "Overall shoe length (mm)",
+                    key="gui_shoe_length_mm",
+                    min_value=L_MM_MIN,
+                    max_value=L_MM_MAX,
+                    default=270.0,
+                    step=1.0,
+                    fmt="%.1f",
+                    help="Projected heel-bottom-to-toe-tip length (not the outsole arc length).",
+                )
+                upper_foam = st.selectbox(
+                    "Upper foam material", list(FOAM_MATERIALS), index=list(FOAM_MATERIALS).index(DEFAULT_UPPER_FOAM),
+                    key="gui_upper_foam",
+                )
+                lower_foam = st.selectbox(
+                    "Lower foam material", list(FOAM_MATERIALS), index=list(FOAM_MATERIALS).index(DEFAULT_LOWER_FOAM),
+                    key="gui_lower_foam",
+                )
+            else:
+                L_mm = dual_linear(
+                    "Shoe length (mm)",
+                    key="gui_L_mm",
+                    min_value=L_MM_MIN,
+                    max_value=L_MM_MAX,
+                    default=m_to_mm(DEFAULTS.L),
+                    step=1.0,
+                    fmt="%.1f",
+                )
             L = mm_to_m(L_mm)
+            if is_measured:
+                st.caption("Layer thicknesses below apply to the layered model only.")
             h1_heel = mm_to_m(
                 dual_linear(
                     "FFTurbo thickness at heel (mm)",
@@ -798,6 +1004,23 @@ def main() -> None:
             )
 
         with st.expander("Mesh parameters", expanded=False):
+            measured_mesh: dict = {}
+            if is_measured:
+                measured_mesh["mesh_size_mm"] = dual_linear(
+                    "Mesh size (mm)", key="gui_mesh_size_mm", min_value=1.0, max_value=8.0,
+                    default=3.0, step=0.1, fmt="%.2f",
+                )
+                for key, label, default in (
+                    ("toe_refinement", "Toe refinement (× mesh size)", 0.4),
+                    ("heel_corner_refinement", "Heel-corner refinement (× mesh size)", 0.5),
+                    ("interface_refinement", "Interface refinement (× mesh size)", 0.6),
+                    ("plate_end_refinement", "Plate-end refinement (× mesh size)", 0.4),
+                ):
+                    measured_mesh[key] = dual_linear(
+                        label, key=f"gui_{key}", min_value=0.1, max_value=1.0,
+                        default=default, step=0.05, fmt="%.2f",
+                    )
+                st.caption("Element counts below apply to the layered model only.")
             nx = int(
                 dual_linear(
                     "Elements along x direction",
@@ -872,7 +1095,24 @@ def main() -> None:
             softplus_a=softplus_a,
             softplus_kappa=softplus_kappa,
             reciprocity_tol=reciprocity_tol,
+            measured=(
+                {
+                    "geometry_csv": geometry_csv,
+                    "shoe_length_mm": L_mm,
+                    "upper_foam_material": upper_foam,
+                    "lower_foam_material": lower_foam,
+                    **measured_mesh,
+                }
+                if is_measured
+                else None
+            ),
         )
+        if is_measured and measured_setup is not None:
+            draft_model = _measured_draft_from_setup(measured_setup, draft_model)
+            if "prebuilt_lookup" in draft_model:
+                st.caption(f"Using the matching prebuilt lookup {draft_model['prebuilt_lookup']}.")
+        if is_measured:
+            _measured_config_export(draft_model, measured_setup)
         if _APPLIED_MODEL_KEY not in st.session_state:
             st.session_state[_APPLIED_MODEL_KEY] = draft_model
 
@@ -880,7 +1120,18 @@ def main() -> None:
         # these widgets deletes their backend state while the frontend still
         # shows the old slider positions — exactly the "plot uses defaults"
         # bug. Persist copies under non-widget keys as well.
-        contact_mode = ContactMode.AUTO
+        with st.expander("Contact interval", expanded=False):
+            mode_label = st.radio(
+                "Contact mode",
+                list(CONTACT_MODE_LABELS.values()),
+                index=0,
+                key="gui_contact_mode",
+                help="Auto searches every stored interval; the others restrict or force it.",
+            )
+            contact_mode = parse_contact_mode(mode_label)
+            specific_i = st.number_input("Specific interval start i", min_value=0, value=0, step=1, key="gui_specific_i")
+            specific_j = st.number_input("Specific interval end j", min_value=0, value=0, step=1, key="gui_specific_j")
+            st.caption("Start/end indices are used only in Specific mode (validated: 0 ≤ i ≤ j < N_b).")
 
         with st.expander("Loads & angles", expanded=False):
             phi_deg = st.slider(
@@ -1018,30 +1269,11 @@ def main() -> None:
 
     t_rebuild0 = time.perf_counter()
     with st.spinner(
-        "Building layered FEM compliance + contact lookup in a subprocess…"
+        "Building FEM compliance + contact lookup in a subprocess…"
         if not cache_hit
         else "Loading cached model…"
     ):
-        lookup = _build_layered_lookup(
-            L=float(applied_model["L"]),
-            h1_heel=float(applied_model["h1_heel"]),
-            h1_toe=float(applied_model["h1_toe"]),
-            h2_heel=float(applied_model["h2_heel"]),
-            h2_toe=float(applied_model["h2_toe"]),
-            E1=float(applied_model["E1"]),
-            nu1=float(applied_model["nu1"]),
-            E_heel=float(applied_model["E_heel"]),
-            E_toe=float(applied_model["E_toe"]),
-            nu2=float(applied_model["nu2"]),
-            EI_plate=float(applied_model["EI_plate"]),
-            nx=int(applied_model["nx"]),
-            ny1=int(applied_model["ny1"]),
-            ny2=int(applied_model["ny2"]),
-            element_order=int(applied_model["element_order"]),
-            softplus_a=float(applied_model["softplus_a"]),
-            softplus_kappa=float(applied_model["softplus_kappa"]),
-            reciprocity_tol=float(applied_model["reciprocity_tol"]),
-        )
+        lookup = _build_layered_lookup(json.dumps(applied_model, sort_keys=True))
     t_rebuild = time.perf_counter() - t_rebuild0
     st.session_state["_layered_lookup_key"] = model_key
     if cache_hit:
@@ -1124,7 +1356,8 @@ def main() -> None:
         st.markdown(f"**cos(varphi) − 1** = `{r_x:.6g}`,  **−sin(varphi)** = `{r_y:.6g}`")
         st.caption(
             "γ = [α, d_ax, d_ay, cos(varphi)−1, −sin(varphi)] in saved basis order "
-            "(top_shape_phi1, contact_translation_x/y, contact_rotation_x/y)."
+            "(top_shape_alpha, contact_translation_x/y, contact_rotation_x/y); the "
+            "curved-sole closure column has a fixed coefficient of 1."
         )
 
         st.subheader("Model summary (SI)")
@@ -1150,22 +1383,46 @@ def main() -> None:
                 "schema_version": lookup.schema_version,
                 "geometry_type": lookup.geometry_type,
                 "phi_ref_deg": float(np.rad2deg(lookup.phi_ref)),
+                "contact_set_model": "single_contiguous_interval",
+                "n_bottom_nodes": int(lookup.n_bottom_nodes),
                 "n_records": lookup.n_records,
+                "n_valid_records": int(np.count_nonzero(lookup.valid_mask)),
                 "n_heel": int(lookup.rows_for(ContactType.HEEL).size),
+                "n_interior": int(lookup.rows_for(ContactType.INTERIOR).size),
                 "n_toe": int(lookup.rows_for(ContactType.TOE).size),
                 "n_full": int(lookup.rows_for(ContactType.FULL).size),
-                "full_contact_anchor_x": lookup.full_contact_anchor_x,
+                "lookup_build_time_s": float(getattr(lookup, "build_time_s", float("nan")) or float("nan")),
                 "has_plate_response": bool(lookup.has_plate_response),
                 "LOOKUP_SCHEMA_VERSION": LOOKUP_SCHEMA_VERSION,
             }
         )
+        if getattr(lookup, "is_measured", False):
+            gm = lookup.geometry_metadata
+            st.subheader("Measured geometry")
+            st.write(
+                {
+                    "source_geometry_filename": gm.get("source_geometry_filename"),
+                    "shoe_length_mm": gm.get("shoe_length_mm"),
+                    "upper_foam_material": gm.get("upper_foam_material"),
+                    "lower_foam_material": gm.get("lower_foam_material"),
+                    "plate_arc_length_m": gm.get("plate_arc_length_m"),
+                    "corner_interior_angles_deg": gm.get("corner_interior_angles_deg"),
+                    "region_areas_m2": gm.get("region_areas_m2"),
+                    "mesh_quality": gm.get("mesh_quality"),
+                    "shared_toe_policy": gm.get("shared_toe_policy"),
+                    "n_top_nodes": int(lookup.n_top_nodes),
+                    "n_bottom_nodes": int(lookup.n_bottom_nodes),
+                }
+            )
 
     tolerances = Tolerances(tau_g=tau_g, tau_R=tau_R, kf_cond_warn=kf_cond_warn)
 
     # Proximity to the previous selection is a final tie-breaker only; it exists
     # so the rendered topology does not flicker between numerically
     # indistinguishable candidates as the sliders move.
-    previous_index = st.session_state.get("previous_edge_node_id")
+    previous_interval = st.session_state.get("previous_contact_interval")
+    if previous_interval is not None and int(previous_interval[1]) >= int(lookup.n_bottom_nodes):
+        previous_interval = None
 
     # Re-read query snapshot after the (possibly long) model rebuild so the plot
     # always matches the sidebar widgets, not stale defaults.
@@ -1173,6 +1430,15 @@ def main() -> None:
     theta_deg = float(st.session_state["gui_query_theta_deg"])
     Fx = float(st.session_state["gui_query_Fx"])
     Fy = float(st.session_state["gui_query_Fy"])
+
+    specific = None
+    if contact_mode is ContactMode.SPECIFIC:
+        specific = (int(specific_i), int(specific_j))
+        try:
+            validate_interval(specific[0], specific[1], int(lookup.n_bottom_nodes))
+        except ValueError as exc:
+            st.error(f"Invalid specific interval: {exc}")
+            st.stop()
 
     t0 = time.perf_counter()
     selection = evaluate_from_angles(
@@ -1183,7 +1449,8 @@ def main() -> None:
         theta_deg,
         tolerances=tolerances,
         mode=contact_mode,
-        previous_index=previous_index,
+        previous_interval=previous_interval,
+        specific_interval=specific,
     )
     t_calc = time.perf_counter() - t0
 
@@ -1193,7 +1460,7 @@ def main() -> None:
             f"Calculation time: {_fmt_ms(t_calc)}; model rebuild: {_fmt_ms(t_rebuild)}"
         )
         st.stop()
-    st.session_state["previous_edge_node_id"] = selection.selected_index
+    st.session_state["previous_contact_interval"] = selection.interval
 
     if selection.approximate:
         st.warning(selection.message)
@@ -1206,9 +1473,8 @@ def main() -> None:
             f"(cond={selection.kf_cond:.3e}). No regularization was applied."
         )
 
-    na = "N/A"
-    is_full = selection.is_full_contact
-    span_lo, span_hi = selection.contact_span(lookup.L)
+    na = NOT_AVAILABLE
+    span_lo, span_hi = selection.contact_span()
 
     t1 = time.perf_counter()
     shape = build_shape_plot_data(
@@ -1259,6 +1525,7 @@ def main() -> None:
             float(selection.d_ay),
             float(selection.varphi),
             elastic_scale=1.0,
+            y_anchor=float(selection.anchor_y),
         )
         u_tr = float(np.asarray(x_def).reshape(-1)[0] - x_ref)
         v_tr = float(np.asarray(y_def).reshape(-1)[0] - y_ref)
@@ -1313,52 +1580,42 @@ def main() -> None:
     st.caption(shape.caption)
     t_shape_render = time.perf_counter() - t2
 
+    _num = format_optional
+
     with st.expander("Detailed outputs", expanded=False):
         cols = st.columns(4)
-        cols[0].metric("Contact type", selection.contact_type.value)
-        cols[1].metric("Contact interval", f"[{span_lo:.4g}, {span_hi:.4g}]")
-        cols[2].metric("Material contact edge l", na if is_full else f"{selection.l:.6g}")
-        cols[3].metric(
-            "Rotated contact coordinate",
-            na if is_full else f"{selection.x_contact_rot:.6g}",
-        )
+        cols[0].metric("Topology label", selection.topology_label)
+        cols[1].metric("Interval (i, j)", f"({selection.contact_start_index}, {selection.contact_end_index})")
+        cols[2].metric("Contact x_i … x_j", f"[{span_lo:.4g}, {span_hi:.4g}]")
+        cols[3].metric("Neutral anchor x_a (numerical)", f"{selection.anchor_x:.6g}")
+        cols = st.columns(4)
+        cols[0].metric("Heel-edge R_n^F", _num(selection.heel_edge_normal_reaction))
+        cols[1].metric("Toe-edge R_n^F", _num(selection.toe_edge_normal_reaction))
+        cols[2].metric("Heel adjacent free gap", _num(selection.heel_adjacent_free_gap))
+        cols[3].metric("Toe adjacent free gap", _num(selection.toe_adjacent_free_gap))
         cols = st.columns(4)
         cols[0].metric(
-            "Heel corner R_n^F (x=0)",
-            na if selection.Rn_heel_corner is None else f"{selection.Rn_heel_corner:.6g}",
+            "Min free gap (node)",
+            na if selection.min_free_gap_node < 0 else f"{selection.min_free_gap:.6g} (#{selection.min_free_gap_node})",
         )
-        cols[1].metric(
-            "Toe corner R_n^F (x=L)",
-            na if selection.Rn_toe_corner is None else f"{selection.Rn_toe_corner:.6g}",
-        )
-        cols[2].metric("Full contact valid", str(selection.full_contact_valid))
-        cols[3].metric(
-            "Full valid (all reactions)", str(selection.full_contact_valid_strict)
-        )
-        cols = st.columns(4)
-        cols[0].metric(
-            "Edge-free gap g^F",
-            na if not selection.has_free_edge else f"{selection.edge_free_gap:.6g}",
-        )
-        cols[1].metric(
-            "Edge-contact R_n^F",
-            na if is_full else f"{selection.edge_contact_reaction_normal:.6g}",
-        )
+        cols[1].metric("Max free penetration", _num(selection.max_free_penetration))
         cols[2].metric(
-            "Max free-surface penetration",
-            na if is_full else f"{max(0.0, -selection.min_free_gap):.6g}",
+            "Min contact R_n^F (node)",
+            f"{selection.min_contact_reaction:.6g} (#{selection.min_contact_reaction_node})",
         )
-        cols[3].metric("Min contact R_n^F", f"{selection.min_contact_reaction:.6g}")
+        cols[3].metric("Max contact tension", _num(selection.max_contact_tension))
         cols = st.columns(4)
-        cols[0].metric("Force reconstruction error", f"{selection.force_residual:.3e}")
-        cols[1].metric("cond(K_F)", f"{selection.kf_cond:.3e}")
+        cols[0].metric("Force reconstruction error", _num(selection.force_reconstruction_error, ".3e"))
+        cols[1].metric("Force-control cond(K_F)", _num(selection.force_control_condition_number, ".3e"))
         cols[2].metric("Admissible", str(selection.exactly_admissible))
-        cols[3].metric("Violation J", f"{selection.violation_score:.3e}")
+        cols[3].metric("Candidate violation score", _num(selection.candidate_violation_score, ".3e"))
         cols = st.columns(4)
-        cols[0].metric("Anchor x_a", f"{selection.anchor_x:.6g}")
+        cols[0].metric("Search method", selection.candidate_search_method)
         cols[1].metric("Rotated anchor x_a,rot", f"{selection.x_anchor_rot:.6g}")
-        cols[2].metric("d_ax", f"{selection.d_ax:.6g}")
-        cols[3].metric("d_ay", f"{selection.d_ay:.6g}")
+        cols[2].metric("Anchor translation d_ax", f"{selection.d_ax:.6g}")
+        cols[3].metric("Anchor translation d_ay", f"{selection.d_ay:.6g}")
+        if selection.disconnected_contact_warning:
+            st.warning(DISCONNECTED_CONTACT_WARNING)
         cols = st.columns(4)
         cols[0].metric(
             "Fx* / reconstructed GRF (fixed)",
@@ -1372,20 +1629,14 @@ def main() -> None:
         cols[3].metric("x_cm − x_a (fixed)", f"{selection.x_cm_rel:.6g}")
         cols = st.columns(4)
         cols[0].metric("Toe moment about (a, H_a)", f"{selection.T_toe:.6g}")
-        cols[1].metric(
-            "R_t at edge (tangential)",
-            na if is_full else f"{selection.edge_contact_reaction_tangential:.6g}",
-        )
-        cols[2].metric("# admissible in family", str(selection.n_admissible))
-        cols[3].metric(
-            "Routed families", "/".join(k.value for k in selection.routed_families)
-        )
+        cols[1].metric("Complementarity score", _num(selection.complementarity_score, ".3e"))
+        cols[2].metric("# admissible intervals", str(selection.n_admissible))
+        cols[3].metric("Contact nodes", str(selection.contact_end_index - selection.contact_start_index + 1))
         st.caption(
-            f"Routing: {selection.routing_reason} "
+            "Absent adjacent nodes (interval touching the heel or toe end) are shown as N/A. "
             "x_cm uses the visualization gauge r_a^F = (x_a, 0); only x_cm − x_a is gauge "
-            "independent. R_t may take either sign because contact remains perfectly sticking. "
-            "Full-contact validity is the corner-only criterion; the all-reaction column is a "
-            "stricter diagnostic that never replaces it."
+            "independent. Tangential reactions may take either sign because contact remains "
+            "perfectly sticking. The anchor x_a is a decomposition point, not a contact edge."
         )
 
     with st.expander("Plate results", expanded=False):
@@ -1417,62 +1668,34 @@ def main() -> None:
     if show_diagnostics:
         t3 = time.perf_counter()
         ev = selection.evaluation
-        adm = ev.admissible & ev.well_conditioned
         figs = []
         try:
-            # Heel and toe families share the l axis, so they are plotted separately;
-            # the single full-contact record has no l and is annotated instead.
-            for family in (ContactType.HEEL, ContactType.TOE):
-                rows = ev.rows_for(family)
-                if rows.size == 0:
-                    continue
-                sel_local = (
-                    int(np.flatnonzero(rows == selection.selected_row)[0])
-                    if selection.selected_row in rows
-                    else -1
-                )
-                x = ev.l[rows]
-                for values, ylabel, title in (
-                    (ev.violation_score[rows], "J", f"{family.value}: violation score J(l)"),
-                    (ev.min_free_gap[rows], "min g^F", f"{family.value}: minimum free gap"),
-                    (
-                        ev.min_contact_reaction[rows],
-                        "min R_n^F",
-                        f"{family.value}: minimum contact reaction",
-                    ),
-                    (ev.d_ax[rows], "d_ax", f"{family.value}: anchor translation d_ax(l)"),
-                    (ev.d_ay[rows], "d_ay", f"{family.value}: anchor translation d_ay(l)"),
-                    (ev.x_cm[rows], "x_cm", f"{family.value}: fixed-frame center of effort"),
-                    (ev.T_toe[rows], "T_toe", f"{family.value}: toe moment"),
-                    (ev.kf_cond[rows], "cond(K_F)", f"{family.value}: conditioning of K_F(l)"),
-                ):
-                    figs.append(
-                        _diag_plot(x, values, "l", ylabel, title, adm[rows], sel_local)
-                    )
+            n_b = int(lookup.n_bottom_nodes)
+            starts, ends = ev.contact_start_index, ev.contact_end_index
+            for values, title in (
+                (np.log10(np.maximum(ev.violation_score, 1e-30)), "log10 violation score V(i, j)"),
+                (ev.admissible.astype(float), "admissible intervals (1 = admissible)"),
+                (ev.min_free_gap, "minimum free gap g^F(i, j)"),
+                (ev.min_contact_reaction, "minimum contact R_n^F(i, j)"),
+            ):
+                grid = np.full((n_b, n_b), np.nan)
+                ok = ev.evaluated & np.isfinite(values)
+                grid[ends[ok], starts[ok]] = values[ok]
+                fig, ax = plt.subplots(figsize=(5, 4))
+                im = ax.imshow(grid, origin="lower", aspect="auto", interpolation="nearest")
+                ax.plot([selection.contact_start_index], [selection.contact_end_index], "rx", ms=10)
+                ax.set_xlabel("start index i")
+                ax.set_ylabel("end index j")
+                ax.set_title(title)
+                fig.colorbar(im, ax=ax)
+                fig.tight_layout()
+                figs.append(fig)
 
-            full_row = ev.full_contact_row
-            fig, ax = plt.subplots(figsize=(6, 3))
-            ax.bar(
-                ["heel corner (x=0)", "toe corner (x=L)"],
-                [ev.Rn_heel_corner[full_row], ev.Rn_toe_corner[full_row]],
-                color=["C0", "C1"],
-            )
-            ax.axhline(0.0, color="0.3", lw=1)
-            ax.set_ylabel("R_n^F")
-            ax.set_title(
-                f"Full-contact corner normal reactions "
-                f"(valid={bool(ev.full_contact_valid[full_row])}, "
-                f"J={ev.violation_score[full_row]:.3e})"
-            )
-            ax.grid(True, alpha=0.3, axis="y")
-            fig.tight_layout()
-            figs.append(fig)
-
-            marker_x = selection.anchor_x if selection.is_full_contact else selection.l
-            marker_style = ":" if selection.is_full_contact else "--"
             fig, ax = plt.subplots(figsize=(6, 3))
             ax.plot(lookup.x_bottom, selection.full_bottom_gap, "-o", markersize=3)
-            ax.axvline(marker_x, color="C3", ls=marker_style)
+            for xe in (span_lo, span_hi):
+                ax.axvline(xe, color="C3", ls="--")
+            ax.axvline(selection.anchor_x, color="0.5", ls=":")
             ax.set_title(
                 f"Selected ({selection.contact_type.value}) bottom fixed-frame normal gap"
             )
@@ -1495,7 +1718,8 @@ def main() -> None:
                 markersize=3,
                 label="R_t^F",
             )
-            ax.axvline(marker_x, color="C3", ls=marker_style)
+            for xe in (span_lo, span_hi):
+                ax.axvline(xe, color="C3", ls="--")
             ax.set_title(
                 f"Selected ({selection.contact_type.value}) bottom nodal reaction force "
                 "(not pressure)"

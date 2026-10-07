@@ -23,7 +23,12 @@ def _run(params: dict, output_dir: Path) -> Path:
         generate_contact_lookup,
         save_contact_lookup,
     )
-    from compliance_fem.gui_params import build_layered_config_from_gui
+    from compliance_fem.gui_params import build_layered_config_from_gui, measured_setup_from_gui
+    from compliance_fem.measured_config_file import build_measured_lookup
+
+    if params.get("geometry_model") == "measured_sole":
+        _, _, npz = build_measured_lookup(measured_setup_from_gui(params), output_dir)
+        return npz
 
     cfg = build_layered_config_from_gui(
         L_m=float(params["L"]),

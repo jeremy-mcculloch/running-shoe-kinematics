@@ -30,6 +30,7 @@ compliance-fem = "compliance_fem.cli:main"
 compliance-fem-contact-lookup = "compliance_fem.contact_lookup_cli:main"
 compliance-fem-query-contact = "compliance_fem.query_contact_lookup:main"
 visco-force-map = "compliance_fem.viscoelasticity.cli:main"
+compliance-fem-gait-replay = "compliance_fem.gait.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 import streamlit as st
 
-from compliance_fem.config import LayeredPlateConfig
+from compliance_fem.config import LayeredPlateConfig, MeasuredSoleConfig
 
 
 @dataclass(frozen=True)
@@ -69,7 +69,7 @@ KAPPA_MIN = 1.0
 KAPPA_MAX = 1000.0
 FX_N_MIN = -1.0e3
 FX_N_MAX = 1.0e3
-FY_N_MIN = -1.0e4
+FY_N_MIN = -2.0e4  # GUI vertical GRF max = 20 kN upward
 FY_N_MAX = 0.0
 
 
@@ -283,6 +283,83 @@ def dual_log(
     val = float(10.0 ** float(log_val))
     st.session_state[key] = val
     return val
+
+
+def build_measured_config_from_gui(params: dict) -> MeasuredSoleConfig:
+    """Measured-sole config from canonical GUI params (SI moduli, mm lengths)."""
+    return MeasuredSoleConfig(
+        shoe_length_mm=float(params["shoe_length_mm"]),
+        geometry_csv=str(params["geometry_csv"]),
+        upper_foam_material=str(params["upper_foam_material"]),
+        lower_foam_material=str(params["lower_foam_material"]),
+        ffturbo_E=float(params["E1"]),
+        ffturbo_nu=float(params["nu1"]),
+        ffleap_E_heel=float(params["E_heel"]),
+        ffleap_E_toe=float(params["E_toe"]),
+        ffleap_nu=float(params["nu2"]),
+        EI_plate=float(params["EI_plate"]),
+        mesh_size=mm_to_m(float(params["mesh_size_mm"])),
+        toe_refinement=float(params["toe_refinement"]),
+        heel_corner_refinement=float(params["heel_corner_refinement"]),
+        interface_refinement=float(params["interface_refinement"]),
+        plate_end_refinement=float(params["plate_end_refinement"]),
+        **{
+            k: float(params[k])
+            for k in ("landmark_tolerance", "curvature_max_turn_deg", "min_angle_deg")
+            if k in params
+        },
+    )
+
+
+def measured_setup_from_gui(params: dict, toe_config=None, shoe_width_m: float | None = None):
+    """Full measured-sole setup (JSON-config equivalent) from canonical GUI params."""
+    from compliance_fem.measured_config_file import (
+        LookupSettings,
+        MeasuredSoleSetup,
+        RuntimeSettings,
+    )
+    from compliance_fem.toe_spring import ToeSpringConfig
+
+    runtime = RuntimeSettings() if shoe_width_m is None else RuntimeSettings(shoe_width_m=float(shoe_width_m))
+    return MeasuredSoleSetup(
+        sole=build_measured_config_from_gui(params),
+        lookup=LookupSettings(
+            a_over_length=None,
+            a_m=float(params["softplus_a"]),
+            kappa=float(params["softplus_kappa"]),
+            reciprocity_tol=float(params["reciprocity_tol"]),
+        ),
+        toe_spring=toe_config or ToeSpringConfig(),
+        runtime=runtime,
+    )
+
+
+def gui_params_from_setup(setup) -> dict:
+    """Canonical GUI measured params (SI moduli, mm lengths) from a config setup."""
+    s = setup.sole
+    return {
+        "geometry_csv": str(s.geometry_csv),
+        "shoe_length_mm": float(s.shoe_length_mm),
+        "upper_foam_material": s.upper_foam_material,
+        "lower_foam_material": s.lower_foam_material,
+        "E1": float(s.ffturbo_E),
+        "nu1": float(s.ffturbo_nu),
+        "E_heel": float(s.ffleap_E_heel),
+        "E_toe": float(s.ffleap_E_toe),
+        "nu2": float(s.ffleap_nu),
+        "EI_plate": float(s.EI_plate),
+        "mesh_size_mm": float(s.mesh_size) * 1000.0,
+        "toe_refinement": float(s.toe_refinement),
+        "heel_corner_refinement": float(s.heel_corner_refinement),
+        "interface_refinement": float(s.interface_refinement),
+        "plate_end_refinement": float(s.plate_end_refinement),
+        "landmark_tolerance": float(s.landmark_tolerance),
+        "curvature_max_turn_deg": float(s.curvature_max_turn_deg),
+        "min_angle_deg": float(s.min_angle_deg),
+        "softplus_a": float(setup.a),
+        "softplus_kappa": float(setup.kappa),
+        "reciprocity_tol": float(setup.lookup.reciprocity_tol),
+    }
 
 
 def build_layered_config_from_gui(

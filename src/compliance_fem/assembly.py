@@ -118,6 +118,41 @@ def assemble_layered_foam_stiffness(
     return K, basis, K1, K2
 
 
+def assemble_region_foam_stiffness(
+    mesh: Mesh,
+    region_elements: dict[str, np.ndarray],
+    region_materials: dict,
+    L: float,
+    order: int = 1,
+) -> tuple[sparse.csc_matrix, Basis, dict[str, sparse.csc_matrix]]:
+    """Plane-strain ``K = sum_r K_r``, each region with its own material.
+
+    ``region_materials[name]`` is a :class:`compliance_fem.config.FoamMaterial`;
+    its modulus ``E(x)`` is evaluated at quadrature points (constant unless the
+    material is graded heel to toe). Every element must belong to exactly one region.
+    """
+    element = _vector_element(mesh, order)
+    basis = Basis(mesh, element)
+    n_el = int(mesh.t.shape[1])
+    owner = np.full(n_el, -1, dtype=int)
+    for k, name in enumerate(region_elements):
+        idx = np.asarray(region_elements[name], dtype=int)
+        if np.any(owner[idx] >= 0):
+            raise ValueError(f"Elements are assigned to more than one foam region ({name}).")
+        owner[idx] = k
+    if np.any(owner < 0):
+        raise ValueError(f"{int(np.count_nonzero(owner < 0))} elements belong to no foam region.")
+    blocks: dict[str, sparse.csc_matrix] = {}
+    K = None
+    for name, idx in region_elements.items():
+        mat = region_materials[name]
+        sub = Basis(mesh, element, elements=np.asarray(idx, dtype=int))
+        K_r = spatially_varying_plane_strain(mat.E_heel, mat.E_toe, L, mat.nu).assemble(sub).tocsc()
+        blocks[name] = K_r
+        K = K_r if K is None else K + K_r
+    return K.tocsc(), basis, blocks
+
+
 def integrate_lower_modulus(mesh: Mesh, config: LayeredPlateConfig) -> float:
     """Return ∫_{Ω2} E2(x) dA using the same quadrature as stiffness assembly."""
     lower = subdomain_elements(mesh, "lower_foam")

@@ -44,9 +44,7 @@ SHAPE_MODE_SIGN = 1.0
 N_BASIS_COEFFICIENTS = 5
 
 # Runtime coefficient names in saved basis order. The two translation entries
-# are the anchor translation solved from the force-controlled 2x2 system: the
-# contact-edge translation d_l for heel/toe contact and the numerical anchor
-# translation d_a for full contact.
+# are the interval-anchor translation solved from the force-controlled 2x2 system.
 BASIS_COEFFICIENT_NAMES = (
     "alpha_tan_theta",
     "d_anchor_x",
@@ -147,12 +145,11 @@ def basis_coefficients(
     """Return gamma = [tan(theta), d_ax, d_ay, cos(varphi) - 1, -sin(varphi)].
 
     The ordering matches the saved basis ordering
-    ``(top_shape_phi1, contact_translation_x, contact_translation_y,
+    ``(top_shape_alpha, contact_translation_x, contact_translation_y,
     contact_rotation_x, contact_rotation_y)``.
 
-    ``(d_ax, d_ay)`` is the anchor translation from the force-controlled 2x2
-    solve: the contact-edge translation ``d_l`` for heel and toe contact, and
-    the numerical anchor translation ``d_a`` for full contact.
+    ``(d_ax, d_ay)`` is the interval-anchor translation from the
+    force-controlled 2x2 solve.
     """
     r_x, r_y = rotation_coefficients(varphi)
     return np.array([float(alpha), float(d_ax), float(d_ay), r_x, r_y], dtype=float)
@@ -167,6 +164,23 @@ def known_coefficients(alpha: float, varphi: float) -> np.ndarray:
     return basis_coefficients(alpha, 0.0, 0.0, varphi)
 
 
+N_AFFINE_COEFFICIENTS = N_BASIS_COEFFICIENTS + 1
+
+
+def affine_coefficients(gamma: np.ndarray) -> np.ndarray:
+    """Prepend the fixed closure coefficient: ``[1, gamma_0..gamma_4]``."""
+    g = np.asarray(gamma, dtype=float).reshape(-1)
+    if g.size == N_AFFINE_COEFFICIENTS:
+        if g[0] != 1.0:
+            raise ValueError("Affine coefficient vectors must have column-0 coefficient exactly 1.")
+        return g
+    if g.size != N_BASIS_COEFFICIENTS:
+        raise ValueError(
+            f"gamma must have {N_BASIS_COEFFICIENTS} entries in saved basis order, got {g.size}."
+        )
+    return np.concatenate([[1.0], g])
+
+
 def contract_basis(basis: np.ndarray, gamma: np.ndarray, mode_axis: int = 0) -> np.ndarray:
     """Contract the mode axis of ``basis`` with ``gamma``.
 
@@ -176,26 +190,49 @@ def contract_basis(basis: np.ndarray, gamma: np.ndarray, mode_axis: int = 0) -> 
     Parameters
     ----------
     basis
-        Array with a length-5 mode axis at ``mode_axis``.
+        Array whose ``mode_axis`` has length 6 (affine storage: column 0 is the
+        curved-sole closure with coefficient 1, columns 1-5 the linear modes) or
+        length 5 (linear modes only).
     gamma
-        Length-5 runtime coefficient vector in saved basis order.
+        Length-5 runtime coefficient vector in saved basis order. For an affine
+        basis the closure coefficient 1 is prepended here, exactly once.
     mode_axis
         Axis of ``basis`` holding the basis modes. Defaults to the leading axis.
     """
     g = np.asarray(gamma, dtype=float).reshape(-1)
-    if g.size != N_BASIS_COEFFICIENTS:
-        raise ValueError(
-            f"gamma must have {N_BASIS_COEFFICIENTS} entries in saved basis order, got {g.size}."
-        )
     arr = np.asarray(basis, dtype=float)
     axis = mode_axis if mode_axis >= 0 else arr.ndim + mode_axis
     if axis < 0 or axis >= arr.ndim:
         raise ValueError(f"mode_axis={mode_axis} is out of range for array with ndim={arr.ndim}.")
-    if arr.shape[axis] != N_BASIS_COEFFICIENTS:
+    n_axis = arr.shape[axis]
+    if n_axis == N_AFFINE_COEFFICIENTS:
+        g = affine_coefficients(g)
+    elif n_axis == N_BASIS_COEFFICIENTS:
+        if g.size != N_BASIS_COEFFICIENTS:
+            raise ValueError(
+                f"gamma must have {N_BASIS_COEFFICIENTS} entries in saved basis order, got {g.size}."
+            )
+    else:
         raise ValueError(
-            f"basis axis {axis} has length {arr.shape[axis]}; expected {N_BASIS_COEFFICIENTS}."
+            f"basis axis {axis} has length {n_axis}; expected "
+            f"{N_AFFINE_COEFFICIENTS} (affine) or {N_BASIS_COEFFICIENTS} (linear)."
         )
     return np.tensordot(g, arr, axes=([0], [axis]))
+
+
+def contract_affine_rows(basis_rows: np.ndarray, gamma_rows: np.ndarray) -> np.ndarray:
+    """Row-wise affine contraction ``out[r, ...] = basis[r, 0, ...] + sum_k gamma[r, k] basis[r, k+1, ...]``.
+
+    ``basis_rows`` has shape ``(n_rows, 6, ...)`` and ``gamma_rows`` ``(n_rows, 5)``.
+    """
+    B = np.asarray(basis_rows, dtype=float)
+    G = np.asarray(gamma_rows, dtype=float)
+    if B.shape[1] != N_AFFINE_COEFFICIENTS or G.shape[-1] != N_BASIS_COEFFICIENTS:
+        raise ValueError("contract_affine_rows expects (n, 6, ...) basis and (n, 5) gamma.")
+    tail = B.shape[2:]
+    flat = B.reshape(B.shape[0], N_AFFINE_COEFFICIENTS, -1)
+    out = flat[:, 0, :] + np.einsum("rk,rkm->rm", G, flat[:, 1:, :])
+    return out.reshape((B.shape[0], *tail))
 
 
 def contact_displacement(
@@ -204,17 +241,19 @@ def contact_displacement(
     d_ax: float,
     d_ay: float,
     varphi: float,
+    y_contact: np.ndarray | None = None,
+    y_anchor: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Exact prescribed contact displacement in the rotating frame.
 
-    ``d_c^T(x) = d_a^T + (Q(varphi)^T - I)(X - X_a)`` on the horizontal bottom:
+    ``d_c^T(x) = d_a^T + (Q(varphi)^T - I)(x - x_a, 0) + (0, -(y - y_a))``:
 
         u_c = d_ax + (cos(varphi) - 1)(x - x_anchor)
-        v_c = d_ay - sin(varphi)(x - x_anchor)
+        v_c = d_ay - sin(varphi)(x - x_anchor) - (y - y_anchor)
 
-    ``x_anchor`` is the contact edge ``l_i`` for heel or toe contact and the
-    numerical anchor ``L/2`` for full contact; the expression is identical for
-    all three topologies, with no sign branching on the topology.
+    The last term is the curved-sole closure (zero for a flat sole); it is
+    independent of ``varphi`` and is not rotated. The expression is identical
+    for every interval, with no sign branching on the topology.
 
     The apparent infinitesimal axial strain in the ``u_c`` term is an accepted
     approximation of this project; it is not replaced by a small-angle form.
@@ -222,7 +261,11 @@ def contact_displacement(
     x = np.asarray(x_contact, dtype=float)
     ds = x - float(x_anchor)
     r_x, r_y = rotation_coefficients(varphi)
-    return float(d_ax) + r_x * ds, float(d_ay) + r_y * ds
+    u = float(d_ax) + r_x * ds
+    v = float(d_ay) + r_y * ds
+    if y_contact is not None:
+        v = v - (np.asarray(y_contact, dtype=float) - float(y_anchor))
+    return u, v
 
 
 def transform_to_fixed_frame(
@@ -236,6 +279,7 @@ def transform_to_fixed_frame(
     varphi: float,
     anchor: tuple[float, float] = None,
     elastic_scale: float = 1.0,
+    y_anchor: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map rotating-frame material points to the fixed frame.
 
@@ -245,15 +289,14 @@ def transform_to_fixed_frame(
     ``r^F = r_a^F + Q(varphi)[(X + d^T) - (X_a + d_a^T)]``. Larger values
     exaggerate only the elastic part; the rigid rotation is never scaled.
 
-    ``x_anchor`` is the contact edge ``l_i`` for heel or toe contact and the
-    numerical full-contact anchor ``L/2``. ``anchor`` is the visualization and
-    reporting gauge ``r_a^F``; it defaults to the reference ground coordinate
-    ``(x_anchor, 0)``.
+    ``X_a = (x_anchor, y_anchor)`` is the interval-midpoint anchor on the
+    reference bottom profile. ``anchor`` is the visualization and reporting
+    gauge ``r_a^F``; it defaults to the ground point ``(x_anchor, 0)``.
     """
     if anchor is None:
         anchor = (float(x_anchor), 0.0)
     dx = np.asarray(x_ref, dtype=float) - float(x_anchor)
-    dy = np.asarray(y_ref, dtype=float) - 0.0
+    dy = np.asarray(y_ref, dtype=float) - float(y_anchor)
     du = np.asarray(u_local, dtype=float) - float(d_ax)
     dv = np.asarray(v_local, dtype=float) - float(d_ay)
     s = float(elastic_scale)

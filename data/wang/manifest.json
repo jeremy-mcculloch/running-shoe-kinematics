@@ -1,0 +1,25 @@
+{
+  "article_doi": "https://doi.org/10.1038/s41597-025-05113-6",
+  "records": {
+    "c3d": {
+      "doi": "https://doi.org/10.17608/k6.auckland.27015301",
+      "figshare_article_id": 27015301,
+      "note": "Raw C3D motion-capture + forces"
+    },
+    "trc": {
+      "doi": "https://doi.org/10.17608/k6.auckland.27015298",
+      "figshare_article_id": 27015298,
+      "note": "OpenSim TRC marker trajectories"
+    },
+    "mot": {
+      "doi": "https://doi.org/10.17608/k6.auckland.27015517",
+      "figshare_article_id": 27015517,
+      "note": "OpenSim MOT ground reactions"
+    },
+    "csv": {
+      "doi": "https://doi.org/10.17608/k6.auckland.27015535",
+      "figshare_article_id": 27015535,
+      "note": "CSV exports"
+    }
+  }
+}

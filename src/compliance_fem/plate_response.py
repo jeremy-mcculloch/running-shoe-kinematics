@@ -26,8 +26,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy import sparse
 
-from compliance_fem.boundaries import build_vector_selector, vector_boundary_data
-from compliance_fem.contact_basis import N_BASIS_MODES
+from compliance_fem.boundaries import build_vector_selector
+from compliance_fem.contact_basis import N_AFFINE_COLUMNS
 from compliance_fem.corotation import (
     basis_coefficients,
     contract_basis,
@@ -252,15 +252,25 @@ def extract_plate_mesh_info(result: ComplianceResult) -> PlateMeshInfo:
     if result.x_plate is None or result.y_plate is None:
         raise ValueError("ComplianceResult is missing plate reference coordinates.")
     cfg = result.config
-    if not hasattr(cfg, "plate_tangent"):
-        raise ValueError("Plate mesh extraction requires a LayeredPlateConfig.")
+    if result.plate_node_ids is not None and not hasattr(cfg, "plate_tangent"):
+        node_ids = np.asarray(result.plate_node_ids, dtype=int)
+        p = np.asarray(result.basis.mesh.p, dtype=float)
+        x = p[0, node_ids].copy()
+        y = p[1, node_ids].copy()
+        chord = np.array([x[-1] - x[0], y[-1] - y[0]], dtype=float)
+        t_ref = chord / float(np.linalg.norm(chord))
+        n_ref = np.array([-t_ref[1], t_ref[0]], dtype=float)
+    elif hasattr(cfg, "plate_tangent"):
+        from compliance_fem.layered_geometry import ordered_interface_nodes
 
-    from compliance_fem.layered_geometry import ordered_interface_nodes
-
-    # Use the same mesh that produced the factorization so DOF indices match.
-    node_ids, x, y = ordered_interface_nodes(result.basis.mesh, cfg)
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
+        # Use the same mesh that produced the factorization so DOF indices match.
+        node_ids, x, y = ordered_interface_nodes(result.basis.mesh, cfg)
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        t_ref = np.asarray(cfg.plate_tangent, dtype=float).reshape(2)
+        n_ref = np.asarray(cfg.plate_normal, dtype=float).reshape(2)
+    else:
+        raise ValueError("Plate mesh extraction requires a plated (layered or measured) model.")
     if not np.allclose(x, result.x_plate, atol=1e-8) or not np.allclose(y, result.y_plate, atol=1e-8):
         raise ValueError(
             "Live plate coordinates disagree with ComplianceResult.x_plate/y_plate; "
@@ -284,8 +294,8 @@ def extract_plate_mesh_info(result: ComplianceResult) -> PlateMeshInfo:
     lengths = np.zeros(n_constraints, dtype=float)
     tangents = np.zeros((n_constraints, 2), dtype=float)
     normals = np.zeros((n_constraints, 2), dtype=float)
-    t_cfg = np.asarray(cfg.plate_tangent, dtype=float).reshape(2)
-    n_cfg = np.asarray(cfg.plate_normal, dtype=float).reshape(2)
+    t_cfg = t_ref
+    n_cfg = n_ref
     for e in range(n_constraints):
         i, j = int(conn[e, 0]), int(conn[e, 1])
         delta = np.array([x[j] - x[i], y[j] - y[i]], dtype=float)
@@ -341,8 +351,8 @@ def recover_primal_from_boundary_forces(
     n_lambda = int(result.n_lambda or 0)
     n_extra = n_lambda + 3
 
-    u_top, v_top, _, _ = vector_boundary_data(result.basis, "top")
-    u_bot, v_bot, _, _ = vector_boundary_data(result.basis, "bottom")
+    u_top, v_top = result.selector_dofs("top")
+    u_bot, v_bot = result.selector_dofs("bottom")
     S_top = build_vector_selector(u_top, v_top, n_q)
     S_bottom = build_vector_selector(u_bot, v_bot, n_q)
 
@@ -466,16 +476,17 @@ def recover_plate_basis_for_record(
     x_r: float = 0.0,
     y_r: float = 0.0,
 ) -> PlateBasisFields:
-    """Recover five-mode plate fields for one contact record.
+    """Recover plate fields for one contact record by direct per-column solves.
 
-    ``F_t``, ``F_c``, ``W_t``, ``W_c`` have shape ``(n_dof, 5)``.
-    When ``Alpha`` (shape ``(3, 5)``) is provided, the free-body particular
-    solution is completed by the same rigid motion used in the boundary solve so
-    that recovered boundary traces match ``W_t`` / ``W_c``.
+    ``F_t``, ``F_c``, ``W_t``, ``W_c`` have shape ``(n_dof, n_cols)`` (six affine
+    columns for schema v9+). When ``Alpha`` (shape ``(3, n_cols)``) is provided,
+    the free-body particular solution is completed by the same rigid motion used
+    in the boundary solve so that recovered boundary traces match ``W_t`` / ``W_c``.
+    This is the reference path that :func:`plate_basis_from_influence` is checked against.
     """
     del x_top, x_contact  # reserved for callers / future residual diagnostics
     verify_plate_orientation(mesh)
-    n_modes = N_BASIS_MODES
+    n_modes = int(np.asarray(F_t).shape[1])
     n_nodes = mesh.n_nodes
     n_el = mesh.n_elements
     u_b = np.zeros((n_modes, n_nodes))
@@ -487,9 +498,9 @@ def recover_plate_basis_for_record(
     top_res = np.zeros(n_modes)
     contact_res = np.zeros(n_modes)
 
-    u_top, v_top, _, _ = vector_boundary_data(result.basis, "top")
+    u_top, v_top = result.selector_dofs("top")
     S_top = build_vector_selector(u_top, v_top, mesh.n_primal)
-    u_bot, v_bot, _, _ = vector_boundary_data(result.basis, "bottom")
+    u_bot, v_bot = result.selector_dofs("bottom")
     contact = np.asarray(contact_nodes, dtype=int)
     if contact.size:
         S_c = build_vector_selector(u_bot[contact], v_bot[contact], mesh.n_primal)
@@ -538,6 +549,138 @@ def recover_plate_basis_for_record(
     )
 
 
+@dataclass
+class PlateInfluence:
+    """Plate fields per unit boundary load / unit rigid amplitude.
+
+    Columns of the load blocks follow the stacked boundary load
+    ``[F_t (2 n_t); F_bottom (2 n_b)]`` (component-major); the rigid blocks have
+    the three columns of ``vector_rigid_mode_matrix`` about ``(x_r, y_r)``. All
+    blocks come from one multi-RHS solve of the factorized augmented free-body
+    operator, so per-record plate recovery is a pair of small matrix products.
+    """
+
+    n_top: int
+    n_bottom: int
+    u: np.ndarray  # (n_plate, 2 n_t + 2 n_b)
+    v: np.ndarray
+    theta: np.ndarray
+    lam: np.ndarray  # (n_el, 2 n_t + 2 n_b)
+    bp: np.ndarray  # (n_constraint_rows, 2 n_t + 2 n_b)
+    top: np.ndarray  # (2 n_t, 2 n_t + 2 n_b)
+    bottom: np.ndarray  # (2 n_b, 2 n_t + 2 n_b)
+    rigid_u: np.ndarray  # (n_plate, 3)
+    rigid_v: np.ndarray
+    rigid_theta: np.ndarray
+    rigid_bp: np.ndarray
+    rigid_top: np.ndarray
+    rigid_bottom: np.ndarray
+
+
+def build_plate_influence(
+    result: ComplianceResult,
+    mesh: PlateMeshInfo,
+    *,
+    x_r: float,
+    y_r: float,
+) -> PlateInfluence:
+    """Precompute plate influence matrices with a single multi-RHS factorized solve."""
+    if result.factorization is None or result.basis is None or result.n_primal is None:
+        raise ValueError("ComplianceResult must retain factorization, basis, and n_primal.")
+    verify_plate_orientation(mesh)
+    n_q = int(result.n_primal)
+    n_lambda = int(result.n_lambda or 0)
+    n_extra = n_lambda + 3
+    u_top, v_top = result.selector_dofs("top")
+    u_bot, v_bot = result.selector_dofs("bottom")
+    S_top = build_vector_selector(u_top, v_top, n_q)
+    S_bottom = build_vector_selector(u_bot, v_bot, n_q)
+    loads = sparse.hstack([S_top.T, S_bottom.T]).tocsc()
+    rhs = np.zeros((n_q + n_extra, loads.shape[1]), dtype=float)
+    rhs[:n_q] = loads.toarray()
+    sol = np.asarray(result.factorization.solve(rhs), dtype=float)
+    q = sol[:n_q]
+    lam_raw = sol[n_q : n_q + n_lambda] if n_lambda else np.zeros((0, loads.shape[1]))
+    lam = np.zeros((mesh.n_elements, loads.shape[1]), dtype=float)
+    n_copy = min(lam_raw.shape[0], mesh.n_elements)
+    lam[:n_copy] = lam_raw[:n_copy]
+    has_theta = bool(np.all(mesh.rotation_dof_ids >= 0))
+    B = result.B_p
+    assert B is not None
+
+    q_rigid = np.column_stack(
+        [rigid_primal_from_alpha(result, mesh, e, x_r, y_r) for e in np.eye(3)]
+    )
+    return PlateInfluence(
+        n_top=int(u_top.size),
+        n_bottom=int(u_bot.size),
+        u=q[mesh.u_dof_ids],
+        v=q[mesh.v_dof_ids],
+        theta=q[mesh.rotation_dof_ids] if has_theta else np.zeros((mesh.n_nodes, q.shape[1])),
+        lam=lam,
+        bp=np.asarray(B @ q, dtype=float),
+        top=np.asarray(S_top @ q, dtype=float),
+        bottom=np.asarray(S_bottom @ q, dtype=float),
+        rigid_u=q_rigid[mesh.u_dof_ids],
+        rigid_v=q_rigid[mesh.v_dof_ids],
+        rigid_theta=q_rigid[mesh.rotation_dof_ids] if has_theta else np.zeros((mesh.n_nodes, 3)),
+        rigid_bp=np.asarray(B @ q_rigid, dtype=float),
+        rigid_top=np.asarray(S_top @ q_rigid, dtype=float),
+        rigid_bottom=np.asarray(S_bottom @ q_rigid, dtype=float),
+    )
+
+
+def plate_basis_from_influence(
+    influence: PlateInfluence,
+    F_t: np.ndarray,
+    F_c: np.ndarray,
+    contact_nodes: np.ndarray,
+    Alpha: np.ndarray,
+    W_t: np.ndarray,
+    W_c: np.ndarray,
+) -> PlateBasisFields:
+    """Plate fields for one record from precomputed influence matrices (no solves)."""
+    F_t = np.asarray(F_t, dtype=float)
+    n_cols = F_t.shape[1]
+    contact = np.asarray(contact_nodes, dtype=int)
+    n_b = influence.n_bottom
+    F_bottom = np.zeros((2 * n_b, n_cols), dtype=float)
+    if contact.size:
+        n_c = int(contact.size)
+        F_bottom[contact] = F_c[:n_c]
+        F_bottom[contact + n_b] = F_c[n_c:]
+    loads = np.vstack([F_t, F_bottom])
+    Al = np.asarray(Alpha, dtype=float)
+    u = influence.u @ loads + influence.rigid_u @ Al
+    v = influence.v @ loads + influence.rigid_v @ Al
+    th = influence.theta @ loads + influence.rigid_theta @ Al
+    lam = influence.lam @ loads
+    bp = influence.bp @ loads + influence.rigid_bp @ Al
+    top = influence.top @ loads + influence.rigid_top @ Al
+    W_t = np.asarray(W_t, dtype=float)
+    W_c = np.asarray(W_c, dtype=float)
+    top_res = np.linalg.norm(top - W_t, axis=0) / np.maximum(np.linalg.norm(W_t, axis=0), 1.0)
+    if contact.size:
+        bottom = influence.bottom @ loads + influence.rigid_bottom @ Al
+        rows = np.concatenate([contact, contact + n_b])
+        denom = np.maximum.reduce(
+            [np.linalg.norm(W_c, axis=0), np.linalg.norm(W_t, axis=0), np.ones(n_cols)]
+        )
+        contact_res = np.linalg.norm(bottom[rows] - W_c, axis=0) / denom
+    else:
+        contact_res = np.zeros(n_cols)
+    return PlateBasisFields(
+        u_local=u.T.copy(),
+        v_local=v.T.copy(),
+        rotation_local=th.T.copy(),
+        constraint_multiplier=lam.T.copy(),
+        axial_force=axial_force_from_multiplier(lam.T),
+        bp_residual=np.linalg.norm(bp, axis=0),
+        top_bc_residual=top_res,
+        contact_bc_residual=contact_res,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Runtime superposition and Hermite rendering
 # ---------------------------------------------------------------------------
@@ -560,11 +703,23 @@ def nodal_tangential_normal(
     v: np.ndarray,
     mesh: PlateMeshInfo,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (u_s, w) using the global plate tangent/normal."""
-    t = mesh.plate_tangent
-    n = mesh.plate_normal
-    u_s = t[0] * u + t[1] * v
-    w = n[0] * u + n[1] * v
+    """Return nodal (u_s, w) in node-averaged element frames.
+
+    Each node uses the normalized mean of its adjacent element tangents, which
+    reduces to the global plate tangent for a straight plate.
+    """
+    u = np.asarray(u, dtype=float)
+    v = np.asarray(v, dtype=float)
+    if mesh.n_elements == 0:
+        t = np.broadcast_to(mesh.plate_tangent, (u.size, 2))
+    else:
+        acc = np.zeros((mesh.n_nodes, 2), dtype=float)
+        conn = mesh.element_connectivity
+        np.add.at(acc, conn[:, 0], mesh.element_tangents)
+        np.add.at(acc, conn[:, 1], mesh.element_tangents)
+        t = acc / np.linalg.norm(acc, axis=1, keepdims=True)
+    u_s = t[:, 0] * u + t[:, 1] * v
+    w = -t[:, 1] * u + t[:, 0] * v
     return u_s, w
 
 
@@ -668,6 +823,7 @@ def build_plate_runtime_state(
     elastic_scale: float = 1.0,
     samples_per_element: int = DEFAULT_SAMPLES_PER_ELEMENT,
     color_quantity: str = "none",
+    anchor_y: float = 0.0,
 ) -> PlateRuntimeState:
     """Contract plate basis fields and build Hermite fixed-frame samples."""
     gamma = np.asarray(gamma, dtype=float).reshape(-1)
@@ -714,6 +870,7 @@ def build_plate_runtime_state(
         float(d_ay),
         float(varphi),
         elastic_scale=float(elastic_scale),
+        y_anchor=float(anchor_y),
     )
     rot_fixed = np.asarray(samples["rotation_local"], dtype=float) + float(varphi)
     # Unwrap for continuous plotting.
@@ -785,15 +942,16 @@ def build_plate_runtime_state(
 
 def empty_plate_basis(n_nodes: int, n_elements: int) -> PlateBasisFields:
     """NaN plate basis for records when FEM recovery is unavailable."""
+    C = N_AFFINE_COLUMNS
     return PlateBasisFields(
-        u_local=np.full((N_BASIS_MODES, n_nodes), np.nan),
-        v_local=np.full((N_BASIS_MODES, n_nodes), np.nan),
-        rotation_local=np.full((N_BASIS_MODES, n_nodes), np.nan),
-        constraint_multiplier=np.full((N_BASIS_MODES, n_elements), np.nan),
-        axial_force=np.full((N_BASIS_MODES, n_elements), np.nan),
-        bp_residual=np.full(N_BASIS_MODES, np.nan),
-        top_bc_residual=np.full(N_BASIS_MODES, np.nan),
-        contact_bc_residual=np.full(N_BASIS_MODES, np.nan),
+        u_local=np.full((C, n_nodes), np.nan),
+        v_local=np.full((C, n_nodes), np.nan),
+        rotation_local=np.full((C, n_nodes), np.nan),
+        constraint_multiplier=np.full((C, n_elements), np.nan),
+        axial_force=np.full((C, n_elements), np.nan),
+        bp_residual=np.full(C, np.nan),
+        top_bc_residual=np.full(C, np.nan),
+        contact_bc_residual=np.full(C, np.nan),
     )
 
 
@@ -871,27 +1029,22 @@ def plate_state_for_selection(
     mesh = plate_mesh_from_lookup(lookup)
     if mesh is None:
         return None
-    bases = (
-        lookup.plate_u_local_basis,
-        lookup.plate_v_local_basis,
-        lookup.plate_rotation_local_basis,
-        lookup.plate_constraint_multiplier_basis,
-        lookup.plate_axial_force_basis,
-    )
-    if any(b is None for b in bases):
+    row = int(row)
+    try:
+        f = lookup.record_fields([row], plate=True)
+    except ValueError:
         return None
 
-    row = int(row)
     gamma = basis_coefficients(
         selection.alpha, selection.d_ax, selection.d_ay, selection.varphi
     )
     return build_plate_runtime_state(
         mesh,
-        lookup.plate_u_local_basis[row],
-        lookup.plate_v_local_basis[row],
-        lookup.plate_rotation_local_basis[row],
-        lookup.plate_constraint_multiplier_basis[row],
-        lookup.plate_axial_force_basis[row],
+        f["plate_u_local"][0],
+        f["plate_v_local"][0],
+        f["plate_rotation_local"][0],
+        f["plate_constraint_multiplier"][0],
+        f["plate_axial_force"][0],
         gamma,
         anchor_x=float(selection.anchor_x),
         d_ax=float(selection.d_ax),
@@ -900,4 +1053,5 @@ def plate_state_for_selection(
         elastic_scale=float(elastic_scale),
         samples_per_element=int(samples_per_element),
         color_quantity=str(color_quantity),
+        anchor_y=float(getattr(selection, "anchor_y", 0.0) or 0.0),
     )

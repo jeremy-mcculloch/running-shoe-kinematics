@@ -17,8 +17,11 @@ from compliance_fem.contact_lookup import (
     save_contact_lookup,
     solve_candidate,
 )
+from compliance_fem.contact_basis import build_top_affine_matrix
+from compliance_fem.contact_lookup import SOLVER_YR, prepare_compliance_blocks
 from compliance_fem.contact_topology import ContactMode, ContactType
 from compliance_fem.corotation import (
+    affine_coefficients,
     basis_coefficients,
     contract_basis,
     transform_to_fixed_frame,
@@ -82,6 +85,7 @@ def lookup(fem_result):
         kappa=30.0,
         fem_result=fem_result,
         require_plate=True,
+        store_fields=True,
     )
 
 
@@ -94,7 +98,7 @@ def plate_mesh(fem_result):
 def rectangle_lookup():
     cfg = ProblemConfig(L=1.0, H=0.5, E=1.0e6, nu=0.3, nx=8, ny=4, order=1)
     result = compute_compliance(cfg)
-    return generate_contact_lookup(from_compliance_result(result), a=0.6, kappa=30.0)
+    return generate_contact_lookup(from_compliance_result(result), a=0.6, kappa=30.0, store_fields=True)
 
 
 def _mesh_h(cfg: LayeredPlateConfig) -> float:
@@ -133,6 +137,14 @@ def _selection_for(lookup, mode: ContactMode):
     )
 
 
+def _solve_row(fem_result, lookup, row: int):
+    prepared, _ = prepare_compliance_blocks(from_compliance_result(fem_result))
+    W = build_top_affine_matrix(prepared.x_top, prepared.L, a=0.18, kappa=30.0)
+    x_r = 0.5 * prepared.L
+    sol = solve_candidate(prepared, lookup.interval(row), W, x_r, a=0.18, y_r=SOLVER_YR)
+    return prepared, W, x_r, sol
+
+
 # ---------------------------------------------------------------------------
 # 1. Plate DOF indices
 # ---------------------------------------------------------------------------
@@ -168,18 +180,9 @@ def test_recovered_basis_reproduces_prescribed_boundary_displacements(
     bp = np.asarray(lookup.plate_bp_residual, dtype=float)
     assert float(np.max(bp)) < 1e-7
 
-    blocks = from_compliance_result(fem_result)
-    from compliance_fem.contact_lookup import build_top_displacement_matrix, prepare_compliance_blocks
-    from compliance_fem.contact_lookup import SOLVER_YR
-
-    prepared, _ = prepare_compliance_blocks(blocks)
-    W = build_top_displacement_matrix(prepared.x_top, prepared.L, a=0.18, kappa=30.0)
-    x_r = 0.5 * prepared.L
-
-    for kind in (ContactType.HEEL, ContactType.FULL, ContactType.TOE):
+    for kind in (ContactType.HEEL, ContactType.FULL, ContactType.TOE, ContactType.INTERIOR):
         row = _pick_row(lookup, kind)
-        spec = lookup.record_spec(row)
-        sol = solve_candidate(prepared, spec, W, x_r, a=0.18, y_r=SOLVER_YR)
+        prepared, W, x_r, sol = _solve_row(fem_result, lookup, row)
         contact = np.asarray(sol["contact"], dtype=int)
         plate = recover_plate_basis_for_record(
             fem_result,
@@ -228,13 +231,13 @@ def test_plate_array_dimensions_consistent_across_contact_types(lookup, plate_me
     n_plate = plate_mesh.n_nodes
     n_el = plate_mesh.n_elements
     n_rec = lookup.n_records
-    assert lookup.plate_u_local_basis.shape == (n_rec, 5, n_plate)
-    assert lookup.plate_v_local_basis.shape == (n_rec, 5, n_plate)
-    assert lookup.plate_rotation_local_basis.shape == (n_rec, 5, n_plate)
-    assert lookup.plate_constraint_multiplier_basis.shape == (n_rec, 5, n_el)
-    assert lookup.plate_axial_force_basis.shape == (n_rec, 5, n_el)
-    assert lookup.plate_bp_residual.shape == (n_rec, 5)
-    for kind in (ContactType.HEEL, ContactType.FULL, ContactType.TOE):
+    assert lookup.plate_u_local_basis.shape == (n_rec, 6, n_plate)
+    assert lookup.plate_v_local_basis.shape == (n_rec, 6, n_plate)
+    assert lookup.plate_rotation_local_basis.shape == (n_rec, 6, n_plate)
+    assert lookup.plate_constraint_multiplier_basis.shape == (n_rec, 6, n_el)
+    assert lookup.plate_axial_force_basis.shape == (n_rec, 6, n_el)
+    assert lookup.plate_bp_residual.shape == (n_rec, 6)
+    for kind in (ContactType.HEEL, ContactType.FULL, ContactType.TOE, ContactType.INTERIOR):
         row = _pick_row(lookup, kind)
         assert lookup.plate_u_local_basis[row].shape[1] == n_plate
         assert lookup.plate_axial_force_basis[row].shape[1] == n_el
@@ -280,7 +283,7 @@ def test_schema_5_load_rejected(lookup, tmp_path) -> None:
     data["schema_version"] = np.asarray(5)
     bad = tmp_path / "contact_lookup_v5.npz"
     np.savez_compressed(bad, **data)
-    with pytest.raises(ValueError, match="schema_version=6|Regenerate"):
+    with pytest.raises(ValueError, match="schema_version=10|Regenerate"):
         load_contact_lookup(bad)
 
 
@@ -289,8 +292,8 @@ def test_schema_5_load_rejected(lookup, tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_runtime_superposition_matches_five_term_sum(lookup, layered_config) -> None:
-    """6. Runtime plate nodal values agree with direct five-term vector sum."""
+def test_runtime_superposition_matches_affine_sum(lookup, layered_config) -> None:
+    """6. Runtime plate nodal values agree with the closure plus five-term vector sum."""
     sel = _selection_for(lookup, ContactMode.FULL)
     if sel.selected_row is None:
         pytest.skip("No full-contact selection for this load.")
@@ -300,9 +303,11 @@ def test_runtime_superposition_matches_five_term_sum(lookup, layered_config) -> 
     v_rt = contract_basis(lookup.plate_v_local_basis[row], gamma, mode_axis=0)
     th_rt = contract_basis(lookup.plate_rotation_local_basis[row], gamma, mode_axis=0)
 
-    u_sum = sum(gamma[k] * lookup.plate_u_local_basis[row, k] for k in range(5))
-    v_sum = sum(gamma[k] * lookup.plate_v_local_basis[row, k] for k in range(5))
-    th_sum = sum(gamma[k] * lookup.plate_rotation_local_basis[row, k] for k in range(5))
+    g6 = affine_coefficients(gamma)
+    assert g6[0] == 1.0
+    u_sum = sum(g6[k] * lookup.plate_u_local_basis[row, k] for k in range(6))
+    v_sum = sum(g6[k] * lookup.plate_v_local_basis[row, k] for k in range(6))
+    th_sum = sum(g6[k] * lookup.plate_rotation_local_basis[row, k] for k in range(6))
     np.testing.assert_allclose(u_rt, u_sum, atol=_rel_atol(u_sum, layered_config, rtol=1e-12))
     np.testing.assert_allclose(v_rt, v_sum, atol=_rel_atol(v_sum, layered_config, rtol=1e-12))
     np.testing.assert_allclose(th_rt, th_sum, atol=_rel_atol(th_sum, layered_config, rtol=1e-12))
@@ -320,17 +325,6 @@ def test_runtime_plate_agrees_with_direct_fem_reconstruction(
     fem_result, lookup, plate_mesh, layered_config
 ) -> None:
     """7. Lookup+gamma plate matches recover from F_t,F_c for heel/full/toe."""
-    blocks = from_compliance_result(fem_result)
-    from compliance_fem.contact_lookup import (
-        SOLVER_YR,
-        build_top_displacement_matrix,
-        prepare_compliance_blocks,
-    )
-
-    prepared, _ = prepare_compliance_blocks(blocks)
-    W = build_top_displacement_matrix(prepared.x_top, prepared.L, a=0.18, kappa=30.0)
-    x_r = 0.5 * prepared.L
-
     for mode, kind in (
         (ContactMode.HEEL, ContactType.HEEL),
         (ContactMode.FULL, ContactType.FULL),
@@ -349,8 +343,7 @@ def test_runtime_plate_agrees_with_direct_fem_reconstruction(
             lookup.plate_rotation_local_basis[row], gamma, mode_axis=0
         )
 
-        spec = lookup.record_spec(row)
-        sol = solve_candidate(prepared, spec, W, x_r, a=0.18, y_r=SOLVER_YR)
+        _, _, x_r, sol = _solve_row(fem_result, lookup, row)
         contact = np.asarray(sol["contact"], dtype=int)
         F_t = np.asarray(sol["F_t"], dtype=float)
         F_c = np.asarray(sol["F_c"], dtype=float)
@@ -563,18 +556,7 @@ def test_plate_and_foam_interface_nodes_coincide_after_transform(
     v_p = contract_basis(lookup.plate_v_local_basis[row], gamma, mode_axis=0)
 
     # Foam interface: same continuum DOFs as plate translations.
-    blocks = from_compliance_result(fem_result)
-    from compliance_fem.contact_lookup import (
-        SOLVER_YR,
-        build_top_displacement_matrix,
-        prepare_compliance_blocks,
-    )
-
-    prepared, _ = prepare_compliance_blocks(blocks)
-    W = build_top_displacement_matrix(prepared.x_top, prepared.L, a=0.18, kappa=30.0)
-    sol = solve_candidate(
-        prepared, lookup.record_spec(row), W, 0.5 * prepared.L, a=0.18, y_r=SOLVER_YR
-    )
+    prepared, _, _, sol = _solve_row(fem_result, lookup, row)
     contact = np.asarray(sol["contact"], dtype=int)
     F_t_s = contract_basis(np.asarray(sol["F_t"]), gamma, mode_axis=1)
     F_c = np.asarray(sol["F_c"], dtype=float)
@@ -698,6 +680,36 @@ def test_changing_contact_type_updates_plate_without_fem_solve(
         np.linalg.norm(heel_th - full_th),
     ]
     assert max(diffs) > _disp_atol(layered_config, 1e-3, rtol=1e-3)
+
+
+def test_plate_uses_selected_interval_response(lookup, layered_config) -> None:
+    """68. The rendered plate is contracted from the selected interval's own row."""
+    rows = lookup.rows_for(ContactType.INTERIOR)
+    assert rows.size >= 2
+    states = {}
+    for row in (int(rows[0]), int(rows[-1])):
+        iv = lookup.interval(row)
+        sel = evaluate_from_angles(
+            lookup,
+            Fx=50.0,
+            Fy=-2.0e3,
+            phi_deg=-2.0,
+            theta_deg=1.5,
+            mode=ContactMode.SPECIFIC,
+            specific_interval=(iv.start, iv.end),
+        )
+        assert sel.selected_row == row
+        assert tuple(sel.interval) == (iv.start, iv.end)
+        state = plate_state_for_selection(lookup, sel)
+        assert state is not None
+        gamma = basis_coefficients(sel.alpha, sel.d_ax, sel.d_ay, sel.varphi)
+        u_row = contract_basis(lookup.plate_u_local_basis[row], gamma, mode_axis=0)
+        v_row = contract_basis(lookup.plate_v_local_basis[row], gamma, mode_axis=0)
+        np.testing.assert_allclose(state.u_local, u_row, atol=_rel_atol(u_row, layered_config))
+        np.testing.assert_allclose(state.v_local, v_row, atol=_rel_atol(v_row, layered_config))
+        states[row] = np.concatenate([state.u_local, state.v_local])
+    a, b = states.values()
+    assert np.linalg.norm(a - b) > _disp_atol(layered_config, 1e-6, rtol=1e-6)
 
 
 def test_plate_color_quantities_and_units(lookup) -> None:

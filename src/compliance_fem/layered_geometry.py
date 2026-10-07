@@ -14,7 +14,7 @@ from skfem import Mesh
 from skfem.io import from_meshio
 
 from compliance_fem.config import LayeredPlateConfig
-from compliance_fem.geometry import MeshData, verify_positive_jacobians
+from compliance_fem.geometry import MeshData, map_bottom_profile, verify_positive_jacobians
 from compliance_fem.gmsh_util import gmsh_session, initialize_gmsh
 
 LAYERED_BOUNDARY_NAMES = (
@@ -99,7 +99,6 @@ def _ensure_layered_groups(mesh: Mesh, config: LayeredPlateConfig, atol: float =
     h2_toe = config.h2_toe
     mesh = mesh.with_boundaries(
         {
-            "bottom": lambda x: np.isclose(x[1], 0.0, atol=atol),
             "top": lambda x: np.isclose(
                 x[1], np.asarray(config.y_top(x[0])), atol=atol, rtol=0.0
             ),
@@ -118,7 +117,24 @@ def _ensure_layered_groups(mesh: Mesh, config: LayeredPlateConfig, atol: float =
         },
         boundaries_only=True,
     )
-    return mesh.with_boundaries({"plate_interface": _interface_facets(mesh)})
+    return mesh.with_boundaries(
+        {"bottom": _bottom_facets(mesh, config, atol), "plate_interface": _interface_facets(mesh)}
+    )
+
+
+def _bottom_facets(mesh: Mesh, config: LayeredPlateConfig, atol: float) -> np.ndarray:
+    """Boundary facets whose vertices all lie on ``y = y_b(x)``.
+
+    Vertices, not facet midpoints, are tested: on a curved (rocker) sole a
+    straight facet's midpoint lies off the profile by O(h^2).
+    """
+    boundary = np.flatnonzero(mesh.f2t[1] < 0)
+    pts = mesh.p[:, mesh.facets[:, boundary]]
+    on = np.isclose(pts[1], np.asarray(config.y_bottom(pts[0]), dtype=float), atol=atol, rtol=0.0)
+    facets = boundary[np.all(on, axis=0)]
+    if facets.size == 0:
+        raise RuntimeError("No boundary facets found on the bottom profile.")
+    return facets.astype(int)
 
 
 def ordered_interface_nodes(mesh: Mesh, config: LayeredPlateConfig, atol: float = 1e-8) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -250,6 +266,8 @@ def generate_layered_mesh(
     mesh = from_meshio(meshio_data)
     if mesh is None:
         raise RuntimeError("Failed to import layered Gmsh mesh via meshio/scikit-fem.")
+    if config.sole_rocker_height > 0.0:
+        mesh = map_bottom_profile(mesh, config.y_bottom, config.y_plate)
     mesh = _ensure_layered_groups(mesh, config)
     verify_positive_jacobians(mesh)
 
@@ -272,8 +290,9 @@ def verify_layered_mesh(mesh_data: LayeredMeshData, atol: float = 1e-8) -> None:
     ymin, ymax = float(mesh.p[1].min()), float(mesh.p[1].max())
     if not np.isclose(xmin, 0.0, atol=atol) or not np.isclose(xmax, config.L, atol=atol):
         raise ValueError(f"Mesh x-extent [{xmin}, {xmax}] does not match L={config.L}.")
-    if not np.isclose(ymin, 0.0, atol=atol):
-        raise ValueError(f"Mesh minimum y={ymin} is not 0.")
+    ymin_expected = float(np.min(config.y_bottom(mesh.p[0])))
+    if not np.isclose(ymin, ymin_expected, atol=atol):
+        raise ValueError(f"Mesh minimum y={ymin} does not match the bottom profile minimum.")
     if not np.isclose(ymax, config.H, atol=atol):
         # H is the max outer height; ymax should match the taller end.
         y_top_ends = (float(config.y_top(0.0)), float(config.y_top(config.L)))

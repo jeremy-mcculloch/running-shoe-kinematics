@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import tempfile
 from dataclasses import dataclass
@@ -31,18 +32,41 @@ class MeshData:
     msh_path: Path | None = None
 
 
-def _ensure_boundaries(mesh: Mesh, L: float, H: float) -> Mesh:
+def _ensure_boundaries(mesh: Mesh, L: float, H: float, y_bottom=None) -> Mesh:
     """Attach named boundaries when meshio import omits physical tags."""
     if hasattr(mesh, "boundaries") and mesh.boundaries:
         return mesh
+    if y_bottom is None:
+        y_bottom = lambda x: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
     return mesh.with_boundaries(
         {
             "top": lambda x: np.isclose(x[1], H),
-            "bottom": lambda x: np.isclose(x[1], 0.0),
+            "bottom": lambda x: np.isclose(x[1], y_bottom(x[0])),
             "left": lambda x: np.isclose(x[0], 0.0),
             "right": lambda x: np.isclose(x[0], L),
         }
     )
+
+
+def map_bottom_profile(mesh: Mesh, y_bottom, y_ceiling, region=None) -> Mesh:
+    """Vertically remap mesh nodes so the flat bottom ``y = 0`` follows ``y_b(x)``.
+
+    Nodes at height ``y`` below the ceiling ``y_c(x)`` move to
+    ``y' = y_b(x) + y (y_c(x) - y_b(x)) / y_c(x)``; nodes on the ceiling and
+    above (or outside ``region``) are unchanged. Topology and named groups are
+    preserved, and higher-order nodes are mapped with the same formula.
+    """
+    doflocs = np.array(mesh.doflocs, dtype=float, copy=True)
+    x = doflocs[0]
+    y = doflocs[1]
+    yb = np.asarray(y_bottom(x), dtype=float)
+    if not np.any(yb != 0.0):
+        return mesh
+    yc = np.asarray(y_ceiling(x), dtype=float)
+    mask = y <= yc + 1e-12 if region is None else np.asarray(region(x, y), dtype=bool)
+    scale = np.where(mask, (yc - yb) / yc, 1.0)
+    doflocs[1] = np.where(mask, yb + y * scale, y)
+    return dataclasses.replace(mesh, doflocs=doflocs)
 
 
 def generate_rectangular_mesh(
@@ -114,6 +138,9 @@ def generate_rectangular_mesh(
     if mesh is None:
         raise RuntimeError("Failed to import Gmsh mesh via meshio/scikit-fem.")
     mesh = _ensure_boundaries(mesh, L, H)
+    if config.sole_rocker_height > 0.0:
+        mesh = map_bottom_profile(mesh, config.y_bottom, lambda x: np.full_like(x, H))
+        verify_positive_jacobians(mesh)
     return MeshData(mesh=mesh, msh_path=msh_path)
 
 
@@ -133,7 +160,8 @@ def verify_mesh_dimensions(mesh: Mesh, config: ProblemConfig, atol: float = 1e-1
     ymin, ymax = mesh.p[1].min(), mesh.p[1].max()
     if not np.isclose(xmin, 0.0, atol=atol) or not np.isclose(xmax, config.L, atol=atol):
         raise ValueError(f"Mesh x-extent [{xmin}, {xmax}] does not match L={config.L}.")
-    if not np.isclose(ymin, 0.0, atol=atol) or not np.isclose(ymax, config.H, atol=atol):
+    ymin_expected = float(np.min(config.y_bottom(mesh.p[0])))
+    if not np.isclose(ymin, ymin_expected, atol=atol) or not np.isclose(ymax, config.H, atol=atol):
         raise ValueError(f"Mesh y-extent [{ymin}, {ymax}] does not match H={config.H}.")
 
 

@@ -1,16 +1,19 @@
-"""Diagnostic plots for contact-edge lookup tables."""
+"""Diagnostic plots for interval contact lookup tables.
+
+Interval records are indexed by ``(i, j)``; per-record quantities are drawn as
+heatmaps with the start index on the horizontal axis and the end index on the
+vertical axis (only ``j >= i`` is populated).
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 
-from compliance_fem.contact_basis import BASIS_MODE_NAMES
+from compliance_fem.contact_basis import AFFINE_COLUMN_NAMES
 from compliance_fem.contact_lookup import (
-    CORNER_NAMES,
-    SCALAR_EDGE_GAP_V,
-    SCALAR_EDGE_RY,
     SCALAR_FX,
     SCALAR_FY,
     SCALAR_MV,
@@ -18,113 +21,83 @@ from compliance_fem.contact_lookup import (
     ContactLookupResult,
 )
 from compliance_fem.contact_query import SelectedCandidate, SuperposedProfile
-from compliance_fem.contact_topology import ContactType
 
-MODE_LABELS = (
-    r"$\phi_1$",
-    r"$B_x$",
-    r"$B_y$",
-    r"$B_{rx}$",
-    r"$B_{ry}$",
-)
+COLUMN_LABELS = (r"closure $z_0$", r"$\alpha$", r"$B_x$", r"$B_y$", r"$B_{rx}$", r"$B_{ry}$")
 
-PARTIAL_FAMILIES = (ContactType.HEEL, ContactType.TOE)
+
+def interval_grid(lookup: ContactLookupResult, values: np.ndarray, rows: np.ndarray | None = None) -> np.ndarray:
+    """Scatter per-record values into an ``(N_b, N_b)`` grid indexed ``[j, i]``."""
+    n_b = int(lookup.n_bottom_nodes)
+    grid = np.full((n_b, n_b), np.nan)
+    starts = np.asarray(lookup.contact_start_index, dtype=int)
+    ends = np.asarray(lookup.contact_end_index, dtype=int)
+    mask = np.zeros(lookup.n_records, dtype=bool)
+    mask[lookup.valid_rows if rows is None else rows] = True
+    v = np.asarray(values, dtype=float)
+    mask &= np.isfinite(v)
+    grid[ends[mask], starts[mask]] = v[mask]
+    return grid
+
+
+def _heatmap(ax, grid: np.ndarray, title: str, marker: tuple[int, int] | None = None) -> None:
+    im = ax.imshow(grid, origin="lower", aspect="auto", interpolation="nearest")
+    if marker is not None:
+        ax.plot([marker[0]], [marker[1]], "rx", ms=9)
+    ax.set_xlabel("start index i")
+    ax.set_ylabel("end index j")
+    ax.set_title(title, fontsize=9)
+    plt.colorbar(im, ax=ax)
 
 
 def plot_scalar_lookup(result: ContactLookupResult, output_dir: Path) -> None:
-    """Plot the local basis scalars versus contact-edge location, per family.
-
-    Heel and toe records both index on ``l`` but describe opposite contact
-    intervals, so they get separate figures. The single full-contact record has
-    no ``l`` and is reported in the corner-reaction figure instead.
-    """
+    """Heatmaps of every affine column of the scalar resultants over (i, j)."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    quantities = [
-        (SCALAR_FX, r"local $F_x^{(k)}(l)$", "Fx"),
-        (SCALAR_FY, r"local $F_y^{(k)}(l)$ (total top nodal force)", "Fy"),
-        (SCALAR_MV, r"$M_v^{(k)}(l)=x_t^T f_{t,y}$", "Mv"),
-        (
-            SCALAR_EDGE_GAP_V,
-            r"edge-free local vertical disp. $v^{(k)}(l)$",
-            "edge_free_gap",
-        ),
-        (
-            SCALAR_EDGE_RY,
-            r"edge-contact local vertical nodal reaction $R_y^{(k)}(l)$",
-            "edge_contact_reaction",
-        ),
-        (SCALAR_TOE, r"$T_{\mathrm{toe}}^{(k)}(l)$", "toe_moment"),
-    ]
-    for family in PARTIAL_FAMILIES:
-        rows = result.rows_for(family)
-        if rows.size == 0:
-            continue
-        l = result.candidate_l[rows]
-        for idx, title, stem in quantities:
-            fig, ax = plt.subplots(figsize=(7, 4))
-            for k, label in enumerate(MODE_LABELS):
-                ax.plot(l, result.scalar_lookup[rows, k, idx], "-o", markersize=3, label=label)
-            ax.set_xlabel(rf"{family.value} contact edge $l$ (material)")
-            ax.set_ylabel(title)
-            ax.set_title(
-                f"{family.value} contact: {title}  basis order: {', '.join(BASIS_MODE_NAMES)}",
-                fontsize=9,
-            )
-            ax.grid(True, alpha=0.3)
-            ax.legend()
-            fig.savefig(output_dir / f"{stem}_vs_l_{family.value}.png", dpi=150, bbox_inches="tight")
-            plt.close(fig)
-
-    plot_full_contact_corners(result, output_dir)
+    for idx, title, stem in (
+        (SCALAR_FX, r"local $F_x$", "Fx"),
+        (SCALAR_FY, r"local $F_y$", "Fy"),
+        (SCALAR_MV, r"$M_v = x_t^T f_{t,y}$", "Mv"),
+        (SCALAR_TOE, r"$T_{\mathrm{toe}}$", "toe_moment"),
+    ):
+        fig, axes = plt.subplots(2, 3, figsize=(13, 7))
+        for k, ax in enumerate(axes.flat):
+            grid = interval_grid(result, result.scalar_lookup[:, k, idx])
+            _heatmap(ax, grid, f"{title}: {COLUMN_LABELS[k]} ({AFFINE_COLUMN_NAMES[k]})")
+        fig.tight_layout()
+        fig.savefig(output_dir / f"{stem}_interval_heatmap.png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
 
 
-def plot_full_contact_corners(result: ContactLookupResult, output_dir: Path) -> None:
-    """Plot the full-contact record's per-basis local corner reactions."""
+def plot_interval_validity(result: ContactLookupResult, output_dir: Path) -> None:
+    """Valid / rejected intervals and the boundary-matrix condition estimate."""
     output_dir = Path(output_dir)
-    row = result.full_contact_row()
-    corners = result.corner_reactions_local[row]
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharex=True)
-    x = range(len(MODE_LABELS))
-    for c, (ax, corner) in enumerate(zip(axes, CORNER_NAMES)):
-        ax.bar([i - 0.18 for i in x], corners[:, c, 0], width=0.36, label=r"$R_x^{T}$")
-        ax.bar([i + 0.18 for i in x], corners[:, c, 1], width=0.36, label=r"$R_y^{T}$")
-        ax.axhline(0.0, color="0.3", lw=1)
-        ax.set_xticks(list(x))
-        ax.set_xticklabels(MODE_LABELS)
-        ax.set_title(f"full contact: {corner} corner local reaction")
-        ax.grid(True, alpha=0.3, axis="y")
-        ax.legend(fontsize=8)
-    axes[0].set_ylabel("local nodal reaction force")
+    all_rows = np.arange(result.n_records)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    _heatmap(axes[0], interval_grid(result, result.valid_mask.astype(float), all_rows), "valid interval (1) / rejected (0)")
+    cond = np.asarray(result.condition_estimates, dtype=float)
+    _heatmap(axes[1], interval_grid(result, np.log10(cond)), "log10 cond(A) estimate (1 / rcond)")
     fig.tight_layout()
-    fig.savefig(output_dir / "full_contact_corner_reactions.png", dpi=150, bbox_inches="tight")
+    fig.savefig(output_dir / "interval_validity.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
 
 
 def plot_solver_residuals(result: ContactLookupResult, output_dir: Path) -> None:
-    """Plot solver residual diagnostics per record, grouped by topology."""
+    """Boundary-system residuals per interval record (rows ordered by start, then end)."""
     output_dir = Path(output_dir)
     fig, ax = plt.subplots(figsize=(8, 4))
-    rows = range(result.n_records)
-    ax.semilogy(rows, result.solve_residuals, label="solve")
-    ax.semilogy(rows, result.top_displacement_residuals, label="top disp.")
-    ax.semilogy(rows, result.contact_displacement_residuals, label="contact disp.")
-    ax.semilogy(rows, result.force_equilibrium_residuals, label="force eq.")
-    ax.semilogy(rows, result.moment_equilibrium_residuals, label="moment eq.")
-    for family in (ContactType.HEEL, ContactType.TOE, ContactType.FULL):
-        family_rows = result.rows_for(family)
-        if family_rows.size:
-            ax.axvline(float(family_rows[0]), color="0.5", ls=":", lw=1)
-            ax.text(
-                float(family_rows[0]),
-                ax.get_ylim()[1],
-                f" {family.value}",
-                fontsize=8,
-                va="top",
-            )
-    ax.set_xlabel("record index (heel, then toe, then full)")
+    rows = np.arange(result.n_records)
+    floor = 1e-300
+    for arr, label in (
+        (result.solve_residuals, "solve"),
+        (result.top_displacement_residuals, "top disp."),
+        (result.contact_displacement_residuals, "contact disp."),
+        (result.force_equilibrium_residuals, "force eq."),
+        (result.moment_equilibrium_residuals, "moment eq."),
+    ):
+        ax.semilogy(rows, np.maximum(np.asarray(arr, dtype=float), floor), label=label, lw=0.8)
+    ax.set_xlabel("record row (start index, then end index)")
     ax.set_ylabel("residual")
-    ax.set_title("Boundary-system residuals per contact record")
+    ax.set_title("Boundary-system residuals per interval record")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.savefig(output_dir / "residuals_vs_record.png", dpi=150, bbox_inches="tight")
@@ -137,13 +110,13 @@ def plot_query_diagnostics(
     selected: SelectedCandidate,
     output_dir: Path,
 ) -> None:
-    """Plot weighted profile, violation score, and selected gap/reaction."""
+    """Weighted top profile, violation heatmap, and the selected gap / reaction."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     c = profile.coefficients
     n_t = len(lookup.x_top)
-    W = lookup.basis_top_displacements
-    w = W[n_t:, :] @ c
+    W = np.asarray(lookup.basis_top_displacements, dtype=float)
+    w = W[n_t:, :] @ np.concatenate([[1.0], c])
 
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.plot(lookup.x_top, w, "-o", markersize=3)
@@ -155,49 +128,29 @@ def plot_query_diagnostics(
     fig.savefig(output_dir / "weighted_top_displacement.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    rows = range(lookup.n_records)
-    ax.plot(rows, profile.violation, "-o", markersize=3, label="J(record)")
-    if selected.admissible_rows.size:
-        ax.plot(
-            selected.admissible_rows,
-            profile.violation[selected.admissible_rows],
-            "o",
-            label="admissible",
-        )
-    ax.axvline(selected.candidate_row, color="C3", linestyle="--", label="selected")
-    ax.set_xlabel("record index (heel, then toe, then full)")
-    ax.set_ylabel("violation score J")
-    ax.set_title(f"Contact violation score (selected: {selected.contact_type})")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.savefig(output_dir / "violation_vs_record.png", dpi=150, bbox_inches="tight")
+    marker = (selected.contact_start_index, selected.contact_end_index)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    V = np.where(np.isfinite(profile.violation), profile.violation, np.nan)
+    _heatmap(axes[0], interval_grid(lookup, np.log10(np.maximum(V, 1e-30))), "log10 violation", marker)
+    _heatmap(axes[1], interval_grid(lookup, profile.admissible.astype(float)), "admissible (1)", marker)
+    fig.tight_layout()
+    fig.savefig(output_dir / "violation_heatmap.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
 
-    marker_x = float(lookup.anchor_reference_x[selected.candidate_row])
-    marker_label = (
-        "numerical anchor" if selected.contact_type == ContactType.FULL.value else "contact edge"
-    )
+    x_i = float(lookup.x_bottom[selected.contact_start_index])
+    x_j = float(lookup.x_bottom[selected.contact_end_index])
     for values, ylabel, title, filename in (
-        (
-            selected.gap,
-            "bottom local vertical displacement",
-            "Free-bottom local vertical displacement",
-            "selected_gap.png",
-        ),
-        (
-            selected.reaction,
-            "bottom nodal reaction force (not pressure)",
-            "Bottom nodal reaction",
-            "selected_reaction.png",
-        ),
+        (selected.gap, "fixed-frame normal gap", "Bottom normal gap", "selected_gap.png"),
+        (selected.reaction, "normal nodal reaction (not pressure)", "Bottom normal reaction", "selected_reaction.png"),
     ):
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.plot(lookup.x_bottom, values, "-o", markersize=3)
-        ax.axvline(marker_x, color="C3", linestyle="--", label=marker_label)
+        ax.axvline(x_i, color="C3", linestyle="--", label="contact edges x_i, x_j")
+        ax.axvline(x_j, color="C3", linestyle="--")
+        ax.axvline(selected.anchor_x, color="0.5", linestyle=":", label="numerical anchor")
         ax.set_xlabel("x (material)")
         ax.set_ylabel(ylabel)
-        ax.set_title(f"{title} for the selected {selected.contact_type} record")
+        ax.set_title(f"{title} for the selected {selected.contact_type} interval {marker}")
         ax.grid(True, alpha=0.3)
         ax.legend()
         fig.savefig(output_dir / filename, dpi=150, bbox_inches="tight")
@@ -207,4 +160,5 @@ def plot_query_diagnostics(
 def save_lookup_plots(result: ContactLookupResult, output_dir: Path) -> None:
     """Write all generation-time diagnostic plots."""
     plot_scalar_lookup(result, output_dir)
+    plot_interval_validity(result, output_dir)
     plot_solver_residuals(result, output_dir)

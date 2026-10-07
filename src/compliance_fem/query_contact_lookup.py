@@ -1,4 +1,4 @@
-"""CLI for querying a contact-edge lookup table with coefficient weights."""
+"""CLI for querying an interval contact lookup table with a raw coefficient vector."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ import numpy as np
 from compliance_fem.contact_lookup import load_contact_lookup
 from compliance_fem.contact_plotting import plot_query_diagnostics
 from compliance_fem.contact_query import select_candidate
-from compliance_fem.contact_topology import CONTACT_TYPE_NAMES, ContactType
+from compliance_fem.contact_topology import ContactType
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Query a contact lookup table with a raw runtime coefficient vector. "
+            "Query an interval contact lookup with a raw runtime coefficient vector. "
             "This is a lookup-level debug path; the force-controlled runtime "
             "(phi, theta, Fx, Fy) lives in the GUI and force_control."
         )
@@ -30,16 +30,17 @@ def main(argv: list[str] | None = None) -> None:
         required=True,
         metavar=("ALPHA", "D_AX", "D_AY", "R_X", "R_Y"),
         help=(
-            "gamma in saved basis order (top_shape_phi1, contact_translation_x, "
+            "gamma in saved basis order (top_shape_alpha, contact_translation_x, "
             "contact_translation_y, contact_rotation_x, contact_rotation_y), i.e. "
-            "[tan(theta), d_ax, d_ay, cos(varphi)-1, -sin(varphi)]."
+            "[tan(theta), d_ax, d_ay, cos(varphi)-1, -sin(varphi)]. The curved-sole "
+            "closure column always has coefficient 1."
         ),
     )
     parser.add_argument(
         "--contact-type",
-        choices=list(CONTACT_TYPE_NAMES),
+        choices=[t.value for t in ContactType],
         default=None,
-        help="Report the best record within one topology family only (default: all records).",
+        help="Report the best record within one topology label only (default: all records).",
     )
     parser.add_argument("--tau-g", type=float, default=0.0)
     parser.add_argument("--tau-R", type=float, default=0.0)
@@ -48,32 +49,22 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     lookup = load_contact_lookup(args.lookup)
-    selected = select_candidate(
-        lookup,
-        args.coefficients,
-        tau_g=args.tau_g,
-        tau_R=args.tau_R,
-        fy_tol=args.fy_tol,
-    )
+    selected = select_candidate(lookup, args.coefficients, tau_g=args.tau_g, tau_R=args.tau_R, fy_tol=args.fy_tol)
 
-    output_dir = args.output
-    if output_dir is None:
-        output_dir = Path(args.lookup).parent / "query"
+    output_dir = args.output or Path(args.lookup).parent / "query"
     output_dir.mkdir(parents=True, exist_ok=True)
-
     plot_query_diagnostics(lookup, selected.profile, selected, output_dir)
 
     family = None
     if args.contact_type is not None:
-        rows = lookup.rows_for(ContactType(args.contact_type))
-        best = int(rows[int(np.nanargmin(selected.profile.violation[rows]))])
+        rows = np.intersect1d(lookup.rows_for(ContactType(args.contact_type)), lookup.valid_rows)
+        best = int(rows[int(np.argmin(selected.profile.violation[rows]))])
         family = {
             "contact_type": args.contact_type,
             "n_records": int(rows.size),
             "best_row": best,
-            "best_edge_node_id": int(lookup.candidate_indices[best]),
-            "best_l": float(lookup.candidate_l[best]),
-            "best_anchor_x": float(lookup.anchor_reference_x[best]),
+            "best_interval": [int(lookup.contact_start_index[best]), int(lookup.contact_end_index[best])],
+            "best_anchor_x": float(lookup.contact_anchor_reference_x[best]),
             "best_violation": float(selected.profile.violation[best]),
             "best_admissible": bool(selected.profile.admissible[best]),
         }
@@ -83,9 +74,8 @@ def main(argv: list[str] | None = None) -> None:
         "n_records": int(lookup.n_records),
         "selected_row": selected.candidate_row,
         "selected_contact_type": selected.contact_type,
-        "selected_edge_node_id": selected.candidate_index,
-        "selected_l": selected.l,
-        "selected_anchor_x": float(lookup.anchor_reference_x[selected.candidate_row]),
+        "selected_interval": [selected.contact_start_index, selected.contact_end_index],
+        "selected_anchor_x": selected.anchor_x,
         "exactly_admissible": selected.exactly_admissible,
         "n_admissible": int(selected.admissible_rows.size),
         "Fy": selected.Fy,
@@ -96,7 +86,6 @@ def main(argv: list[str] | None = None) -> None:
     }
     with (output_dir / "query_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
-
     print(json.dumps(summary, indent=2))
 
 

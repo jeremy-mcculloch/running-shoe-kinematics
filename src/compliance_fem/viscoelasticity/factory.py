@@ -6,9 +6,18 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal, Union
 
 from compliance_fem.viscoelasticity.base import ViscoelasticForceMapper
+from compliance_fem.viscoelasticity.elastic import ElasticMaterial
 from compliance_fem.viscoelasticity.fractional import FractionalMaterial
 from compliance_fem.viscoelasticity.fung import FungMaterial
 from compliance_fem.viscoelasticity.sls import SLSMaterial
+
+
+@dataclass(frozen=True)
+class ElasticConfig:
+    """Identity map ``F_e = F_VE`` (no relaxation)."""
+
+    n_components: int = 2
+    model: Literal["elastic"] = "elastic"
 
 
 @dataclass(frozen=True)
@@ -76,7 +85,7 @@ class FungConfig:
     model: Literal["fung"] = "fung"
 
 
-MaterialConfig = Union[SLSConfig, FractionalConfig, FungConfig]
+MaterialConfig = Union[ElasticConfig, SLSConfig, FractionalConfig, FungConfig]
 
 
 def create_material(config: MaterialConfig | dict[str, Any]) -> ViscoelasticForceMapper:
@@ -84,15 +93,21 @@ def create_material(config: MaterialConfig | dict[str, Any]) -> ViscoelasticForc
     if isinstance(config, dict):
         model = str(config.get("model", "")).lower()
         data = {k: v for k, v in config.items() if k != "model"}
-        if model == "sls":
+        if model == "elastic":
+            config = ElasticConfig(**data)
+        elif model == "sls":
             config = SLSConfig(**data)
         elif model == "fractional":
             config = FractionalConfig(**data)
         elif model == "fung":
             config = FungConfig(**data)
         else:
-            raise ValueError(f"unknown model {model!r}; expected sls|fractional|fung")
+            raise ValueError(
+                f"unknown model {model!r}; expected elastic|sls|fractional|fung"
+            )
 
+    if isinstance(config, ElasticConfig):
+        return ElasticMaterial(n_components=config.n_components)
     if isinstance(config, SLSConfig):
         return SLSMaterial(
             g_inf=config.g_inf,

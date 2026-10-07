@@ -2,9 +2,10 @@
 
 Plane-strain finite-element computation of **vector** (component-major \(u,v\))
 compliance matrices for a homogeneous rectangular elastic body or a layered
-trapezoidal foam pair with an inextensible internal plate, plus a schema-v6
-heel/full/toe contact-topology lookup built from those nodal-force compliance
-blocks (layered tables may include an optional `plate_response` section).
+trapezoidal foam pair with an inextensible internal plate, plus a schema-v9
+single-contiguous-interval ground-contact lookup built from those nodal-force
+compliance blocks (layered tables may include an optional `plate_response`
+section). See [docs/interval_contact.md](docs/interval_contact.md).
 
 ## Physical problem
 
@@ -40,7 +41,7 @@ F_\Gamma=\begin{bmatrix}f_{\Gamma,x}\\ f_{\Gamma,y}\end{bmatrix},\qquad
 \texttt{dof\_ordering}=\texttt{component\_major\_uv}.
 \]
 
-**Contact-edge lookup uses only the stacked nodal-force matrices** \(\mathbf C^{F}_{tt}\),
+**The contact lookup uses only the stacked nodal-force matrices** \(\mathbf C^{F}_{tt}\),
 \(\mathbf C^{F}_{tb}\), \(\mathbf C^{F}_{bt}\), \(\mathbf C^{F}_{bb}\) (each \(2n\times 2n\)).
 Old vertical-only \(n\times n\) compliance files must be regenerated; there is no silent fallback.
 
@@ -82,55 +83,39 @@ depend on mesh resolution and must not be interpreted as exact pointwise continu
 values. Responses to finite-width or smooth traction distributions converge under
 mesh refinement.
 
-## Contact-edge lookup
+## Interval contact lookup
 
-Schema v6 stores three contiguous ground-contact topologies. Topology is stored
-explicitly in `contact_type_codes` and is **never** inferred from the material
-edge coordinate \(l\). Heel and toe families are solved independently (no
-reflection of one into the other). With \(N_b\) bottom nodes the table has
-\(2N_b-1\) records: \(N_b-1\) heel, \(N_b-1\) toe, and exactly one full.
+The implementation supports one contiguous contact interval. If the normal reactions become tensile inside an otherwise active interval, or if two separated sole regions simultaneously contact the ground with a free region between them, a multi-interval contact model is required.
 
-| Topology | Contact interval | Contact nodes | Free nodes | Edge index \(i\) |
-|----------|------------------|---------------|------------|------------------|
-| **HEEL** | \([0,l]\) | \(\{0,\ldots,i\}\) | \(\{i+1,\ldots,N_b-1\}\) | \(i=0,\ldots,N_b-2\) |
-| **TOE** | \([l,L]\) | \(\{i,\ldots,N_b-1\}\) | \(\{0,\ldots,i-1\}\) | \(i=1,\ldots,N_b-1\) |
-| **FULL** | \([0,L]\) | \(\{0,\ldots,N_b-1\}\) | \(\emptyset\) | none (one record) |
+With \(N_b\) bottom nodes the lookup stores **every** contiguous interval
+\(\mathcal I_{ij}=\{i,\dots,j\}\), \(0\le i\le j<N_b\): \(N_b(N_b+1)/2\) records
+(\(N_b-1\) heel-attached, \(N_b-1\) toe-attached, one full, and
+\((N_b-1)(N_b-2)/2\) interior intervals; one-node intervals included). The
+heel/toe/full/interior label is derived from \((i,j)\) and is only a filter.
+Each record has its own free/contact partition, a **numerical** anchor
+\(x_a=(x_i+x_j)/2\), \(y_a=y_b(x_a)\) (`contact_anchor_definition="interval_midpoint"`;
+the physical contact edges are \(l_h=x_i\), \(l_t=x_j\)), adjacent free node ids
+(\(-1\) beyond an end of the sole), a status and a structured rejection reason.
 
-The transition node \(i\) always belongs to the contact set. Full contact has no
-lift-off edge; its basis modes use the numerical anchor \(x_a=L/2\) (a
-decomposition point only, not a physical contact edge). `--include-endpoints` is
-retained for CLI compatibility but ignored: all three topologies are always
-enumerated.
-
-For each record the code solves the dense boundary saddle system
+Active nodes stick at their reference abscissa on the ground. The prescribed
+rotating-frame contact displacement
 
 \[
-\mathbf A_i
-\begin{pmatrix}
-\mathbf F_t\\
-\mathbf F_c\\
-\boldsymbol\alpha
-\end{pmatrix}
-=
-\begin{pmatrix}
-\mathbf W_t\\
-\mathbf W_c\\
-\mathbf 0
-\end{pmatrix},
+\mathbf d_k^{\mathcal T}=\mathbf d_a^{\mathcal T}+\bigl(Q(\varphi)^T-I\bigr)(x_k-x_a,0)^T+\bigl(0,-(y_k-y_a)\bigr)^T
 \]
 
-where \(\mathbf W_t\) and \(\mathbf W_c\) have five columns each (component-major
-\([u;v]\)) describing prescribed **rotating-frame** boundary displacement.
-The rotation-mode lever uses the record anchor \(x_a=l_i\) for heel/toe and
-\(x_a=L/2\) for full; the same five modes apply to every topology:
+is exact in \(\varphi\). Its last term, the **curved-sole closure**, is stored as
+affine column 0 of every response with coefficient fixed at 1 (zero on a flat
+sole), so every response tensor has six columns:
 
-| \(k\) | name | top \((u_t,v_t)\) | contact \((u_c,v_c)\) |
+| column | name | top \((u_t,v_t)\) | contact \((u_c,v_c)\) |
 |---|------|-------------------|------------------------|
-| 0 | `top_shape_phi1` | \((0,\ \varphi_1(x))\) | \((0,0)\) |
-| 1 | `contact_translation_x` | \((0,0)\) | \((1,0)\) |
-| 2 | `contact_translation_y` | \((0,0)\) | \((0,1)\) |
-| 3 | `contact_rotation_x` | \((0,0)\) | \((x-x_a,\ 0)\) |
-| 4 | `contact_rotation_y` | \((0,0)\) | \((0,\ x-x_a)\) |
+| 0 | `curved_sole_closure` | \((0,0)\) | \((0,\ -(y_k-y_a))\) |
+| 1 | `top_shape_alpha` | \((0,\ \varphi_1(x))\) | \((0,0)\) |
+| 2 | `contact_translation_x` | \((0,0)\) | \((1,0)\) |
+| 3 | `contact_translation_y` | \((0,0)\) | \((0,1)\) |
+| 4 | `contact_rotation_x` | \((0,0)\) | \((x-x_a,\ 0)\) |
+| 5 | `contact_rotation_y` | \((0,0)\) | \((0,\ x-x_a)\) |
 
 The single top shape mode is the endpoint-fixed softplus ramp
 
@@ -141,22 +126,25 @@ The single top shape mode is the endpoint-fixed softplus ramp
 
 with no normalization. Its sign lives in one place, `corotation.SHAPE_MODE_SIGN`.
 
-\(\boldsymbol\alpha\) restores the three rigid modes (horizontal translation,
-vertical translation, rotation \(u=-(y-y_r)\), \(v=(x-x_r)\)) about
-\(x_r=L/2\), \(y_r=0\). Equilibrium \(R_t^T F_t + R_c^T F_c = 0\) occupies the
-last three rows. \(\mathbf A_i\) is factorized once per record and all five
-right-hand sides are solved together; the global stiffness matrix is **not**
-refactorized per record.
+For each interval the dense boundary saddle system (prescribed top and contact
+displacements, rigid modes \(\boldsymbol\alpha\) about \(x_r=L/2\), \(y_r=0\),
+equilibrium rows) is LU-factored **once** and all six right-hand sides are solved
+against that factorization; the global compliance blocks are reused and the
+global stiffness matrix is never refactorized. Numerically rank-deficient,
+failed, non-finite or high-residual records are rejected with a reason and
+counted in `metadata["rejection_counts"]`.
 
-Saved scalars per mode \(k\in\{0,\dots,4\}\) are topology-independent:
-
-`[Fx, Fy, Mv, Mz, edge_free_gap_v, edge_free_gap_u, edge_contact_reaction_x,
-edge_contact_reaction_y, M_toe, M_toe_vertical]`,
-
-where \(M_v=x_t^T f_{t,y}\) and \(M_z\) is the top-force moment about \((0,0)\).
-Edge free-gap / contact-reaction components are taken at the free/contact nodes
-adjoining the transition (\(i+1\) / \(i\) for heel, \(i-1\) / \(i\) for toe) and
-are `NaN` for full contact. Toe moment about \(P_{\mathrm{toe}}=(a,H_a)\) is
+Stored per record: bottom displacement and contact reaction bases
+`(n_rec, 6, N_b)`, top force bases `(n_rec, 6, n_t)`, scalars
+`scalar_lookup` `(n_rec, 6, 6)` = `[Fx, Fy, Mv, Mz, M_toe, M_toe_vertical]`,
+heel/toe edge reactions and adjacent-free displacements (`edge_responses`, NaN
+when absent), `kf_matrix`, residual and rank diagnostics, and
+`Q_alpha_shoe_on_foot_basis` `(n_rec, 6)`: the generalized force of the shoe on
+the foot along the top-shape coordinate with the rearfoot (heel → MTP line)
+held fixed, \(Q_\alpha^{\mathrm{shoe}\to\mathrm{foot}}=-\psi^\mathsf T\mathbf f_{t,y}\),
+\(\psi(x)=\varphi_1(x)-(x/a)\varphi_1(a)\), used by the passive toe spring
+([docs/passive_toe_spring.md](docs/passive_toe_spring.md)). Toe moment about
+\(P_{\mathrm{toe}}=(a,H_a)\) is
 
 \[
 T_{\mathrm{toe}}=\boldsymbol{\rho}_a^T\mathbf f_{t,y}-\boldsymbol{\eta}_a^T\mathbf f_{t,x},
@@ -164,33 +152,23 @@ T_{\mathrm{toe}}=\boldsymbol{\rho}_a^T\mathbf f_{t,y}-\boldsymbol{\eta}_a^T\math
 [\boldsymbol{\rho}_a]_j=\max(0,x_{t,j}-a).
 \]
 
-\(H_a\) is interpolated from \(y_{\mathrm{top}}\). On a flat top, \(\eta_a=0\).
-If \(a\) is not a top node, the existing nodal ramp is used (no remesh). Because
-\(\rho_a\) and \(\eta_a\) are **reference** levers about \((a,H_a)\), the toe
-moment superposes as a scalar exactly like every other saved quantity.
-
-Full contact additionally stores `corner_reactions_local` with shape
-`[basis, corner={heel,toe}, component={x,y}]` (local rotating-frame nodal forces
-at \(x=0\) and \(x=L\)). Those entries are finite only on the full-contact row;
-heel/toe rows store `NaN`.
-
-The lookup schema version is \(6\), with `scalar_lookup` shape `(n_records, 5, 10)`.
-Files that are not `schema_version=6` **hard-fail** with a regenerate message.
-Older tables cannot be migrated: v4 stored only the toe family (no full-contact
-record or corner reactions); v5 has heel/full/toe but no `plate_response` fields.
+`schema_version` is **9**. Files with schema v8 or older (heel/toe/full tables
+with \(2N_b-1\) records, contact-edge or \(L/2\) anchors and no curved-sole
+closure) are **rejected** with a regenerate message; they cannot be migrated to
+arbitrary interval support.
 
 ## Internal plate response
 
 For layered lookups, plate fields are recovered from the **same** coupled
 foam–plate FEM factorization used while generating the contact table—not a
-separate plate solver. Each record stores five-mode basis fields
-\(u\), \(v\), \(\theta\), \(\lambda\), and axial force (same basis order as the
-boundary modes). Axial constraint rows \(B_p\) are unscaled
+separate plate solver. Each interval record stores six-column affine basis fields
+\(u\), \(v\), \(\theta\), \(\lambda\), and axial force (same column order as the
+boundary responses, closure first). Axial constraint rows \(B_p\) are unscaled
 (\(t_p\cdot(u_{j+1}-u_j)=0\)), so the Lagrange multiplier already has force
 units and equals the element axial constraint force.
 
-At runtime the stored modes are contracted with the same \(\boldsymbol\gamma\)
-as the foam scalars. The centerline is rebuilt with cubic Hermite interpolation;
+At runtime the selected interval's stored plate response is contracted with the
+same \([1,\boldsymbol\gamma]\) as the foam scalars. The centerline is rebuilt with cubic Hermite interpolation;
 curvature \(\kappa=w''\), bending moment \(M=EI\,\kappa\), and shear
 \(V=EI\,w'''\). Fixed-frame placement uses the shared foam anchor transform
 \(r^{\mathcal F}=r_a^{\mathcal F}+Q(\varphi)[(\mathbf X-\mathbf X_a)+s_d(\mathbf d^{\mathcal T}-\mathbf d_a^{\mathcal T})]\);
@@ -198,7 +176,7 @@ the elastic display scale \(s_d\) never multiplies \(\varphi\).
 
 The Streamlit GUI exposes plate toggles (show plate, undeformed plate, nodes,
 rotations), a color quantity, samples/element, and a plate-results summary
-panel. Rectangle lookups are still schema 6 but omit `plate_response`; the GUI
+panel. Rectangle lookups are also schema 9 but omit `plate_response`; the GUI
 reports plate fields as **N/A**.
 
 ## Co-rotating top frame
@@ -219,8 +197,8 @@ Q(\varphi)=\begin{bmatrix}\cos\varphi&-\sin\varphi\\ \sin\varphi&\cos\varphi\end
 reference top surface is handled correctly. Only \(\varphi\) appears in
 \(Q^T-I\) terms.
 
-Contact nodes move rigidly with the frame relative to the record anchor
-\(x_a\) (\(l_i\) for heel/toe, \(L/2\) for full),
+Contact nodes move rigidly with the frame relative to the interval anchor
+\(x_a=(x_i+x_j)/2\) (plus the curved-sole closure on a curved bottom),
 
 \[
 \mathbf d_c^{\mathcal T}(x)=\mathbf d_a^{\mathcal T}+\bigl(Q(\varphi)^T-I\bigr)(\mathbf X-\mathbf X_a)
@@ -267,7 +245,7 @@ record (no inverse, no regularization)
 \begin{bmatrix}d_{a,x}\\d_{a,y}\end{bmatrix}
 =
 F^{\mathcal T\star}
--\bigl(\alpha F^{\mathcal T}_{\varphi_1}+r_x F^{\mathcal T}_{B_{rx}}+r_y F^{\mathcal T}_{B_{ry}}\bigr).
+-F^{\mathcal T}_{\mathrm{closure}}-\bigl(\alpha F^{\mathcal T}_{\varphi_1}+r_x F^{\mathcal T}_{B_{rx}}+r_y F^{\mathcal T}_{B_{ry}}\bigr).
 \]
 
 Singular values, determinant, and condition number of \(K_F\) are reported;
@@ -278,46 +256,41 @@ verified against the targets in both frames. Every scalar and vector output is
 then superposed with the same \(\boldsymbol\gamma\) through one shared
 `contract_basis` contraction.
 
-For heel/toe the rotated contact-edge coordinate is \(x_{l,\mathrm{rot}}=l_i+d_{a,x}\)
-(NaN for full). The lookup itself is indexed by topology plus the **material**
-coordinate \(l_i\) (NaN for full); the shared gauge is
-\(r_a^{\mathcal F}=(x_a,0)\).
+The lookup is indexed by the interval \((i,j)\); the shared visualization gauge
+is \(r_a^{\mathcal F}=(x_a,0)\).
 
-### Contact selection (fixed-frame normal gap and \(R_n\) only)
+### Contact admissibility and interval selection
 
 Gaps and reactions are tested in the **fixed** frame, since the ground normal is
 fixed while the body rotates:
 
 \[
-g_j^{\mathcal F}=\sin\varphi\,\Delta x_j^{\mathcal T}+\cos\varphi\,\Delta y_j^{\mathcal T},
+g_k=\sin\varphi\,\Delta x_k+\cos\varphi\,\Delta y_k,
 \qquad
-R_n^{\mathcal F}=\sin\varphi\,R_{c,x}^{\mathcal T}+\cos\varphi\,R_{c,y}^{\mathcal T},
+R_{n,k}=\sin\varphi\,R_{x,k}^{\mathcal T}+\cos\varphi\,R_{y,k}^{\mathcal T},
 \]
 
-with \(\Delta x_j=(x_j+u_j)-(x_a+d_{a,x})\) and \(\Delta y_j=v_j-d_{a,y}\).
-Selection does **not** use the tangential reaction \(R_t\), \(M_v\),
-\(x_{\mathrm{cm}}\), or \(T_{\mathrm{toe}}\).
+with \(\Delta x_k=(x_k-x_a)+u_k-d_{a,x}\) and \(\Delta y_k=(y_k-y_a)+v_k-d_{a,y}\).
+An interval is admissible when it reproduces \(F^\star\), **every** free node has
+\(g_k\ge-\tau_{g,\mathrm{eff}}\), and **every** contact node (both edges and all
+interior nodes) has \(R_{n,k}\ge-\tau_{R,\mathrm{eff}}\), with mesh- and
+load-scaled tolerances. For linear elements the nodal checks are exact (the gap
+is piecewise linear); quadratic elements also check the per-segment minimum.
+Interior tension sets `disconnected_contact_warning`. Selection does **not** use
+the tangential reaction, \(M_v\), \(x_{\mathrm{cm}}\), or \(T_{\mathrm{toe}}\).
 
-**AUTO** routing starts from the full-contact corner normals \(R_n\) at \(x=0\)
-(heel) and \(x=L\) (toe):
-
-- both compressive \(\Rightarrow\) select full immediately
-- heel tensile \(\Rightarrow\) search the toe family only
-- toe tensile \(\Rightarrow\) search the heel family only
-- both tensile (or full \(K_F\) ill-conditioned) \(\Rightarrow\) search both partial families
-
-Full contact is **never** returned silently when either corner is tensile.
-Forced modes restrict the pool to **Heel**, **Full**, or **Toe**. A partial
-record is admissible when free \(g^{\mathcal F}\) and contact \(R_n^{\mathcal F}\)
-satisfy the unilateral inequalities within \(\tau_g,\tau_R\); full validity uses
-the two corner normals only (interior tension stays diagnostic). Among admissible
-well-conditioned records in the routed pool, a deterministic representative
-minimizes the edge score on the free/contact edge pair. If none are admissible,
-the least-violating well-conditioned record is returned and marked approximate.
-
-The dimensionless violation score uses the worst free-gap and contact-reaction
-violations (plus force residual), with denominators \(\tau_g,\tau_R\) when
-positive and otherwise data-driven gap/reaction scales.
+Contact modes: **Auto**, **Heel** (\(i=0\)), **Interior**, **Toe**
+(\(j=N_b-1\)), **Full** (forced) and **Specific** (forced, validated \((i,j)\));
+legacy names `Auto` / `Heel contact` / `Full contact` / `Toe contact` map onto
+these. The search reports `candidate_search_method`:
+`local_interval_search` / `expanded_interval_search` (near the previous
+interval, only with temporal continuity enabled), `global_interval_search`,
+`forced_interval`, or `least_violating_fallback` (no admissible interval;
+minimum violation score, marked approximate). Among admissible intervals the
+previous one is kept if still admissible, otherwise the smallest edge
+complementarity score wins; continuity is a tie-breaker among physically
+acceptable candidates only and never keeps a penetrating or tensile interval.
+Details: [docs/interval_contact.md](docs/interval_contact.md).
 
 The center of effort is computed in the fixed frame by rotating both the top
 nodal reactions and the top nodal positions, and is `NaN` when \(|F_y^\star|\) is
@@ -335,15 +308,17 @@ below the zero tolerance. Its absolute value depends on the visualization gauge
 ### Generate lookup, query, and GUI
 
 ```bash
-# regenerate lookup (schema v6, heel/full/toe, five-mode co-rotating basis) — required after upgrading.
+# regenerate lookup (schema v10: every contiguous contact interval, six-column affine basis;
+# v9 rectangle/layered files are migrated on load, older files must be regenerated).
 # Generation never sees phi: the table is built once and reused for every angle.
 # Layered compliance NPZs recompute FEM in-process so plate_response can be recovered.
-python -m compliance_fem.contact_lookup \
+python -m compliance_fem.contact_lookup_cli \
   --compliance outputs/rectangle/compliance_results.npz \
   --a 0.6 --kappa 30 --reciprocity-tol 1e-6 --output outputs/contact_lookup
+# add --store-fields to keep the per-node bases in the NPZ (default: recomputed on demand)
 
 # raw gamma debug query: alpha d_ax d_ay r_x r_y
-# optional --contact-type {heel,toe,full} restricts the reported family best
+# optional --contact-type {heel,interior,toe,full} restricts the reported best interval
 python -m compliance_fem.query_contact_lookup \
   --lookup outputs/contact_lookup/contact_lookup.npz \
   --coefficients 0.1 0.0 -1e-3 -0.002 0.07
@@ -356,17 +331,38 @@ streamlit run src/compliance_fem/app.py
 
 Lookup outputs:
 
-- `contact_lookup.npz` — `scalar_lookup` `(n_records,5,10)`, `contact_type_codes`,
-  `corner_reactions_local`, `top_force_x/y_basis`, `gap_u/v_basis`,
-  `reaction_x/y_basis`, `kf_matrix` `(n_records,2,2)`, `kf_svals`, `phi_ref`,
-  `schema_version=6`; layered tables may also store `plate_response` arrays
-  (`plate_*_basis`, mesh connectivity, `has_plate_response=True`)
-- `contact_lookup.csv` — scalars per mode plus \(K_F\) cond/det/\(\sigma_{\min}\) and residuals
-- `contact_lookup_metadata.json` — topologies, frame and angle conventions, `phi_ref`,
-  the five-mode basis order, `force_frame`, the shape-mode formula, plate-response
-  flags when present, and the regenerate note
-- diagnostic plots of \(F_x\), \(F_y\), \(M_v\), edge free gap / contact reaction,
-  \(T_{\mathrm{toe}}\), and residuals vs \(l\) (per family)
+- `contact_lookup.npz` — interval arrays (`contact_start/end_index`, `contact_start/end_x`,
+  anchors, adjacent free ids, `contact_mask`, status, rejection reasons), six-column
+  `scalar_lookup` `(n_records,6,6)`, `edge_responses`, `kf_matrix`,
+  `Q_alpha_shoe_on_foot_basis`, `phi_ref`, `rigid_alpha_basis`, `schema_version=10`,
+  and the prepared compliance matrix `field_solver_compliance`. The per-node bases
+  (bottom displacement / reaction, top force, plate) are recomputed on demand by
+  `lookup.record_fields(rows)`, bitwise identical to stored ones; `--store-fields`
+  (or `generate_contact_lookup(..., store_fields=True)`) also saves them. See
+  [docs/interval_contact.md](docs/interval_contact.md#stored-scalars-on-demand-nodal-fields).
+  Layered and measured tables also store `plate_response` data (mesh connectivity,
+  plate influence matrices or `plate_*_basis`, `has_plate_response=True`);
+  measured-sole tables add the stored mesh and render influence matrices
+- `contact_lookup.csv` — one row per interval with scalars per column, status and residuals
+- `contact_lookup_metadata.json` — contact law, anchor definition, closure convention,
+  frame and sign conventions, label counts, rejection counts, build time
+- `generation_summary.json` — \(N_b\), theoretical / valid record counts per label,
+  rejection counts, build time and file size
+- diagnostic plots of the scalar lookup, interval validity and solver residuals
+
+### Interval contact performance
+
+| Lookup | \(N_b\) | intervals (valid / theoretical) | rejected | file | build | runtime per sample |
+|--------|---------|------------------|---------|------|-------|-------------------|
+| `outputs/contact_lookup` (rectangle 1 m × 0.5 m, 80×40) | 81 | 3321 / 3321 | 0 | 45.1 MB | 639 s | 90–105 ms (Auto, all intervals); 42 ms per gait frame (force-phi) |
+| `outputs/layered_contact_lookup` (layered plate, nx=100) | 101 | 5151 / 5151 | 0 | 185 MB | 746 s | 18–70 ms per gait frame (passive toe, local-first search) |
+| measured sole, 270 mm, 3 mm mesh | 126 | 8001 / 8001 | 0 | 19.6 MB (377 MB with `--store-fields`) | 47–73 s | 0.24 s per `SoleModel.step` |
+
+Build times were measured with both lookups generating concurrently on one
+machine; the rectangle and layered sizes are for files with stored nodal
+fields. Generation cost grows like \(N_b^2\) intervals times one dense
+factorization. Runtime contracts stored scalars for every interval and re-solves
+nodal fields only for the few intervals that pass the exact edge prefilter.
 
 The Streamlit app no longer loads a prebuilt NPZ as its primary input. Sidebar
 controls expose layered geometry (\(L\), \(h_1/h_2\) heel/toe), softplus
@@ -378,11 +374,12 @@ contact-lookup CLI (`a=0.2262`, \(\kappa=160\)). Display units are mm / Pa /
 N·mm² / kN; solvers use SI. Heights use a 0.5 mm floor (configs require \(h>0\));
 Poisson ratios cap at 0.49 to avoid plane-strain lock.
 
-The app also has a **contact-mode** control (Auto / Heel / Full / Toe). Free-edge
-gap and contact-edge coordinate show **N/A** for full contact. The fixed-frame plot
-shades the contact interval \([0,l]\), \([l,L]\), or \([0,L]\), marks the physical
-contact edge for heel/toe, and uses a distinct open-square marker for the full-contact
-numerical anchor \(x_a=L/2\). Geometry uses
+The app has a **contact-mode** control (Auto / Heel / Interior / Toe / Full /
+Specific, with start/end node inputs for Specific). Absent edge quantities show
+**N/A**. The fixed-frame plot draws the contact interval as a solid curve on the
+ground, the free bottom dashed, the heel and toe contact edges at \(l_h\), \(l_t\),
+the adjacent free nodes, and the interval anchor as a grey open cross labelled
+numerical (not a contact boundary). Geometry uses
 
 \[
 r^{\mathcal F}=r_a^{\mathcal F}+Q(\varphi)\bigl[(\mathbf X-\mathbf X_a)+s_d(\mathbf d^{\mathcal T}-\mathbf d_a^{\mathcal T})\bigr],
@@ -473,12 +470,47 @@ or
 python examples/layered_plate_sample.py
 ```
 
+Image-derived carbon-plated sole (two foams, partial curved plate) from the
+normalized geometry CSV; `--shoe-length-mm` is the projected heel-bottom-to-toe
+length and is required:
+
+```bash
+python -m compliance_fem.cli \
+  --geometry measured-sole \
+  --geometry-csv data/geometry/sole_geometry_normalized.csv \
+  --shoe-length-mm 270 \
+  --output outputs/measured_sole
+
+python examples/measured_sole_validation.py --shoe-length-mm 270
+```
+
+All non-CSV parameters (shoe length, materials, plate EI, mesh, softplus `a` /
+`kappa`, toe spring, shoe width, lookup directory) can instead come from a JSON
+config such as `configs/measured_sole_270mm.json`. Explicit CLI flags override
+the file:
+
+```bash
+python -m compliance_fem.measured_config_file build configs/measured_sole_270mm.json
+python -m compliance_fem.contact_lookup_cli --config configs/measured_sole_270mm.json --kappa 120 --output outputs/k120
+```
+
+```python
+from compliance_fem.api import SoleModel
+model = SoleModel.from_config("configs/measured_sole_270mm.json")
+```
+
+In the GUI choose **Geometry model → Measured carbon-plated sole** (CSV, overall
+shoe length, upper/lower foam, mesh size, refinements). See
+[docs/measured_sole.md](docs/measured_sole.md) for the file format, conventions,
+validation and limitations.
+
 The rectangle path remains the default (`--geometry rectangle`). Contact lookup
-still consumes the same nodal-force blocks; changing only topology / \(l\),
-\(F_x\), \(F_y\), \(\phi\), \(\theta\) requires neither regenerating FEM nor
+still consumes the same nodal-force blocks; changing only
+\(F_x\), \(F_y\), \(\phi\), \(\theta\) or the contact interval requires neither regenerating FEM nor
 regenerating the lookup table, since all angle dependence is applied at runtime.
 Changing geometry or material parameters does. Old vertical-only compliance NPZs
-and any lookup file that is not `schema_version=6` must be regenerated.
+and any lookup file older than `schema_version=9` must be regenerated (v9
+rectangle/layered lookups are migrated to v10 on load).
 When generating a layered lookup from a compliance NPZ, the CLI recomputes the
 FEM in-process so the factorization is available for `plate_response` recovery.
 
@@ -505,6 +537,11 @@ pytest
 src/compliance_fem/
   geometry.py             Gmsh rectangle mesh generation
   layered_geometry.py     Two-trapezoid mesh with shared plate interface
+  measured_geometry.py    Normalized sole CSV loader, validation, exterior/regions/plate
+  measured_mesh.py        Gmsh two-foam mesh with tagged selectors and plate polyline
+  measured_render.py      Stored-mesh render section and render influence matrices
+  api.py                  SoleModel: stateful step() interface for external codebases
+  measured_config_file.py Measured-sole JSON config: parse, fingerprint, build/reuse lookup
   assembly.py             Plane-strain stiffness (constant and E(x))
   plate.py                Hermite Euler–Bernoulli plate assembly
   plate_response.py       Plate basis recovery, Hermite postprocess, runtime state
@@ -514,11 +551,12 @@ src/compliance_fem/
   compliance.py           Saddle-point solves and compliance blocks
   validation.py           Full-bottom-contact analytical checks
   corotation.py           Frame math: Q(varphi), phi_ref, gamma, basis contraction
-  contact_topology.py     Heel / full / toe sets, record enumeration, anchors
-  contact_basis.py        Five-mode boundary basis (softplus shape + contact motion)
-  contact_lookup.py       Contact-topology lookup table (schema v6)
+  contact_topology.py     Contact intervals I_ij, labels, mode filters, validation
+  contact_basis.py        Six-column affine basis (closure + softplus shape + contact motion)
+  contact_lookup.py       Interval contact lookup table (schema v10)
+  toe_spring.py           Passive toe spring: exact equilibrium, roots, stability
   contact_query.py        Raw gamma superposition (lookup-level debug path)
-  force_control.py        Fx/Fy/φ/θ runtime: force rotation, 2x2 K_F solve, routing
+  force_control.py        Fx/Fy/φ/θ runtime: K_F solve, all-node checks, interval search
   shape_render.py         Fixed-frame deformed-outline plot data
   app.py                  Streamlit GUI (live layered rebuild + contact mode)
   gui_params.py           GUI defaults, dual slider/number widgets, SI conversion
@@ -529,6 +567,14 @@ src/compliance_fem/
   plotting.py             Compliance diagnostic figures
   cli.py                  Compliance command-line driver
   viscoelasticity/        Viscoelastic F_VE(t) → elastic F_e(t) mapper + CLI
+  gait/                   Wang gait force-replay (passive-toe-spring θ by default) + CLI/GUI
 docs/viscoelasticity.md   Viscoelastic force-map mathematics and usage
+docs/gait_replay.md       Gait replay conventions, citations, limitations
+docs/passive_toe_spring.md Passive toe spring model, signs, solver, limitations
+docs/interval_contact.md  Single-interval contact model, schema v10, selection, limits
+docs/measured_sole.md     Measured carbon-plated sole: CSV, conventions, validation, limits
+docs/external_api.md      SoleModel.step(): loads / pitch in, displacements / moments out
+configs/measured_sole_270mm.json  Example measured-sole configuration (all non-CSV parameters)
+src/compliance_fem/pages/1_Gait_replay.py    Streamlit multipage entry for gait replay
 ```
 
