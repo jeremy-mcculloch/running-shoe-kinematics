@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "compliance-fem"
 version = "0.2.0"
-description = "Plane-strain FEM compliance matrices for rectangular and layered-plate bodies"
+description = "Plane-strain FEM compliance matrices for measured carbon-plated running-shoe soles"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -26,11 +26,8 @@ dependencies = [
 dev = ["pytest>=7.4"]
 
 [project.scripts]
-compliance-fem = "compliance_fem.cli:main"
-compliance-fem-contact-lookup = "compliance_fem.contact_lookup_cli:main"
-compliance-fem-query-contact = "compliance_fem.query_contact_lookup:main"
-visco-force-map = "compliance_fem.viscoelasticity.cli:main"
-compliance-fem-gait-replay = "compliance_fem.gait.cli:main"
+compliance-fem-contact-lookup = "compliance_fem.cli.contact_lookup:main"
+visco-force-map = "compliance_fem.cli.visco_force_map:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 
-import compliance_fem.contact_lookup as contact_lookup
-from compliance_fem.contact_lookup import (
+import compliance_fem.contact.lookup as contact_lookup
+from compliance_fem.contact.lookup import (
     REJECT_RANK_DEFICIENT,
-    from_compliance_result,
+    get_compliance_block_matrix,
     generate_contact_lookup,
     record_counts,
 )
-from compliance_fem.contact_topology import (
+from compliance_fem.contact.topology import (
     ABSENT_NODE_ID,
     CONTACT_SET_MODEL,
     ContactInterval,
@@ -26,7 +28,7 @@ from compliance_fem.contact_topology import (
     validate_interval,
 )
 
-from conftest import SMALL_A, SMALL_KAPPA
+from conftest import SMALL_KAPPA, SMALL_TOE_LENGTH
 
 
 @pytest.mark.parametrize("n", [1, 2, 3, 7, 13])
@@ -151,20 +153,21 @@ def test_one_node_interval_does_not_double_count_edge_force(flat_lookup_full) ->
 
 def test_rank_deficient_interval_rejected_with_structured_reason(flat_case, monkeypatch) -> None:
     result, _ = flat_case
-    blocks = from_compliance_result(result)
+    blocks = get_compliance_block_matrix(result)
     n = len(blocks.x_bottom)
     target_contact = 3  # contact count that identifies the sabotaged interval (2, 4)
     real = contact_lookup.build_boundary_matrix
 
     def sabotaged(blocks_, free, contact, x_r, y_r=0.0):
-        A, R_t, R_f, rb = real(blocks_, free, contact, x_r, y_r=y_r)
+        system = real(blocks_, free, contact, x_r, y_r=y_r)
         if contact.size == target_contact and int(contact[0]) == 2:
-            A = A.copy()
+            A = system.A.copy()
             A[-1, :] = A[-2, :]  # duplicate a row: exactly singular
-        return A, R_t, R_f, rb
+            return dataclasses.replace(system, A=A)
+        return system
 
     monkeypatch.setattr(contact_lookup, "build_boundary_matrix", sabotaged)
-    lookup = generate_contact_lookup(blocks, a=SMALL_A, kappa=SMALL_KAPPA)
+    lookup = generate_contact_lookup(blocks, toe_length=SMALL_TOE_LENGTH, kappa=SMALL_KAPPA)
     row = lookup.row_of(2, 4)
     assert not lookup.valid_mask[row]
     assert lookup.rejection_reason[row].startswith(REJECT_RANK_DEFICIENT)

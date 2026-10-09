@@ -9,6 +9,7 @@ positions, displacements, forces and moments. No FEM is solved at runtime.
 ```python
 from compliance_fem.api import SoleModel
 
+# lookup.output_dir written by `compliance-fem-contact-lookup configs/setup.json`
 model = SoleModel("outputs/measured_sole_lookup", shoe_width_m=0.10)  # load once
 
 for Fx, Fy, phi in external_frames:            # N, N, degrees
@@ -30,8 +31,8 @@ the lookup was generated from the same parameters (see
 [measured_sole.md](measured_sole.md#configuration-file)):
 
 ```python
-model = SoleModel.from_config("configs/measured_sole_270mm.json", build_if_missing=True)
-model.setup.a, model.setup.sole.EI_plate        # the parsed configuration
+model = SoleModel.from_config("configs/setup.json", build_if_missing=True)
+model.setup.toe_length_m, model.setup.sole.EI_plate_Nm2_per_m   # the parsed configuration
 ```
 
 ## Inputs

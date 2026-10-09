@@ -24,11 +24,11 @@ from pathlib import Path
 
 import numpy as np
 
-from compliance_fem.contact_lookup import SCALAR_MZ, SCALAR_TOE, ContactLookupResult, load_contact_lookup
-from compliance_fem.corotation import contract_basis
-from compliance_fem.force_control import EXACT_ALL, SelectionConfig, Tolerances, reconstruct_rows
+from compliance_fem.contact.lookup import SCALAR_MZ, SCALAR_TOE, ContactLookupResult, load_contact_lookup
+from compliance_fem.contact.corotation import contract_basis
+from compliance_fem.contact.force_control import EXACT_ALL, SelectionConfig, Tolerances, reconstruct_rows
 from compliance_fem.gait.passive_toe import pick_instant_best_passive, solve_passive_toe_candidates
-from compliance_fem.toe_spring import ToeSpringConfig
+from compliance_fem.contact.toe_spring import ToeSpringConfig
 
 
 def _nan2(n: int) -> np.ndarray:
@@ -111,8 +111,6 @@ class SoleModel:
             raise ValueError(f"shoe_width_m must be positive, got {shoe_width_m!r}.")
         self.shoe_width_m = width
         self.toe_config = toe_config or ToeSpringConfig()
-        if not self.toe_config.is_passive:
-            raise ValueError("SoleModel solves the passive toe spring; use a passive toe_model.")
         self.tolerances = tolerances or Tolerances()
         self.selection_config = selection_config or SelectionConfig()
         self.cond_limit = float(cond_limit)
@@ -147,24 +145,24 @@ class SoleModel:
         """
         import warnings
 
-        from compliance_fem.measured_config_file import (
+        from compliance_fem.contact.model_setup import (
             ConfigFileError,
-            ensure_measured_lookup,
-            load_measured_sole_config,
+            ensure_lookup_exists,
+            load_model_setup,
             lookup_matches_setup,
         )
 
-        setup = load_measured_sole_config(config)
+        setup = load_model_setup(config)
         if lookup is None:
             if setup.output_dir is None:
                 raise ConfigFileError(f"{config}: set lookup.output_dir or pass lookup=... to SoleModel.from_config.")
-            lookup = ensure_measured_lookup(setup) if build_if_missing else setup.output_dir
+            lookup = ensure_lookup_exists(setup) if build_if_missing else setup.output_dir
         lk = lookup if isinstance(lookup, ContactLookupResult) else load_contact_lookup(lookup)
         match = lookup_matches_setup(lk, setup)
         if match is False and require_matching_lookup:
             raise ConfigFileError(
                 f"The lookup was built from different parameters than {config}. Regenerate it with "
-                f"`python -m compliance_fem.measured_config_file build {config}` "
+                f"`compliance-fem-contact-lookup {config} --force` "
                 "or pass require_matching_lookup=False."
             )
         if match is None:

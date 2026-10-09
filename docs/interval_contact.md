@@ -1,4 +1,4 @@
-# Single-contiguous-interval ground contact (lookup schema v10)
+# Single-contiguous-interval ground contact
 
 The contact lookup describes the sole touching flat ground \(y=0\) (upward normal
 \(n_g=(0,1)\)) on **one contiguous interval of bottom nodes**. Every such interval
@@ -94,7 +94,7 @@ produces:
 - `Q_alpha_shoe_on_foot_basis` `(n_rec, 6)` for the passive toe spring;
 - `kf_matrix` `(n_rec, 2, 2)` and its singular values / condition number;
 - residual diagnostics, numerical rank, matrix size, condition estimate;
-- for layered results, the six-column plate bases (`plate_u/v/rotation_local_basis`,
+- the six-column plate bases (`plate_u/v/rotation_local_basis`,
   multiplier, axial force) recovered from the same factorized FEM.
 
 ### Stored scalars, on-demand nodal fields
@@ -105,17 +105,15 @@ residuals, interval topology). The per-node bases above (and the plate bases)
 are **not** stored; they are recomputed on demand by
 `ContactLookupResult.record_fields(rows, plate=False)`, which re-runs the
 record's boundary solve from the stored prepared compliance matrix
-(`field_solver_compliance`, \((2n_t+2N_b)^2\)) and, for layered/measured soles,
-the plate influence matrices (`plate_influence_*`). The re-solve uses the same
+(`field_solver_compliance`, \((2n_t+2N_b)^2\)) and the plate influence matrices (`plate_influence_*`). The re-solve uses the same
 code path and inputs as generation, so the fields are **bitwise identical** to
 stored ones. Solved records are kept in a thread-safe LRU cache
 (`FIELD_CACHE_ROWS = 2048`).
 
 The per-node bases grow like \(N_b^3\) (one \(6\times N_b\) block per each of the
 \(N_b(N_b+1)/2\) intervals), so this is what keeps the measured 270 mm lookup at
-about 20 MB instead of 377 MB. Pass `generate_contact_lookup(..., store_fields=True)`,
-`python -m compliance_fem.contact_lookup_cli --store-fields`, or set
-`lookup.store_nodal_fields: true` in a measured config to keep them; selections
+about 20 MB instead of 377 MB. Set `lookup.store_nodal_fields: true` in the config
+passed to `compliance-fem-contact-lookup` to keep them; selections
 are identical either way. `lookup.nodal_fields_stored` reports the mode.
 
 At runtime, `reconstruct_rows(..., exact="auto")` evaluates every row from the
@@ -128,7 +126,7 @@ admissibility is exact. For non-prefiltered rows the result carries
 score, gap/reaction penalties and maximum free penetration are edge-only **lower
 bounds** (scaled by \(1-10^{-9}\)); minimum free gap and minimum contact
 reaction are upper bounds. Wherever these rows are ranked (least-violating
-fallback, passive-toe and wrench-control shortlists), `refine_top_k` makes the
+fallback and passive-toe shortlists), `refine_top_k` makes the
 leading candidates exact before trusting the order, so the chosen row and its
 reported values match a fully stored lookup. `exact="all"` forces exact fields
 for every row. On a stored lookup every evaluated row is exact.
@@ -173,10 +171,9 @@ A record is admissible when it is finite, reproduces \(F^\star\), **every** free
 node has \(g_k\ge-\tau_{g,\mathrm{eff}}\) and **every** contact node — both edges
 and all interior nodes — has \(R_{n,k}\ge-\tau_{R,\mathrm{eff}}\).
 
-For linear elements the bottom gap is piecewise linear between nodes, so its
-minimum over a free segment is attained at a node and the nodal check is exact.
-For quadratic elements the per-segment quadratic minimum
-(`_quadratic_segment_minimum`) is also checked.
+The mesh uses linear elements, so the bottom gap is piecewise linear between
+nodes, its minimum over a free segment is attained at a node, and the nodal
+check is exact.
 
 Interior tension on an otherwise compressive interval sets
 `disconnected_contact_warning` and the message recommends a multi-interval
@@ -195,8 +192,8 @@ or unstable toe root).
 
 Modes: **Auto** (all intervals), **Heel** / **Toe** (attached to that end;
 the full interval is included in both), **Interior**, **Full** (forced), and
-**Specific** (forced \((i,j)\), validated). Legacy GUI names `Auto`,
-`Heel contact`, `Full contact`, `Toe contact` map onto these filters.
+**Specific** (forced \((i,j)\), validated). `parse_contact_mode` accepts the
+enum values (case-insensitive) and the GUI labels.
 
 Search labels (`candidate_search_method`):
 
@@ -234,26 +231,15 @@ mode or interval only re-contracts stored data.
 
 ## Schema and compatibility
 
-`schema_version = 10`, `contact_set_model = "single_contiguous_interval"`,
-`contact_anchor_definition = "interval_midpoint"`. v10 adds per-record
-`rigid_alpha_basis` and an optional measured-sole geometry section
-([measured_sole.md](measured_sole.md)); v9 rectangle and layered files are
-migrated on load. Files with schema v8 or
-older are rejected with a regenerate message: they store only \(2N_b-1\)
-heel/toe/full records with contact-edge or \(L/2\) anchors and no curved-sole
-closure, so they cannot represent arbitrary curved-sole intervals. Missing
-interval fields, a different anchor definition or truncated record arrays are
-also rejected. Compact (default) and full-field v10 files share the schema;
-the saved `nodal_fields_stored` flag tells them apart, and older full-field v10
-files load unchanged.
-
-## Layered rocker bottom boundary
-
-The layered mesh previously selected bottom facets with a midpoint test that
-fails on a curved (rocker) bottom profile, leaving no bottom boundary. Bottom
-facets are now the boundary facets whose nodes all lie on
-`config.y_bottom(x)`, so curved layered soles build interval lookups whose plate
-response matches direct FEM.
+`schema_version = 11`, `contact_set_model = "single_contiguous_interval"`,
+`contact_anchor_definition = "interval_midpoint"`. The file stores per-record
+`rigid_alpha_basis` and the measured-sole geometry section
+([measured_sole.md](measured_sole.md)). Files with any other schema version are
+rejected with a regenerate message, as are files with truncated record arrays.
+Compact (default) and full-field files share the schema; the saved
+`nodal_fields_stored` flag tells them apart. The softplus joint is stored as
+the toe length `softplus_toe_length` (metres; the joint sits at
+\(L-\ell_{\mathrm{toe}}\)).
 
 ## Performance
 

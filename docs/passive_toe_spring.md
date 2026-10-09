@@ -7,15 +7,15 @@ No FEM solve is performed per gait frame: the stored contact lookup is linear in
 the generalized coordinates, so every frame reduces to a scalar root find per
 contact record.
 
-Implementation: `src/compliance_fem/toe_spring.py` (spring, affine model, root
+Implementation: `src/compliance_fem/contact/toe_spring.py` (spring, affine model, root
 solver), `src/compliance_fem/gait/passive_toe.py` (per-frame candidates), and
 `src/compliance_fem/gait/replay.py` (runtime integration).
 
 ## Why \(\theta\) is an output
 
-The earlier replay either prescribed \(\theta\) with an empirical formula
-(`prescribed_legacy`: \(\theta=\mathrm{ReLU}(-\phi)(1-(1-F_y^c/F_y^{\max})^4)\)) or
-fitted \(\alpha\) to the measured sagittal moment/COP (`fit_cop_legacy`). Neither
+Earlier versions of the replay either prescribed \(\theta\) with an empirical formula
+(\(\theta=\mathrm{ReLU}(-\phi)(1-(1-F_y^c/F_y^{\max})^4)\)) or
+fitted \(\alpha\) to the measured sagittal moment/COP; both have been removed. Neither
 is mechanics: the formula is arbitrary, and the COP fit makes the toe
 coordinate absorb all moment-modelling error. With a passive joint the angle
 is whatever balances the shoe's reaction against the joint stiffness, so it is
@@ -44,7 +44,7 @@ be identified, not a measured property of these subjects.
 \(\alpha=0\), i.e. the stored reference geometry) is taken as the spring's
 stress-free configuration. Zero load therefore gives exactly \(\theta=0\).
 
-**No damping.** The equation is quasistatic: \(c\) is stored in provenance, a
+**No damping.** The equation is quasistatic: \(c\) is stored in `toe_config`, a
 warning is issued if it is nonzero, and it never enters the solve.
 
 ## Coordinate: \(\alpha=\tan\theta\)
@@ -59,8 +59,10 @@ displacement \(v_{\mathrm{top}}=\alpha\,\varphi_1(x)\) from mode 0 only (modes
 \qquad s=\text{softplus (metres)},
 \]
 
-so \(\varphi_1(0)=\varphi_1(L)=0\) and \(\varphi_1\le 0\) in the interior
-(\(\varphi_1(a)\approx-a(L-a)/L\)). The toe angle is
+where \(s\) turns on at the softplus joint \(x_{\mathrm{mtp}}=L-\ell_{\mathrm{toe}}\)
+and \(\ell_{\mathrm{toe}}\) is the toe length (joint to toe tip, metres). So
+\(\varphi_1(0)=\varphi_1(L)=0\) and \(\varphi_1\le 0\) in the interior
+(\(\varphi_1(x_{\mathrm{mtp}})\approx-(L-\ell_{\mathrm{toe}})\,\ell_{\mathrm{toe}}/L\)). The toe angle is
 \(\theta=\arctan\alpha\) **exactly** — no small-angle substitution anywhere
 (\(\arctan\alpha\neq\alpha\) in the spring energy and its derivatives).
 
@@ -99,15 +101,15 @@ therefore:
 1. rotates the chord frame, exactly (within the lookup's displacement
    kinematics):
    \[
-   \varphi(\alpha)=\phi-\operatorname{atan2}\bigl(y_{\mathrm{top}}(a)-y_{\mathrm{top}}(0)+\alpha\,\varphi_1(a),\;a\bigr),
+   \varphi(\alpha)=\phi-\operatorname{atan2}\bigl(y_{\mathrm{top}}(x_{\mathrm{mtp}})-y_{\mathrm{top}}(0)+\alpha\,\varphi_1(x_{\mathrm{mtp}}),\;x_{\mathrm{mtp}}\bigr),
    \]
    so the model's deformed heel → MTP line always lies along the measured
    \(\phi\) (test `test_solved_configuration_keeps_measured_rearfoot_angle`);
 2. moves the sole relative to the rearfoot line by
    \[
-   \psi(x)=\varphi_1(x)-\frac{x}{a}\varphi_1(a),\qquad \psi(0)=\psi(a)=0,
+   \psi(x)=\varphi_1(x)-\frac{x}{x_{\mathrm{mtp}}}\varphi_1(x_{\mathrm{mtp}}),\qquad \psi(0)=\psi(x_{\mathrm{mtp}})=0,
    \]
-   which is \(\approx\max(0,x-a)\): a rotation of the toe segment about the
+   which is \(\approx\max(0,x-x_{\mathrm{mtp}})\): a rotation of the toe segment about the
    MTP point. \(\psi-\varphi_1\) is linear in \(x\) (a rigid rotation about the
    heel).
 
@@ -120,7 +122,7 @@ pushes on the foot with \(-\mathbf f_{t,y}\):
 \[
 Q_\alpha^{\mathrm{shoe}\to\mathrm{foot}}
 =-\,\psi^\mathsf T\mathbf f_{t,y}
-=-\,\varphi_1^\mathsf T\mathbf f_{t,y}+\frac{\varphi_1(a)}{a}\,M_v
+=-\,\varphi_1^\mathsf T\mathbf f_{t,y}+\frac{\varphi_1(x_{\mathrm{mtp}})}{x_{\mathrm{mtp}}}\,M_v
 \quad[\text{N·m per metre width}],
 \qquad
 Q_\alpha^{\mathrm{total}}=w\,Q_\alpha^{\mathrm{lookup}}\quad[\text{N·m}],
@@ -131,9 +133,9 @@ with \(M_v=\mathbf x_t^\mathsf T\mathbf f_{t,y}\) and \(w\) = `shoe_width_m`
 `Q_alpha_shoe_on_foot_basis` (shape `(n_records, 6)`, column 0 the
 curved-sole closure) so \(Q_\alpha=w\,\mathbf q_{\mathrm{basis}}\cdot[1,\gamma]\).
 
-**Relation to the toe moment.** Because \(\psi\approx\max(0,x-a)\), the
+**Relation to the toe moment.** Because \(\psi\approx\max(0,x-x_{\mathrm{mtp}})\), the
 stored ramp moment `M_toe_vertical` \(=\rho^\mathsf T\mathbf f_{t,y}\) with
-\(\rho=\max(0,x-a)\) gives
+\(\rho=\max(0,x-x_{\mathrm{mtp}})\) gives
 
 \[
 Q_\alpha^{\mathrm{shoe}\to\mathrm{foot}}\approx-M_{\mathrm{toe}},
@@ -144,7 +146,7 @@ exact in the sharp-kink limit (test `test_negative_toe_moment_gives_positive_the
 A **negative foot-on-shoe toe moment about the MTP point (load under the toes)
 gives a positive (dorsiflexing) \(\theta\)**. The chord-fixed quantity
 \(-\varphi_1^\mathsf T\mathbf f_{t,y}\) (used before this correction) equals
-\(-\rho^\mathsf T\mathbf f+\tfrac{L-a}{L}M_v\approx F_y\,a(1-x_c/L)\) and is
+\(-\rho^\mathsf T\mathbf f+\tfrac{\ell_{\mathrm{toe}}}{L}M_v\approx F_y\,(L-\ell_{\mathrm{toe}})(1-x_c/L)\) and is
 negative for any compressive load wherever it acts, which produced the wrong
 (negative) toe angle.
 
@@ -166,7 +168,7 @@ The equilibrium \(Q_\alpha=\partial U/\partial\alpha\) is equivalent to
 
 **Sign convention for \(\theta\).** \(\theta>0\) (\(\alpha>0\)) tilts the toe
 segment **up** relative to the rearfoot line (dorsiflexion), since
-\(\psi(L)\approx(L-a)>0\). Positive fixed-frame angles are counter-clockwise
+\(\psi(L)\approx\ell_{\mathrm{toe}}>0\). Positive fixed-frame angles are counter-clockwise
 with +x heel → toe and +y up. Moments in the lookup are foot-on-shoe.
 
 ## Reduction per interval record
@@ -251,7 +253,7 @@ toe residual (`toe_residual` = 10·min(rel. residual, 1)), unstable roots
 When \(\|F\|<\) `toe_low_force_threshold_N` (experimental total), only the
 **relaxed root** (the root closest to \(\theta_0\)) is kept per record, status
 `+low_load`. Zero load gives \(q_0=0\) and \(\theta=0\) exactly. There is no
-fallback to the legacy formula.
+formula fallback.
 
 ## Contact interval
 
@@ -269,7 +271,7 @@ least-violating candidates are kept, the selected one is labelled
 `least_violating_fallback`, and its status carries `+unilateral_violation`
 (plus `+interior_tension` when interior contact nodes are tensile, i.e. a
 multi-interval contact state is indicated); the counts are in
-`provenance.toe_summary`.
+`model_info.toe_summary`.
 
 ## Viscoelasticity: elastic only
 
@@ -287,22 +289,15 @@ A proper viscoelastic extension needs: (1) the relaxation history applied to
 term, making the solve an ODE/DAE per frame; (3) consistent state updates when
 the contact record changes.
 
-## Legacy models
+## Lookup schema
 
-`prescribed_legacy` (old force-phi formula) and `fit_cop_legacy` (old COP fit)
-remain available with `--toe-model` or the deprecated `--theta-mode`; they are
-never the default, and provenance records `toe_model`.
-
-## Schema v9
-
-`LOOKUP_SCHEMA_VERSION = 9` stores `Q_alpha_shoe_on_foot_basis`
+The lookup (`LOOKUP_SCHEMA_VERSION = 10`) stores `Q_alpha_shoe_on_foot_basis`
 (`(n_records, 6)`, N·m per metre width per unit coefficient, column 0 the
 curved-sole closure) defined as the rearfoot-fixed
 \(-\psi^\mathsf T\mathbf f_{t,y}\) for every contact interval, plus metadata
 (`top_force_sign`, `toe_generalized_force`, units, source). The stored basis
 must match recomputation from the stored top forces (rel. 1e-9). Files with
-schema v8 or older are rejected and must be regenerated (they hold only
-heel/toe/full records).
+a different schema version are rejected and must be regenerated.
 
 ## Outputs
 
@@ -317,11 +312,11 @@ Per frame: `theta_rad`, `theta_deg`, `alpha`, `Q_alpha_shoe_on_foot`,
 `toe_damping_Nms_per_rad`. The `varphi` column is the chord-frame rotation at
 the selected root (it differs from the measured rearfoot `phi` by the bent-toe
 chord offset). The NPZ also stores `toe_Q_coeff` (per-frame \(\mathbf c\)) so
-the GUI can redraw the exact \(Q_\alpha(\theta)\) curve. Provenance includes
-`toe_config`, `toe_rearfoot_kinematics` (\(a\), \(\varphi_1(a)\), \(\Delta y_a\))
+the GUI can redraw the exact \(Q_\alpha(\theta)\) curve. `model_info.json` includes
+`toe_config`, `toe_equation`, `toe_rearfoot_kinematics` (`L`, `toe_length`, `phi1_mtp` \(=\varphi_1(L-\ell_{\mathrm{toe}})\), `dy_mtp`)
 and `toe_summary`.
 
-## Example results (layered lookup, width 0.1 m, elastic)
+## Example results (width 0.1 m, elastic)
 
 | Trial | Frames | \(\theta\) range | peak at | max \(|g|\) | low-load | max \(U\) | contacts | unilateral-violation frames |
 |---|---|---|---|---|---|---|---|---|
@@ -331,12 +326,7 @@ and `toe_summary`.
 Every frame had exactly one root and all were stable. \(\theta>0\) wherever
 the foot-on-shoe toe moment is negative (100 % of loaded P1 frames, 99.5 % of
 P4). The chord frame differs from the measured rearfoot angle by up to 8°.
-Schema-v9 lookups (all 5151 intervals of the layered table) reproduce the
-earlier heel/toe/full results: for P4, 276 of 281 frames give the same
-\(\theta\) to 1e-6°, three frames select an adjacent admissible interval
-(\(|\Delta\theta|\le0.03^\circ\)), and the two remaining differences are
-violation frames, one of which was previously accepted as full contact by
-the corner-only check and is now flagged for interior tension. In every
+In every
 unilateral-violation frame no interval of the lookup admits a violation-free
 solution at the measured wrench; the interior-tension frames indicate that a
 multi-interval contact model would be needed there.
@@ -345,14 +335,14 @@ multi-interval contact model would be needed there.
 
 - **Distributed coordinate vs anatomical MTP.** \(\alpha\) scales a smooth
   softplus shape across the whole top surface; it is not a rigid rotation about
-  an MTP axis, although with the rearfoot held fixed \(\psi\approx\max(0,x-a)\)
+  an MTP axis, although with the rearfoot held fixed \(\psi\approx\max(0,x-x_{\mathrm{mtp}})\)
   makes it behave like one for a sharp softplus. The toe dorsiflexes with load
   under the toes and peaks late in stance (65–76 %), which is the same sense
   and timing as anatomical MTP dorsiflexion; magnitudes still depend on the
   soft \(k\) relative to the shoe's generalized stiffness and on the width
   scaling.
 - For a soft softplus (small \(\kappa\)) \(\psi\) dips below the rearfoot line
-  on \((0,a)\), so loads under the rearfoot contribute slightly to
+  on \((0,L-\ell_{\mathrm{toe}})\), so loads under the rearfoot contribute slightly to
   \(Q_\alpha\) and \(Q_\alpha\approx-M_{\mathrm{toe}}\) is only approximate.
 - Quasistatic and elastic only; damping is ignored.
 - The bounded spring force means \(\theta\) grows quickly once

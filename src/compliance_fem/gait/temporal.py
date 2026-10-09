@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from compliance_fem.gait.wrench_control import WrenchCandidate
+from compliance_fem.gait.candidate import WrenchCandidate
 
 
 @dataclass(frozen=True)

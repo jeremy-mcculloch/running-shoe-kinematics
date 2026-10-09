@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Literal, Union
 
 from compliance_fem.viscoelasticity.base import ViscoelasticForceMapper
@@ -135,5 +135,3 @@ def create_material(config: MaterialConfig | dict[str, Any]) -> ViscoelasticForc
     raise TypeError(f"unsupported config type {type(config)!r}")
 
 
-def config_to_dict(config: MaterialConfig) -> dict[str, Any]:
-    return asdict(config)

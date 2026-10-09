@@ -10,10 +10,8 @@ import numpy as np
 import pytest
 from scipy import linalg
 
-from compliance_fem.boundaries import DOF_ORDERING_COMPONENT_MAJOR_UV
-from compliance_fem.compliance import compute_compliance
-from compliance_fem.config import LayeredPlateConfig
-from compliance_fem.contact_basis import (
+from compliance_fem.fem.boundaries import DOF_ORDERING_COMPONENT_MAJOR_UV
+from compliance_fem.contact.basis import (
     COL_ALPHA,
     COL_BX,
     COL_BY,
@@ -22,31 +20,30 @@ from compliance_fem.contact_basis import (
     build_top_affine_matrix,
     softplus_w2,
 )
-from compliance_fem.contact_lookup import (
+from compliance_fem.contact.lookup import (
     LOOKUP_SCHEMA_VERSION,
     SCALAR_FX,
     SCALAR_FY,
     build_boundary_matrix,
     compute_toe_moment,
-    from_compliance_result,
+    get_compliance_block_matrix,
     generate_contact_lookup,
     interval_metadata,
-    load_force_compliance,
     prepare_compliance_blocks,
     ramp_horizontal_lever,
     restricted_blocks,
     save_contact_lookup,
     solve_candidate,
 )
-from compliance_fem.contact_topology import ContactInterval
-from compliance_fem.force_control import evaluate_candidates, select_contact_candidate
+from compliance_fem.contact.topology import ContactInterval
+from compliance_fem.contact.force_control import evaluate_candidates, select_contact_candidate
 
-from conftest import SMALL_A, SMALL_KAPPA
+from conftest import SMALL_KAPPA, SMALL_TOE_LENGTH
 
 
 @pytest.fixture(scope="module")
 def blocks(rocker_case):
-    prepared, _ = prepare_compliance_blocks(from_compliance_result(rocker_case[0]))
+    prepared, _ = prepare_compliance_blocks(get_compliance_block_matrix(rocker_case[0]))
     return prepared
 
 
@@ -55,17 +52,17 @@ def test_restricted_block_dimensions(blocks) -> None:
     free, contact = iv.sets()
     rb = restricted_blocks(blocks, free, contact)
     n_t, n_c, n_f = 2 * len(blocks.x_top), 2 * contact.size, 2 * free.size
-    assert rb["C_tc"].shape == (n_t, n_c)
-    assert rb["C_ct"].shape == (n_c, n_t)
-    assert rb["C_cc"].shape == (n_c, n_c)
-    assert rb["C_ft"].shape == (n_f, n_t)
-    assert rb["C_fc"].shape == (n_f, n_c)
+    assert rb.C_tc.shape == (n_t, n_c)
+    assert rb.C_ct.shape == (n_c, n_t)
+    assert rb.C_cc.shape == (n_c, n_c)
+    assert rb.C_ft.shape == (n_f, n_t)
+    assert rb.C_fc.shape == (n_f, n_c)
 
 
 @pytest.mark.parametrize("interval", [(0, 4), (3, 8), (6, 6), (0, 12)])
 def test_boundary_matrix_symmetry(blocks, interval) -> None:
     free, contact = ContactInterval(*interval, len(blocks.x_bottom)).sets()
-    A, _, _, _ = build_boundary_matrix(blocks, free, contact, x_r=0.5 * blocks.L)
+    A = build_boundary_matrix(blocks, free, contact, x_r=0.5 * blocks.L).A
     n = 2 * len(blocks.x_top) + 2 * contact.size + 3
     assert A.shape == (n, n)
     assert np.linalg.norm(A - A.T) / np.linalg.norm(A) < 1e-12
@@ -73,19 +70,19 @@ def test_boundary_matrix_symmetry(blocks, interval) -> None:
 
 def test_one_factorization_matches_separate_direct_solves(blocks) -> None:
     iv = ContactInterval(2, 9, len(blocks.x_bottom))
-    W = build_top_affine_matrix(blocks.x_top, blocks.L, SMALL_A, SMALL_KAPPA)
-    sol = solve_candidate(blocks, iv, W, 0.5 * blocks.L, a=SMALL_A)
-    A = sol["A"]
+    W = build_top_affine_matrix(blocks.x_top, blocks.L, SMALL_TOE_LENGTH, SMALL_KAPPA)
+    sol = solve_candidate(blocks, iv, W, 0.5 * blocks.L, toe_length=SMALL_TOE_LENGTH)
+    A = sol.A
     free, contact = iv.sets()
     n_t = 2 * len(blocks.x_top)
     rhs = np.zeros((A.shape[0], N_AFFINE_COLUMNS))
     rhs[:n_t] = W
     rhs[n_t : n_t + 2 * contact.size] = build_contact_affine_matrix(
-        blocks.x_bottom[contact], sol["x_anchor"], blocks.y_bottom[contact], sol["y_anchor"]
+        blocks.x_bottom[contact], sol.x_anchor, blocks.y_bottom[contact], sol.y_anchor
     )
     for k in range(N_AFFINE_COLUMNS):
         x_k = linalg.solve(A, rhs[:, k])
-        np.testing.assert_allclose(sol["F_t"][:, k], x_k[:n_t], rtol=1e-9, atol=1e-9 * np.abs(x_k).max())
+        np.testing.assert_allclose(sol.F_t[:, k], x_k[:n_t], rtol=1e-9, atol=1e-9 * np.abs(x_k).max())
 
 
 def test_prescribed_boundary_values_and_traction_free_bottom(rocker_lookup) -> None:
@@ -122,7 +119,7 @@ def test_kf_matrix_matches_translation_scalars(rocker_lookup) -> None:
 
 def test_softplus_stable_large_kappa() -> None:
     x = np.linspace(0.0, 1.0, 21)
-    w = softplus_w2(x, L=1.0, a=0.4, kappa=1e6)
+    w = softplus_w2(x, L=1.0, toe_length=0.6, kappa=1e6)
     assert np.all(np.isfinite(w))
     np.testing.assert_allclose(w, np.maximum(0.0, x - 0.4), atol=1e-4)
 
@@ -132,7 +129,7 @@ def test_metadata_records_conventions(rocker_lookup, tmp_path: Path) -> None:
     meta = json.loads((tmp_path / "contact_lookup_metadata.json").read_text(encoding="utf-8"))
     for key, value in interval_metadata().items():
         assert key in meta, key
-    assert meta["schema_version"] == LOOKUP_SCHEMA_VERSION == 10
+    assert meta["schema_version"] == LOOKUP_SCHEMA_VERSION == 11
     assert meta["contact_set_model"] == "single_contiguous_interval"
     assert meta["contact_anchor_definition"] == "interval_midpoint"
     assert meta["affine_columns"][0] == "curved_sole_closure"
@@ -146,7 +143,7 @@ def test_metadata_records_conventions(rocker_lookup, tmp_path: Path) -> None:
 def test_progress_reporting(rocker_case) -> None:
     calls = []
     generate_contact_lookup(
-        from_compliance_result(rocker_case[0]), a=SMALL_A, kappa=SMALL_KAPPA,
+        get_compliance_block_matrix(rocker_case[0]), toe_length=SMALL_TOE_LENGTH, kappa=SMALL_KAPPA,
         progress=lambda done, total: calls.append((done, total)),
     )
     assert calls and calls[-1] == (91, 91)
@@ -160,34 +157,22 @@ def test_xy_coupling_reciprocity(flat_case) -> None:
     assert np.linalg.norm(Ctt[:n_t, n_t:] - Ctt[n_t:, :n_t].T) / np.linalg.norm(Ctt[:n_t, n_t:]) < 1e-8
     assert np.linalg.norm(Cbt - Ctb.T) / np.linalg.norm(Cbt) < 1e-8
     assert np.linalg.norm(Cbb[:n_b, n_b:] - Cbb[n_b:, :n_b].T) / np.linalg.norm(Cbb[:n_b, n_b:]) < 1e-8
-    assert r.solve_residuals["top"] < 1e-8 and r.rigid_mode_error < 1e-8
-
-
-def test_load_force_compliance_rejects_vertical_only(tmp_path: Path, flat_case) -> None:
-    r = flat_case[0]
-    n_t, n_b = len(r.x_top), len(r.x_bottom)
-    path = tmp_path / "old_vertical.npz"
-    np.savez_compressed(
-        path, Ctt_force=np.eye(n_t), Ctb_force=np.zeros((n_t, n_b)), Cbt_force=np.zeros((n_b, n_t)),
-        Cbb_force=np.eye(n_b), x_top=r.x_top, x_bottom=r.x_bottom, L=0.25, H=0.03, E=1.0e6, nu=0.3,
-    )
-    with pytest.raises(ValueError, match="vector"):
-        load_force_compliance(path)
+    assert r.solve_residuals.top < 1e-8 and r.rigid_mode_error < 1e-8
 
 
 def test_flat_top_eta_is_zero() -> None:
     x = np.array([0.0, 0.5, 1.0])
     y = np.full(3, 0.2)
     np.testing.assert_allclose(ramp_horizontal_lever(x, y, 0.5, 0.2), 0.0)
-    T, T_vert, H_a = compute_toe_moment(np.array([1.0, 2.0, 3.0]), np.array([0.0, 0.0, 4.0]), x, y, 0.5)
-    assert H_a == pytest.approx(0.2) and T == pytest.approx(T_vert) == pytest.approx(2.0)
+    T, T_vert, H_mtp = compute_toe_moment(np.array([1.0, 2.0, 3.0]), np.array([0.0, 0.0, 4.0]), x, y, 0.5)
+    assert H_mtp == pytest.approx(0.2) and T == pytest.approx(T_vert) == pytest.approx(2.0)
 
 
 def test_sloped_top_eta_enters_toe_moment() -> None:
     x = np.array([0.0, 0.5, 1.0])
     y = np.array([0.1, 0.2, 0.3])
-    T, T_vert, H_a = compute_toe_moment(np.array([0.0, 0.0, 2.0]), np.array([0.0, 0.0, 3.0]), x, y, 0.5)
-    assert H_a == pytest.approx(0.2)
+    T, T_vert, H_mtp = compute_toe_moment(np.array([0.0, 0.0, 2.0]), np.array([0.0, 0.0, 3.0]), x, y, 0.5)
+    assert H_mtp == pytest.approx(0.2)
     assert T_vert == pytest.approx(1.5)
     assert T == pytest.approx(1.5 - 0.1 * 2.0)
 
@@ -204,30 +189,14 @@ def test_singular_kf_is_reported_not_regularized(flat_lookup) -> None:
     assert sel.selected_row is None
 
 
-def test_layered_vector_blocks_and_interval_lookup() -> None:
-    cfg = LayeredPlateConfig(
-        L=0.30, h1_heel=0.025, h1_toe=0.015, h2_heel=0.020, h2_toe=0.030, E1=2.0e6, nu1=0.30,
-        E_heel=5.0e5, E_toe=1.5e6, nu2=0.30, EI_plate=10.0, nx=6, ny1=2, ny2=2, element_order=1,
-    )
-    result = compute_compliance(cfg)
+def test_vector_blocks_and_interval_lookup(rocker_case) -> None:
+    result, lookup = rocker_case
     n_t = len(result.x_top)
     assert result.dof_ordering == DOF_ORDERING_COMPONENT_MAJOR_UV
     assert result.Ctt_force.shape == (2 * n_t, 2 * n_t)
-    assert result.inextensibility_residuals["top"] < 1e-8
-    lookup = generate_contact_lookup(from_compliance_result(result), a=0.15, kappa=30.0)
+    assert result.inextensibility_residuals.top < 1e-8
     n_b = lookup.n_bottom_nodes
     assert lookup.n_records == n_b * (n_b + 1) // 2
     assert lookup.scalar_lookup.shape[1] == N_AFFINE_COLUMNS
     ev = evaluate_candidates(lookup, 0.0, -1.0e3, -2.0, 1.0)
     assert np.any(ev.evaluated)
-
-
-def test_layered_rocker_sole_mesh_has_bottom_boundary() -> None:
-    cfg = LayeredPlateConfig(
-        L=0.30, h1_heel=0.025, h1_toe=0.015, h2_heel=0.020, h2_toe=0.030, E1=2.0e6, nu1=0.30,
-        E_heel=5.0e5, E_toe=1.5e6, nu2=0.30, EI_plate=10.0, nx=8, ny1=2, ny2=2, element_order=1,
-        sole_rocker_height=0.003, sole_rocker_apex=0.4,
-    )
-    result = compute_compliance(cfg)
-    assert len(result.x_bottom) == 9
-    np.testing.assert_allclose(result.y_bottom, cfg.y_bottom(result.x_bottom), atol=1e-12)

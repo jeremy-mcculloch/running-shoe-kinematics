@@ -1,0 +1,47 @@
+{
+  "schema_version": 2,
+  "description": "Measured carbon-plated sole, 270 mm projected length. Relative paths resolve against this file's directory.",
+  "sole": {
+    "geometry_csv": "../data/geometry/sole_geometry.csv",
+    "shoe_length_mm": 270.0,
+    "upper_foam_material": "FFTurbo",
+    "lower_foam_material": "FFLeap",
+    "ffturbo_E_Pa": 260000.0,
+    "ffturbo_nu": 0.113,
+    "ffleap_E_heel_Pa": 354000.0,
+    "ffleap_E_toe_Pa": 207000.0,
+    "ffleap_nu": 0.113,
+    "EI_plate_Nm2_per_m": 2.0,
+    "mesh_size_m": 0.003,
+    "toe_refinement": 0.4,
+    "heel_corner_refinement": 0.5,
+    "interface_refinement": 0.6,
+    "plate_end_refinement": 0.4,
+    "curvature_max_turn_deg": 12.0,
+    "min_angle_deg": 12.0,
+    "landmark_tolerance": 0.002,
+    "element_order": 1
+  },
+  "lookup": {
+    "toe_length_mm": 59.4,
+    "min_bend_radius_mm": 6.75,
+    "reciprocity_tol": 1e-06,
+    "output_dir": "../outputs/measured_sole_lookup",
+    "store_nodal_fields": false
+  },
+  "toe_spring": {
+    "toe_model": "passive_spring",
+    "toe_stiffness_Nm_per_rad": 25.0,
+    "toe_neutral_angle_rad": 0.0,
+    "toe_damping_Nms_per_rad": 0.0,
+    "toe_angle_min_deg": -75.0,
+    "toe_angle_max_deg": 75.0,
+    "toe_equilibrium_abs_tol_Nm": 1e-06,
+    "toe_equilibrium_rel_tol": 1e-08,
+    "toe_root_scan_points": 721,
+    "toe_low_force_threshold_N": 50.0
+  },
+  "runtime": {
+    "shoe_width_m": 0.1
+  }
+}

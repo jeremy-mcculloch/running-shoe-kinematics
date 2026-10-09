@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from compliance_fem.contact_basis import (
+from compliance_fem.contact.basis import (
     AFFINE_COLUMN_NAMES,
     BASIS_ORDER,
     COL_ALPHA,
@@ -19,8 +19,8 @@ from compliance_fem.contact_basis import (
     build_contact_displacement_matrix,
     build_top_affine_matrix,
 )
-from compliance_fem.contact_lookup import CONTACT_ANCHOR_DEFINITION, SCALAR_FX, SCALAR_FY
-from compliance_fem.corotation import (
+from compliance_fem.contact.lookup import CONTACT_ANCHOR_DEFINITION, SCALAR_FX, SCALAR_FY
+from compliance_fem.contact.corotation import (
     affine_coefficients,
     basis_coefficients,
     contact_displacement,
@@ -28,7 +28,7 @@ from compliance_fem.corotation import (
     rotation_coefficients,
     rotation_matrix,
 )
-from compliance_fem.force_control import Tolerances, reconstruct_rows
+from compliance_fem.contact.force_control import Tolerances, reconstruct_rows
 
 
 @pytest.fixture(scope="module")
@@ -188,7 +188,7 @@ def test_affine_superposition_matches_direct_vector_construction(rocker_lookup, 
         W_c = build_contact_affine_matrix(lk.x_bottom[ids], x_a, lk.y_bottom[ids], y_a)
         uv = W_c @ affine_coefficients(gamma)
         np.testing.assert_allclose(uv, np.concatenate([u_ex, v_ex]), atol=1e-16)
-    W = build_top_affine_matrix(lk.x_top, lk.L, lk.softplus_a, lk.softplus_kappa)
+    W = build_top_affine_matrix(lk.x_top, lk.L, lk.softplus_toe_length, lk.softplus_kappa)
     np.testing.assert_allclose(lk.basis_top_displacements, W)
     np.testing.assert_allclose(W[:, COL_CONST], 0.0)
 

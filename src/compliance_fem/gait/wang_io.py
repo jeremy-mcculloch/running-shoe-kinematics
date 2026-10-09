@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -108,16 +108,6 @@ def discover_trials(root: str | Path) -> list[TrialSelection]:
             )
         )
     return out
-
-
-def _skip_opensim_header(lines: list[str], *, data_marker: str = "endheader") -> int:
-    for i, line in enumerate(lines):
-        if line.strip().lower().startswith(data_marker):
-            return i + 1
-        if line.strip().lower() == "endheader":
-            return i + 1
-    # TRC often has a fixed multi-line header without endheader.
-    return 0
 
 
 def read_opensim_trc(

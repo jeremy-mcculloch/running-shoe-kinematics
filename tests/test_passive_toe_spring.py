@@ -8,16 +8,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from compliance_fem.compliance import compute_compliance
-from compliance_fem.config import ProblemConfig
-from compliance_fem.contact_basis import COL_ALPHA, MODE_PHI1, shape_mode_phi1
-from compliance_fem.contact_direct_fem import solve_direct_fem_contact
-from compliance_fem.contact_lookup import (
+from compliance_fem.fem.compliance import compute_compliance
+from compliance_fem.contact.basis import COL_ALPHA, MODE_PHI1, shape_mode_phi1
+from compliance_fem.contact.direct_fem import solve_direct_fem_contact
+from compliance_fem.contact.lookup import (
     LOOKUP_SCHEMA_VERSION,
     REGENERATE_LOOKUP_MESSAGE,
-    SCALAR_FX,
-    SCALAR_FY,
-    from_compliance_result,
+    get_compliance_block_matrix,
     SCALAR_TOE,
     generate_contact_lookup,
     load_contact_lookup,
@@ -26,22 +23,20 @@ from compliance_fem.contact_lookup import (
     recompute_q_alpha_basis,
     save_contact_lookup,
 )
-from compliance_fem.contact_topology import ContactType
-from compliance_fem.corotation import (
-    basis_coefficients,
+from compliance_fem.contact.topology import ContactType
+from compliance_fem.contact.corotation import (
     contract_basis,
     rotate_force_to_local,
     rotation_coefficients,
 )
-from compliance_fem.force_control import evaluate_candidates
+from compliance_fem.contact.force_control import evaluate_candidates
 from compliance_fem.gait.passive_toe import pick_instant_best_passive, solve_passive_toe_candidates
 from compliance_fem.gait.replay import replay_stance, resolve_toe_config, save_replay_result
-from compliance_fem.gait.wrench_control import unilateral_check
-from compliance_fem.toe_spring import (
+from compliance_fem.gait.candidate import unilateral_check
+from compliance_fem.contact.toe_spring import (
     DEFAULT_TOE_MODEL,
     TOE_MODEL_PASSIVE_SPRING,
     TOE_MODEL_PASSIVE_SPRING_ELASTIC_EQUIVALENT,
-    TOE_MODEL_PRESCRIBED_LEGACY,
     ToeSpringConfig,
     potential_curvature,
     q_alpha_foot_on_shoe,
@@ -58,24 +53,36 @@ from compliance_fem.toe_spring import (
     spring_moment_theta,
     toe_affine_model,
     toe_residual,
-    toe_residual_tolerance,
     top_shape_mode_vertical,
     total_potential,
 )
 
+from conftest import small_config
+
 K = 25.0
-A_SOFT = 0.6
+TOE_LENGTH_SOFT = 0.4
 KAPPA = 30.0
 
 
 @pytest.fixture(scope="module")
 def fem():
-    return compute_compliance(ProblemConfig(L=1.0, H=0.5, E=1.0e6, nu=0.3, nx=16, ny=8, order=1))
+    return compute_compliance(
+        small_config(
+            L=1.0,
+            height=0.05,
+            ffturbo_E_Pa=1.0e6,
+            ffturbo_nu=0.3,
+            ffleap_E_heel_Pa=1.0e6,
+            ffleap_E_toe_Pa=1.0e6,
+            ffleap_nu=0.3,
+            EI_plate_Nm2_per_m=1.0,
+        )
+    )
 
 
 @pytest.fixture(scope="module")
 def lookup(fem):
-    return generate_contact_lookup(from_compliance_result(fem), a=A_SOFT, kappa=KAPPA, store_fields=True)
+    return generate_contact_lookup(get_compliance_block_matrix(fem), toe_length=TOE_LENGTH_SOFT, kappa=KAPPA, fem_result=fem, store_fields=True)
 
 
 def _rows(lookup, kind: ContactType) -> np.ndarray:
@@ -94,7 +101,7 @@ def _phi1(lookup) -> np.ndarray:
 
 def _psi(lookup) -> np.ndarray:
     geo = lookup_rearfoot_geometry(lookup)
-    return rearfoot_toe_mode(_phi1(lookup), lookup.x_top, geo.a, geo.phi1_a)
+    return rearfoot_toe_mode(_phi1(lookup), lookup.x_top, geo.L, geo.toe_length, geo.phi1_mtp)
 
 
 def _model(lookup, row, Fx, Fy, phi, width=1.0):
@@ -136,7 +143,7 @@ def test_shape_mode_derivative_wrt_alpha(lookup) -> None:
     u1 = W @ (gamma0 + np.array([eps, 0, 0, 0, 0]))
     du = (u1 - u0) / eps
     np.testing.assert_allclose(du[:n_t], 0.0, atol=1e-12)
-    np.testing.assert_allclose(du[n_t:], shape_mode_phi1(lookup.x_top, lookup.L, A_SOFT, KAPPA), rtol=1e-8, atol=1e-12)
+    np.testing.assert_allclose(du[n_t:], shape_mode_phi1(lookup.x_top, lookup.L, TOE_LENGTH_SOFT, KAPPA), rtol=1e-8, atol=1e-12)
     np.testing.assert_allclose(_phi1(lookup), W[n_t:, MODE_PHI1])
     np.testing.assert_allclose(_phi1(lookup), np.asarray(lookup.basis_top_displacements)[n_t:, COL_ALPHA])
 
@@ -160,7 +167,7 @@ def test_q_alpha_virtual_work_matches_nodal_contraction(lookup) -> None:
         # Rearfoot-fixed virtual displacement psi = phi1 + (rigid rotation about the heel).
         q_rf = float(q_alpha_foot_on_shoe(f_ty, _psi(lookup)))
         geo = lookup_rearfoot_geometry(lookup)
-        q_rf_mv = q_chord - (geo.phi1_a / geo.a) * float(lookup.x_top @ f_ty)
+        q_rf_mv = q_chord - (geo.phi1_mtp / (geo.L - geo.toe_length)) * float(lookup.x_top @ f_ty)
         q_basis = -float(contract_basis(lookup_q_alpha_basis(lookup)[row], gamma))
         scale = max(abs(q_rf), 1e-12)
         assert abs(q_rf - q_rf_mv) / scale < 1e-12
@@ -169,25 +176,25 @@ def test_q_alpha_virtual_work_matches_nodal_contraction(lookup) -> None:
 
 def test_rearfoot_mode_vanishes_at_heel_and_mtp(lookup) -> None:
     geo = lookup_rearfoot_geometry(lookup)
-    x = np.array([0.0, geo.a, lookup.L])
-    phi1 = shape_mode_phi1(x, lookup.L, A_SOFT, KAPPA)
-    psi = rearfoot_toe_mode(phi1, x, geo.a, geo.phi1_a)
+    x = np.array([0.0, geo.L - geo.toe_length, lookup.L])
+    phi1 = shape_mode_phi1(x, lookup.L, TOE_LENGTH_SOFT, KAPPA)
+    psi = rearfoot_toe_mode(phi1, x, geo.L, geo.toe_length, geo.phi1_mtp)
     assert psi[0] == pytest.approx(0.0, abs=1e-15)
     assert psi[1] == pytest.approx(0.0, abs=1e-15)
-    # Toe tip rises relative to the rearfoot line by ~ (L - a) per unit alpha.
+    # Toe tip rises relative to the rearfoot line by ~ toe_length per unit alpha.
     assert psi[2] > 0.0
-    assert psi[2] == pytest.approx(lookup.L - geo.a, rel=0.1)
-    assert np.all(_psi(lookup)[np.asarray(lookup.x_top) >= geo.a] >= -1e-12)
+    assert psi[2] == pytest.approx(geo.toe_length, rel=0.1)
+    assert np.all(_psi(lookup)[np.asarray(lookup.x_top) >= geo.L - geo.toe_length] >= -1e-12)
 
 
 # 3. Units: phi1 is a length, so Q = phi1^T f is force x length.
 def test_q_alpha_units_force_times_length(lookup) -> None:
     x = np.linspace(0.0, 1.0, 17)
     s = 3.7
-    np.testing.assert_allclose(shape_mode_phi1(s * x, s * 1.0, s * A_SOFT, KAPPA), s * shape_mode_phi1(x, 1.0, A_SOFT, KAPPA), rtol=1e-12)
+    np.testing.assert_allclose(shape_mode_phi1(s * x, s * 1.0, s * TOE_LENGTH_SOFT, KAPPA), s * shape_mode_phi1(x, 1.0, TOE_LENGTH_SOFT, KAPPA), rtol=1e-12)
     f = np.linspace(-2.0, 1.0, 17)
-    assert q_alpha_foot_on_shoe(f, s * shape_mode_phi1(x, 1.0, A_SOFT, KAPPA)) == pytest.approx(
-        s * q_alpha_foot_on_shoe(f, shape_mode_phi1(x, 1.0, A_SOFT, KAPPA))
+    assert q_alpha_foot_on_shoe(f, s * shape_mode_phi1(x, 1.0, TOE_LENGTH_SOFT, KAPPA)) == pytest.approx(
+        s * q_alpha_foot_on_shoe(f, shape_mode_phi1(x, 1.0, TOE_LENGTH_SOFT, KAPPA))
     )
     cfg = ToeSpringConfig(toe_stiffness_Nm_per_rad=0.0)
     kw = dict(Fx_star=0.0, Fy_star=-2.0e3, Mz_meas=0.0, phi_rad=0.0, config=cfg)
@@ -220,8 +227,8 @@ def test_foot_on_shoe_and_shoe_on_foot_signs(fem, lookup) -> None:
         assert m.q1 < 0.0, name
         alpha = 1e-3
         gamma = m.gamma(alpha)
-        direct = solve_direct_fem_contact(fem, lookup.interval(row), 0, A_SOFT, KAPPA, gamma=gamma)
-        u = np.asarray(direct["u"])
+        direct = solve_direct_fem_contact(fem, lookup.interval(row), 0, TOE_LENGTH_SOFT, KAPPA, gamma=gamma)
+        u = np.asarray(direct.u)
         strain_energy = 0.5 * float(u @ (fem.K @ u))
         assert strain_energy > 0.0
         assert strain_energy == pytest.approx(-float(m.work(alpha)), rel=1e-3), name
@@ -334,8 +341,8 @@ def test_solved_configuration_keeps_measured_rearfoot_angle(lookup) -> None:
         lookup, Fx_star=500.0, Fy_star=-6.0e3, Mz_meas=0.0, phi_rad=phi, config=ToeSpringConfig(), width_m=0.1
     )
     geo = lookup_rearfoot_geometry(lookup)
-    x = np.array([0.0, geo.a])
-    phi1 = shape_mode_phi1(x, lookup.L, A_SOFT, KAPPA)
+    x = np.array([0.0, geo.L - geo.toe_length])
+    phi1 = shape_mode_phi1(x, lookup.L, TOE_LENGTH_SOFT, KAPPA)
     y_top = np.interp(x, lookup.x_top, lookup.y_top) if lookup.y_top is not None else np.zeros(2)
     n = 0
     for c in cands:
@@ -350,8 +357,8 @@ def test_solved_configuration_keeps_measured_rearfoot_angle(lookup) -> None:
 
 @pytest.fixture(scope="module")
 def sharp_lookup(fem):
-    """Softplus transition narrower than the node spacing: psi ~ max(0, x - a) at nodes."""
-    return generate_contact_lookup(from_compliance_result(fem), a=A_SOFT, kappa=400.0)
+    """Softplus transition narrower than the node spacing: psi ~ max(0, x - (L - toe_length)) at nodes."""
+    return generate_contact_lookup(get_compliance_block_matrix(fem), toe_length=TOE_LENGTH_SOFT, kappa=400.0)
 
 
 # Sign convention: a negative foot-on-shoe toe moment about the MTP point (load
@@ -361,7 +368,7 @@ def test_negative_toe_moment_gives_positive_theta(sharp_lookup) -> None:
     cfg = ToeSpringConfig()
     phi = lookup_rearfoot_geometry(lk).reference_angle
     psi = _psi(lk)
-    ramp = np.maximum(0.0, np.asarray(lk.x_top) - A_SOFT)
+    ramp = np.maximum(0.0, np.asarray(lk.x_top) - (lk.L - TOE_LENGTH_SOFT))
     dev = float(np.max(np.abs(psi - ramp)))
     assert dev < 0.01 * lk.L
     checked = {+1: 0, -1: 0}
@@ -438,7 +445,7 @@ def test_root_outside_bounds_rejected() -> None:
 def test_no_root_candidate_status(lookup) -> None:
     cfg = ToeSpringConfig(toe_angle_min_deg=-0.5, toe_angle_max_deg=0.5)
     cands = solve_passive_toe_candidates(
-        lookup, Fx_star=0.0, Fy_star=-2.0e4, Mz_meas=0.0, phi_rad=0.15, config=cfg, width_m=1.0
+        lookup, Fx_star=0.0, Fy_star=-2.0e5, Mz_meas=0.0, phi_rad=0.15, config=cfg, width_m=1.0
     )
     failed = [c for c in cands if "no_root_in_bounds" in c.status]
     assert failed
@@ -477,7 +484,7 @@ def test_low_load_no_spurious_angle(lookup) -> None:
     # Synthetic three-root case: low-load keeps only the branch through theta0.
     q0, q1 = 1e-6, 5.0
     sol = solve_toe_equilibrium(q0, q1, ToeSpringConfig())
-    from compliance_fem.toe_spring import relaxed_root_index
+    from compliance_fem.contact.toe_spring import relaxed_root_index
 
     assert sol.n_roots == 3
     assert abs(sol.roots[relaxed_root_index(sol.roots)].theta_deg) < 1e-3
@@ -521,7 +528,7 @@ def test_roots_retained_per_topology(lookup) -> None:
 
 # 22. Both interval edge nodes stay on the ground after solving alpha.
 def test_transition_node_in_contact_after_toe_solve(lookup) -> None:
-    from compliance_fem.corotation import contact_displacement, fixed_frame_normal_component
+    from compliance_fem.contact.corotation import contact_displacement, fixed_frame_normal_component
 
     cands = solve_passive_toe_candidates(
         lookup, Fx_star=0.0, Fy_star=-5.0e3, Mz_meas=0.0, phi_rad=0.08, config=ToeSpringConfig(), width_m=1.0
@@ -565,7 +572,7 @@ def test_force_and_toe_residuals_within_tolerance(lookup) -> None:
 
 # 25. Unilateral checks use the solved alpha.
 def test_unilateral_checks_after_alpha(lookup) -> None:
-    from compliance_fem.force_control import Tolerances
+    from compliance_fem.contact.force_control import Tolerances
 
     phi = 0.1
     cands = solve_passive_toe_candidates(
@@ -602,8 +609,8 @@ def test_runtime_superposition_matches_direct_fem(fem, lookup) -> None:
         root = next(r for r in sol.roots if r.converged)
         gamma = m.gamma(root.alpha)
         F_local = rotate_force_to_local(Fx, Fy, float(m.varphi(root.alpha)))
-        direct = solve_direct_fem_contact(fem, lookup.interval(row), 0, A_SOFT, KAPPA, gamma=gamma)
-        f_t = np.asarray(direct["f_t"])
+        direct = solve_direct_fem_contact(fem, lookup.interval(row), 0, TOE_LENGTH_SOFT, KAPPA, gamma=gamma)
+        f_t = np.asarray(direct.f_t)
         f_tx, f_ty = f_t[:n_t], f_t[n_t:]
         np.testing.assert_allclose(f_ty, contract_basis(lookup.top_force_y_basis[row], gamma), rtol=1e-7, atol=1e-7 * np.max(np.abs(f_ty)))
         assert np.array([f_tx.sum(), f_ty.sum()]) == pytest.approx(F_local, rel=1e-7, abs=1e-6 * abs(Fy))
@@ -634,12 +641,10 @@ def test_defaults() -> None:
     assert cfg.toe_damping_Nms_per_rad == 0.0
     assert cfg.toe_model == TOE_MODEL_PASSIVE_SPRING == DEFAULT_TOE_MODEL
     assert resolve_toe_config().toe_model == TOE_MODEL_PASSIVE_SPRING
-    assert resolve_toe_config().toe_model != TOE_MODEL_PRESCRIBED_LEGACY
-    assert resolve_toe_config(theta_mode="force-phi").toe_model == TOE_MODEL_PRESCRIBED_LEGACY
     with pytest.raises(ValueError):
         ToeSpringConfig(toe_stiffness_Nm_per_rad=-1.0)
     with pytest.raises(ValueError):
-        resolve_toe_config(toe_model=TOE_MODEL_PASSIVE_SPRING, theta_mode="force-phi")
+        ToeSpringConfig(toe_model="prescribed_legacy")
 
 
 def test_replay_default_is_passive_and_damping_ignored(lookup) -> None:
@@ -647,7 +652,7 @@ def test_replay_default_is_passive_and_damping_ignored(lookup) -> None:
     syn = {"times": t, "Fx": np.zeros(6), "Fy": -3.0e3 * np.ones(6), "Mz": np.zeros(6), "phi": np.zeros(6)}
     r = replay_stance(lookup, synthetic=syn, shoe_width_m=1.0)
     assert r.toe_model == TOE_MODEL_PASSIVE_SPRING
-    assert r.provenance["toe_config"]["toe_stiffness_Nm_per_rad"] == 25.0
+    assert r.model_info["toe_config"]["toe_stiffness_Nm_per_rad"] == 25.0
     r2 = replay_stance(
         lookup, synthetic=syn, shoe_width_m=1.0, toe_config=ToeSpringConfig(toe_damping_Nms_per_rad=3.0)
     )
@@ -674,7 +679,7 @@ def test_viscoelastic_rejected_for_passive_spring(lookup) -> None:
 def test_serialization_preserves_q_basis(lookup, tmp_path: Path) -> None:
     save_contact_lookup(lookup, tmp_path)
     loaded = load_contact_lookup(tmp_path)
-    assert loaded.schema_version == LOOKUP_SCHEMA_VERSION == 10
+    assert loaded.schema_version == LOOKUP_SCHEMA_VERSION == 11
     assert loaded.toe_generalized_force_source == "stored"
     np.testing.assert_array_equal(loaded.Q_alpha_shoe_on_foot_basis, lookup.Q_alpha_shoe_on_foot_basis)
     data = dict(np.load(tmp_path / "contact_lookup.npz", allow_pickle=True))
@@ -685,34 +690,22 @@ def test_serialization_preserves_q_basis(lookup, tmp_path: Path) -> None:
 
 
 # 34. Old schemas are rejected: heel/toe/full records cannot be migrated to intervals.
-def test_old_schema_migrated_or_rejected(lookup, tmp_path: Path) -> None:
+def test_old_schema_rejected(lookup, tmp_path: Path) -> None:
     save_contact_lookup(lookup, tmp_path)
     data = dict(np.load(tmp_path / "contact_lookup.npz", allow_pickle=True))
-    for version in (5, 6, 7, 8):
+    for version in (5, 6, 7, 8, 9):
         old = dict(data)
         old["schema_version"] = np.asarray(version)
         np.savez_compressed(tmp_path / f"v{version}.npz", **old)
         with pytest.raises(ValueError, match="Regenerate"):
             load_contact_lookup(tmp_path / f"v{version}.npz")
-    v9 = dict(data)
-    v9["schema_version"] = np.asarray(9)
-    v9.pop("rigid_alpha_basis", None)
-    np.savez_compressed(tmp_path / "v9.npz", **v9)
-    migrated = load_contact_lookup(tmp_path / "v9.npz")
-    assert migrated.schema_version == 10 and migrated.migrated_from_schema == 9
-    np.testing.assert_array_equal(migrated.scalar_lookup, lookup.scalar_lookup)
-    v9_missing = dict(v9)
-    v9_missing.pop("Q_alpha_shoe_on_foot_basis")
-    np.savez_compressed(tmp_path / "v9_missing.npz", **v9_missing)
-    with pytest.raises(ValueError, match="missing"):
-        load_contact_lookup(tmp_path / "v9_missing.npz")
-    assert "schema_version=10" in REGENERATE_LOOKUP_MESSAGE
+    assert "schema_version=11" in REGENERATE_LOOKUP_MESSAGE
 
 
 # 35. GUI and exported results show the same solved theta.
 def test_gui_and_export_show_same_theta(lookup, tmp_path: Path) -> None:
-    from compliance_fem.gait.gui_gait import toe_equilibrium_figure, toe_stance_figure
-    from compliance_fem.gait.visualize import selection_proxy_for_frame
+    from compliance_fem.gui.gait_page import toe_equilibrium_figure, toe_stance_figure
+    from compliance_fem.gui.gait_plots import selection_proxy_for_frame
 
     t = np.linspace(0.0, 0.1, 11)
     Fy = -5.0e3 * np.sin(np.pi * t / 0.1) ** 2

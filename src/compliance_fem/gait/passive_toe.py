@@ -1,8 +1,8 @@
 """Per-frame passive toe-spring equilibrium over the stored contact intervals.
 
 The measured pitch ``phi`` is the rearfoot (heel -> MTP) angle, so the chord
-frame of the lookup rotates with the toe: ``varphi(alpha) = phi - atan2(dy_a +
-alpha phi1(a), a)``. For each interval record the prescribed fixed-frame force
+frame of the lookup rotates with the toe: ``varphi(alpha) = phi - atan2(dy_mtp +
+alpha phi1_mtp, L - toe_length)``. For each interval record the prescribed fixed-frame force
 ``(Fx*, Fy*)`` is rotated into the chord frame at ``varphi(alpha)`` and the
 anchor translations are eliminated analytically, including the curved-sole
 closure (``toe_spring.RearfootToeModel``). The toe balance
@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from compliance_fem.contact_lookup import (
+from compliance_fem.contact.lookup import (
     SCALAR_FX,
     SCALAR_FY,
     SCALAR_MZ,
@@ -36,9 +36,9 @@ from compliance_fem.contact_lookup import (
     lookup_q_alpha_basis,
     lookup_rearfoot_geometry,
 )
-from compliance_fem.contact_topology import interval_distance
-from compliance_fem.corotation import contract_basis, rotate_vector_to_fixed
-from compliance_fem.force_control import (
+from compliance_fem.contact.topology import interval_distance
+from compliance_fem.contact.corotation import contract_basis, rotate_vector_to_fixed
+from compliance_fem.contact.force_control import (
     EXACT_ALL,
     SEARCH_EXPANDED,
     SEARCH_FALLBACK,
@@ -50,12 +50,12 @@ from compliance_fem.force_control import (
     refine_reconstruction,
     refine_top_k,
 )
-from compliance_fem.gait.wrench_control import (
+from compliance_fem.gait.candidate import (
     WrenchCandidate,
     _candidate_geometry,
     diagnostics_from_reconstruction,
 )
-from compliance_fem.toe_spring import (
+from compliance_fem.contact.toe_spring import (
     ToeRoot,
     ToeSpringConfig,
     order_toe_roots,
@@ -428,7 +428,7 @@ def _unilateral_only(rec: dict, i: int) -> bool:
     sc = rec["scales"]
     return bool(
         rec["finite"][i]
-        and rec["min_free_gap_interpolated"][i] >= -sc.tau_g_eff
+        and rec["min_free_gap"][i] >= -sc.tau_g_eff
         and rec["min_contact_reaction"][i] >= -sc.tau_R_eff
     )
 

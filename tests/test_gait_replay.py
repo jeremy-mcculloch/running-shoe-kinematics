@@ -7,10 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from compliance_fem.contact_basis import COL_ALPHA, COL_BX
-from compliance_fem.contact_lookup import SCALAR_FX, SCALAR_FY, SCALAR_MZ
-from compliance_fem.contact_topology import ContactType
-from compliance_fem.corotation import contract_basis
+from compliance_fem.contact.topology import ContactType
 from compliance_fem.gait.phi_markers import estimate_phi, select_chord_markers
 from compliance_fem.gait.replay import replay_stance, save_replay_result
 from compliance_fem.gait.sagittal import (
@@ -26,32 +23,7 @@ from compliance_fem.gait.wang_io import (
     read_opensim_mot,
     read_opensim_trc,
 )
-from compliance_fem.gait.wrench_control import (
-    assemble_Kw,
-    pick_instant_best,
-    solve_wrench_control,
-)
 from compliance_fem.viscoelasticity import ElasticConfig, SLSConfig, create_material
-
-
-def test_prescribed_toe_angle_relu_neg_phi():
-    from compliance_fem.gait.toe_angle import prescribed_toe_angle_deg
-
-    # φ = −10° → relu(−φ)=10°; at peak load factor → 10°
-    phi = np.deg2rad([-10.0, 5.0, -20.0])
-    fy = np.array([-1000.0, -500.0, 0.0])  # compressive top force
-    fy_max = 1000.0
-    theta = prescribed_toe_angle_deg(phi, fy, fy_max, theta_min_deg=0.0, theta_max_deg=45.0)
-    assert theta[0] == pytest.approx(10.0)
-    # Positive φ → relu(−φ)=0
-    assert theta[1] == pytest.approx(0.0)
-    # Zero load → load factor 0
-    assert theta[2] == pytest.approx(0.0)
-    # Mid load: ratio=0.5 → 1-(0.5)^4 = 1-0.0625 = 0.9375
-    theta_mid = prescribed_toe_angle_deg(
-        np.deg2rad(-10.0), -500.0, 1000.0, theta_min_deg=0.0, theta_max_deg=45.0
-    )
-    assert float(theta_mid) == pytest.approx(10.0 * (1.0 - 0.5**4))
 
 
 def test_parse_wang_trial_name():
@@ -215,108 +187,8 @@ def test_wang_marker_aliases_for_phi():
     assert np.all(np.isfinite(series.phi_rad))
 
 
-def _wrench_row(lookup) -> int:
-    """A valid interval row whose 3x3 wrench map [dx, dy, alpha] -> [Fx, Fy, Mz] is well conditioned."""
-    best, best_cond = -1, np.inf
-    for row in lookup.valid_rows:
-        cond = np.linalg.cond(assemble_Kw(lookup.scalar_lookup[int(row)]))
-        if cond < best_cond:
-            best, best_cond = int(row), cond
-    assert best >= 0 and best_cond < 1e8
-    return best
-
-
-def _wrench_from_gamma(lookup, row: int, gamma: np.ndarray) -> np.ndarray:
-    """Local-frame (Fx, Fy, Mz) of the affine state, closure column included once."""
-    S = np.asarray(lookup.scalar_lookup[row])
-    W = np.stack([S[:, SCALAR_FX], S[:, SCALAR_FY], S[:, SCALAR_MZ]])
-    return contract_basis(W, gamma, mode_axis=1)
-
-
-def _row_candidate(cands, row: int):
-    mine = [c for c in cands if c.row == row]
-    assert len(mine) == 1
-    return mine[0]
-
-
-def test_Kw_assembly_and_recovery(flat_lookup):
-    lookup = flat_lookup
-    row = _wrench_row(lookup)
-    Kw = assemble_Kw(lookup.scalar_lookup[row])
-    assert Kw.shape == (3, 3)
-    S = lookup.scalar_lookup[row]
-    np.testing.assert_array_equal(Kw[:, 0], S[COL_BX, [SCALAR_FX, SCALAR_FY, SCALAR_MZ]])
-    np.testing.assert_array_equal(Kw[:, 2], S[COL_ALPHA, [SCALAR_FX, SCALAR_FY, SCALAR_MZ]])
-    dx, dy, alpha = 1e-6, -2e-5, np.tan(np.deg2rad(8.0))
-    w = _wrench_from_gamma(lookup, row, np.array([alpha, dx, dy, 0.0, 0.0]))
-    cands = solve_wrench_control(
-        lookup,
-        Fx_star=float(w[0]),
-        Fy_star=float(w[1]),
-        Mz_star=float(w[2]),
-        phi_rad=float(lookup.phi_ref),
-        theta_min_deg=-20,
-        theta_max_deg=40,
-    )
-    c = _row_candidate(cands, row)
-    iv = lookup.interval(row)
-    assert c.interval == (iv.start, iv.end)
-    assert c.d_ax == pytest.approx(dx, rel=1e-7, abs=1e-12)
-    assert c.d_ay == pytest.approx(dy, rel=1e-7)
-    assert c.alpha == pytest.approx(alpha, rel=1e-7)
-    assert c.theta_deg == pytest.approx(8.0, abs=1e-6)
-    assert c.force_residual < 1e-8 * np.hypot(w[0], w[1])
-
-
-def _row_wrench_at_theta(lookup, row: int, theta_deg: float) -> np.ndarray:
-    return _wrench_from_gamma(lookup, row, np.array([np.tan(np.deg2rad(theta_deg)), 0.0, -2e-5, 0.0, 0.0]))
-
-
-def test_theta_bounds_clamp_nonnegative(flat_lookup):
-    lookup = flat_lookup
-    row = _wrench_row(lookup)
-    w = _row_wrench_at_theta(lookup, row, 30.0)
-    cands = solve_wrench_control(
-        lookup, Fx_star=float(w[0]), Fy_star=float(w[1]), Mz_star=float(w[2]),
-        phi_rad=float(lookup.phi_ref), theta_min_deg=0.0, theta_max_deg=1.0,
-    )
-    assert cands
-    assert all(0.0 <= c.theta_deg <= 1.0 + 1e-9 for c in cands if np.isfinite(c.theta_deg))
-    c = _row_candidate(cands, row)
-    assert "theta_clamped" in c.status
-    assert c.theta_deg == pytest.approx(1.0)
-
-    w = _row_wrench_at_theta(lookup, row, -20.0)
-    cands_neg = solve_wrench_control(
-        lookup, Fx_star=float(w[0]), Fy_star=float(w[1]), Mz_star=float(w[2]),
-        phi_rad=float(lookup.phi_ref), theta_min_deg=0.0, theta_max_deg=45.0,
-    )
-    assert all(c.theta_deg >= -1e-9 for c in cands_neg if np.isfinite(c.theta_deg))
-    c = _row_candidate(cands_neg, row)
-    assert "theta_clamped" in c.status
-    assert c.theta_deg == pytest.approx(0.0, abs=1e-12)
-
-
-def test_theta_prior_used_when_free_alpha_oob(flat_lookup):
-    """Force-phi prior replaces nearest-bound clamp when free alpha is out of range."""
-    lookup = flat_lookup
-    row = _wrench_row(lookup)
-    prior = 12.0
-    w = _row_wrench_at_theta(lookup, row, -20.0)
-    cands = solve_wrench_control(
-        lookup, Fx_star=float(w[0]), Fy_star=float(w[1]), Mz_star=float(w[2]),
-        phi_rad=float(lookup.phi_ref), theta_min_deg=0.0, theta_max_deg=45.0, theta_prior_deg=prior,
-    )
-    c = _row_candidate(cands, row)
-    assert "theta_prior_fallback" in c.status
-    assert c.theta_deg == pytest.approx(prior, abs=1e-9)
-    assert all(
-        abs(c.theta_deg - prior) < 1e-9 for c in cands if np.isfinite(c.theta_deg) and "fallback" in c.status
-    )
-
-
 def test_viterbi_continuity_and_forefoot():
-    from compliance_fem.gait.wrench_control import WrenchCandidate
+    from compliance_fem.gait.candidate import WrenchCandidate
 
     n_b = 13
     spans = {ContactType.HEEL: (0, 4), ContactType.FULL: (0, n_b - 1), ContactType.TOE: (8, n_b - 1)}
@@ -392,71 +264,30 @@ def test_shoe_width_scales_forces(flat_lookup):
         "Mz": np.array([0.0, 2.0, 2.0]),
         "phi": np.zeros_like(t),
     }
-    r1 = replay_stance(
-        lookup, synthetic=syn, theta_mode="fit-cop", shoe_width_m=1.0, cop_fit_min_force=1.0
-    )
-    r01 = replay_stance(
-        lookup, synthetic=syn, theta_mode="fit-cop", shoe_width_m=0.1, cop_fit_min_force=1.0
-    )
+    r1 = replay_stance(lookup, synthetic=syn, shoe_width_m=1.0)
+    r01 = replay_stance(lookup, synthetic=syn, shoe_width_m=0.1)
     np.testing.assert_allclose(r01.elastic_Fx, r1.elastic_Fx / 0.1)
     np.testing.assert_allclose(r01.elastic_Fy, r1.elastic_Fy / 0.1)
     np.testing.assert_allclose(r01.elastic_Mz, r1.elastic_Mz / 0.1)
-    assert r01.provenance["shoe_width_m"] == 0.1
-
-
-def test_fit_cop_low_force_defaults_theta_to_zero(flat_lookup):
-    """When |Fy| is below the COP-fit threshold, theta is fixed at 0 deg."""
-    t = np.array([0.0, 0.05, 0.1])
-    syn = {
-        "times": t,
-        "Fx": np.zeros(3),
-        "Fy": np.array([0.0, -1.0, -1.0]),
-        "Mz": np.array([0.0, 5.0, 5.0]),
-        "phi": np.zeros(3),
-    }
-    result = replay_stance(
-        flat_lookup,
-        synthetic=syn,
-        theta_mode="fit-cop",
-        shoe_width_m=1.0,
-        cop_fit_min_force=50.0,
-    )
-    np.testing.assert_allclose(result.theta_deg, 0.0, atol=1e-12)
-    assert result.provenance["toe_angle_method"] == "fit-cop-3x3-wrench"
-    assert all("low_force_fallback" in s for s in result.selection_status)
+    assert r01.model_info["shoe_width_m"] == 0.1
 
 
 def test_end_to_end_synthetic_replay(flat_lookup, tmp_path: Path):
-    lookup = flat_lookup
-    row = _wrench_row(lookup)
     t = np.linspace(0.0, 0.2, 40)
-    w = _wrench_from_gamma(lookup, row, np.array([np.tan(np.deg2rad(5.0)), 1e-6, -2e-5, 0.0, 0.0]))
     ramp = np.clip(t / 0.02, 0, 1)
     syn = {
         "times": t,
-        "Fx": w[0] * ramp,
-        "Fy": w[1] * ramp,
-        "Mz": w[2] * ramp,
+        "Fx": 5.0 * ramp,
+        "Fy": -200.0 * ramp,
+        "Mz": 2.0 * ramp,
         "cop_x": np.zeros_like(t),
         "cop_y": np.zeros_like(t),
-        "phi": np.full_like(t, float(lookup.phi_ref)),
+        "phi": np.full_like(t, float(flat_lookup.phi_ref)),
     }
-    result = replay_stance(
-        lookup,
-        synthetic=syn,
-        visco_model="elastic",
-        theta_mode="fit-cop",
-        theta_min_deg=-10,
-        theta_max_deg=30,
-        cop_fit_min_force=1.0,
-        shoe_width_m=1.0,
-    )
+    result = replay_stance(flat_lookup, synthetic=syn, visco_model="elastic", shoe_width_m=1.0)
     paths = save_replay_result(result, tmp_path)
     assert paths["csv"].exists()
-    F = float(np.hypot(w[0], w[1]))
-    assert np.nanmax(result.force_residual[10:]) < 1e-8 * F
+    assert result.model_info["toe_angle_method"] == "passive-toe-spring-exact"
     assert np.all(result.contact_start_index[10:] >= 0)
     assert np.all(result.contact_end_index[10:] >= result.contact_start_index[10:])
-    same = result.record_index[10:] == row
-    if np.any(same):
-        np.testing.assert_allclose(result.theta_deg[10:][same], 5.0, atol=1e-6)
+    assert np.all(np.isfinite(result.theta_deg[10:]))

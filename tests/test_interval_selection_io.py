@@ -7,14 +7,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from compliance_fem.contact_lookup import (
+from compliance_fem.contact.lookup import (
     EDGE_RESPONSE_FIELDS,
     LOOKUP_SCHEMA_VERSION,
     load_contact_lookup,
     save_contact_lookup,
 )
-from compliance_fem.contact_topology import CONTACT_SET_MODEL, ContactMode, parse_contact_mode
-from compliance_fem.force_control import (
+from compliance_fem.contact.topology import CONTACT_SET_MODEL, ContactMode, parse_contact_mode
+from compliance_fem.contact.force_control import (
     SEARCH_EXPANDED,
     SEARCH_FALLBACK,
     SEARCH_FORCED,
@@ -45,7 +45,7 @@ def saved(rocker_lookup_full, tmp_path_factory):
 
 def test_interval_records_roundtrip_without_loss(rocker_lookup_full, saved) -> None:
     path, loaded = saved
-    assert loaded.schema_version == LOOKUP_SCHEMA_VERSION == 10
+    assert loaded.schema_version == LOOKUP_SCHEMA_VERSION == 11
     for name in ARRAY_FIELDS:
         np.testing.assert_array_equal(np.asarray(getattr(loaded, name)), np.asarray(getattr(rocker_lookup_full, name)), err_msg=name)
     for name in EDGE_RESPONSE_FIELDS:
@@ -96,12 +96,8 @@ def test_old_schemas_are_rejected_clearly(saved, tmp_path, old) -> None:
         load_contact_lookup(target)
 
 
-def test_reinterpreting_heel_toe_records_is_rejected(saved, tmp_path) -> None:
+def test_truncated_interval_records_are_rejected(saved, tmp_path) -> None:
     path, _ = saved
-    with pytest.raises(ValueError, match="contact_set_model"):
-        load_contact_lookup(_rewrite(path, tmp_path / "a", contact_set_model=None))
-    with pytest.raises(ValueError, match="contact_anchor_definition"):
-        load_contact_lookup(_rewrite(path, tmp_path / "b", contact_anchor_definition=np.asarray("contact_edge")))
     data = np.load(path, allow_pickle=True)
     n = 5  # a heel/toe/full-only table has 2 N_b - 1 records
     with pytest.raises(ValueError):
@@ -162,10 +158,10 @@ def test_specific_interval_mode(flat_lookup) -> None:
         select_contact_candidate(ev, mode="specific")
 
 
-def test_legacy_mode_names_map_onto_interval_filters() -> None:
+def test_contact_mode_parses_values_and_gui_labels() -> None:
     assert parse_contact_mode("Auto") is ContactMode.AUTO
-    assert parse_contact_mode("Heel contact") is ContactMode.HEEL
-    assert parse_contact_mode("Toe contact") is ContactMode.TOE
+    assert parse_contact_mode("heel") is ContactMode.HEEL
+    assert parse_contact_mode("Toe-attached intervals") is ContactMode.TOE
     assert parse_contact_mode("Full contact") is ContactMode.FULL
     assert parse_contact_mode("Interior intervals") is ContactMode.INTERIOR
     assert parse_contact_mode("Specific interval") is ContactMode.SPECIFIC

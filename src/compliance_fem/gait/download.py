@@ -64,27 +64,3 @@ def write_data_readme(root: str | Path) -> Path:
         encoding="utf-8",
     )
     return path
-
-
-def try_download_figshare(article_id: int, dest: Path) -> list[Path]:
-    """Best-effort Figshare download via the public API.
-
-    Returns downloaded paths. May fail if the API requires interactive auth;
-    in that case use the browser links in README.md.
-    """
-    import urllib.request
-
-    dest = Path(dest)
-    dest.mkdir(parents=True, exist_ok=True)
-    api = f"https://api.figshare.com/v2/articles/{article_id}"
-    with urllib.request.urlopen(api, timeout=60) as resp:
-        meta = json.loads(resp.read().decode("utf-8"))
-    saved: list[Path] = []
-    for fmeta in meta.get("files", []):
-        name = fmeta["name"]
-        url = fmeta["download_url"]
-        out = dest / name
-        print(f"Downloading {name} ...")
-        urllib.request.urlretrieve(url, out)
-        saved.append(out)
-    return saved

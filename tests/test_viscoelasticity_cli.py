@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from compliance_fem.viscoelasticity.cli import main
+from compliance_fem.cli.visco_force_map import main
 from compliance_fem.viscoelasticity.io import read_force_history, write_force_history
 
 

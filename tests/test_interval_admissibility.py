@@ -7,9 +7,9 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from compliance_fem.contact_basis import COL_CONST
-from compliance_fem.corotation import rotation_matrix, transform_to_fixed_frame
-from compliance_fem.force_control import (
+from compliance_fem.contact.basis import COL_CONST
+from compliance_fem.contact.corotation import rotation_matrix, transform_to_fixed_frame
+from compliance_fem.contact.force_control import (
     DISCONNECTED_CONTACT_WARNING,
     Tolerances,
     evaluate_candidates,
@@ -106,7 +106,7 @@ def test_adjacent_gaps_match_direct_coordinate_reconstruction(rocker_lookup, phi
 def heel_case(flat_lookup):
     """Admissible heel-attached state with many free nodes: flat sole, toe up 0.3 deg."""
     ev, sel = _selected(flat_lookup, 0.0, -500.0, 0.3)
-    assert sel.exactly_admissible and sel.interval == (0, 3)
+    assert sel.exactly_admissible and sel.interval == (0, 4)
     return ev, sel
 
 
@@ -121,7 +121,7 @@ def long_case(flat_lookup):
 def test_penetration_at_any_free_node_rejects_and_endpoint_checks_do_not_hide_it(flat_lookup, heel_case) -> None:
     ev, sel = heel_case
     row = sel.selected_row
-    k = 8  # a free node far from the toe-side edge (adjacent free node is 4)
+    k = 8  # a free node far from the toe-side edge (adjacent free node is 5)
     bv = flat_lookup.bottom_v_basis.copy()
     bv[row, COL_CONST, k] -= 10.0 * (sel.full_bottom_gap[k] + 1e-6)
     lk2 = replace(flat_lookup, bottom_v_basis=bv)
@@ -136,7 +136,7 @@ def test_penetration_at_any_free_node_rejects_and_endpoint_checks_do_not_hide_it
 def test_tension_at_any_contact_node_rejects_and_endpoint_checks_do_not_hide_it(flat_lookup, long_case) -> None:
     ev, sel = long_case
     row = sel.selected_row
-    k = 5  # interior contact node (edges are 0 and 11)
+    k = 5  # interior contact node (edges are the selected interval ends)
     ry = flat_lookup.reaction_y_basis.copy()
     ry[row, COL_CONST, k] -= 10.0 * (abs(sel.full_bottom_reaction_normal[k]) + 1.0)
     lk2 = replace(flat_lookup, reaction_y_basis=ry)

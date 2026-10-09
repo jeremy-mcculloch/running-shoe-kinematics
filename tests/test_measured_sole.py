@@ -9,53 +9,56 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from compliance_fem.compliance import (
+from compliance_fem.fem.compliance import (
+    SOLE_SCALAR_FIELDS,
     compute_compliance,
-    compute_measured_compliance,
-    is_measured_compliance_npz,
-    measured_config_from_compliance_npz,
     save_compliance_npz,
 )
-from compliance_fem.config import MeasuredSoleConfig, validate_shoe_length_mm
-from compliance_fem.constraints import assemble_axial_constraints
-from compliance_fem.contact_direct_fem import run_standard_direct_comparisons
-from compliance_fem.contact_lookup import (
+from compliance_fem.contact.config import SoleConfig, validate_shoe_length_mm
+from compliance_fem.contact.basis import N_AFFINE_COLUMNS
+from compliance_fem.contact.direct_fem import (
+    run_standard_direct_comparisons,
+    solve_direct_fem_contact,
+    standard_validation_intervals,
+)
+from compliance_fem.contact.lookup import (
     LOOKUP_SCHEMA_VERSION,
     REGENERATE_LOOKUP_MESSAGE,
     SCALAR_FX,
     SCALAR_FY,
     SCALAR_MZ,
-    from_compliance_result,
+    get_compliance_block_matrix,
     generate_contact_lookup,
     load_contact_lookup,
     save_contact_lookup,
 )
-from compliance_fem.contact_topology import ContactInterval, n_intervals
-from compliance_fem.force_control import evaluate_candidates, select_contact_candidate
-from compliance_fem.measured_geometry import (
+from compliance_fem.contact.topology import ContactInterval, interval_row, n_intervals
+from compliance_fem.contact.force_control import evaluate_candidates, select_contact_candidate
+from compliance_fem.geometry.profile import (
     BOUNDARY_TAGS,
     FOAM_REGION_TAGS,
     SHARED_TOE_POLICY,
     GeometryFileError,
-    build_measured_geometry,
+    build_sole_geometry,
     distance_to_polyline,
     load_normalized_sole_csv,
     point_in_polygon,
     polyline_self_intersections,
 )
-from compliance_fem.measured_mesh import MeshQualityError, generate_measured_mesh
-from compliance_fem.plate import assemble_plate_bending, plate_element_frames
-from compliance_fem.shape_render import build_shape_plot_data
+from compliance_fem.geometry.mesh import MeshQualityError, generate_mesh
+from compliance_fem.fem.plate import assemble_plate_bending, plate_element_frames
+from compliance_fem.plotting.shape_render import build_shape_plot_data
 
-CSV_PATH = Path(__file__).resolve().parents[1] / "data" / "geometry" / "sole_geometry_normalized.csv"
+CSV_PATH = Path(__file__).resolve().parents[1] / "data" / "geometry" / "sole_geometry.csv"
 SHOE_MM = 270.0
 L_M = SHOE_MM / 1000.0
-A_SOFT = 0.78 * L_M
+TOE_LENGTH_SOFT = 0.22 * L_M
 KAPPA = 160.0
 
 
@@ -98,18 +101,18 @@ def _subsampled_rows(step: int = 5) -> list[dict]:
 
 
 @pytest.fixture(scope="module")
-def meas_cfg() -> MeasuredSoleConfig:
-    return MeasuredSoleConfig(shoe_length_mm=SHOE_MM, geometry_csv=str(CSV_PATH))
+def meas_cfg() -> SoleConfig:
+    return SoleConfig(shoe_length_mm=SHOE_MM, geometry_csv=str(CSV_PATH))
 
 
 @pytest.fixture(scope="module")
 def meas_geom(meas_cfg):
-    return build_measured_geometry(meas_cfg.normalized_geometry, SHOE_MM)
+    return build_sole_geometry(meas_cfg.normalized_geometry, SHOE_MM)
 
 
 @pytest.fixture(scope="module")
 def meas_fem(meas_cfg):
-    return compute_measured_compliance(meas_cfg)
+    return compute_compliance(meas_cfg)
 
 
 @pytest.fixture(scope="module")
@@ -123,19 +126,19 @@ def coarse_csv(tmp_path_factory) -> Path:
 
 
 @pytest.fixture(scope="module")
-def coarse_cfg(coarse_csv) -> MeasuredSoleConfig:
-    return MeasuredSoleConfig(shoe_length_mm=SHOE_MM, geometry_csv=str(coarse_csv), mesh_size=0.010)
+def coarse_cfg(coarse_csv) -> SoleConfig:
+    return SoleConfig(shoe_length_mm=SHOE_MM, geometry_csv=str(coarse_csv), mesh_size_m=0.010)
 
 
 @pytest.fixture(scope="module")
 def coarse_fem(coarse_cfg):
-    return compute_measured_compliance(coarse_cfg)
+    return compute_compliance(coarse_cfg)
 
 
 @pytest.fixture(scope="module")
 def coarse_lookup(coarse_fem):
     with pytest.warns(UserWarning):
-        return generate_contact_lookup(from_compliance_result(coarse_fem), a=A_SOFT, kappa=KAPPA, fem_result=coarse_fem, store_fields=True)
+        return generate_contact_lookup(get_compliance_block_matrix(coarse_fem), toe_length=TOE_LENGTH_SOFT, kappa=KAPPA, fem_result=coarse_fem, store_fields=True)
 
 
 @pytest.fixture(scope="module")
@@ -158,7 +161,7 @@ def _selection(lookup, phi_deg=0.0, theta_deg=0.0, Fx=0.0, Fy=-1500.0):
 # 1. shoe_length_mm is required.
 def test_shoe_length_required() -> None:
     with pytest.raises(ValueError, match="shoe_length_mm is required"):
-        MeasuredSoleConfig(shoe_length_mm=None, geometry_csv=str(CSV_PATH))
+        SoleConfig(shoe_length_mm=None, geometry_csv=str(CSV_PATH))
 
 
 # 2. Nonpositive / nonfinite lengths are rejected.
@@ -167,13 +170,13 @@ def test_bad_shoe_length_rejected(bad) -> None:
     with pytest.raises(ValueError):
         validate_shoe_length_mm(bad)
     with pytest.raises(ValueError):
-        MeasuredSoleConfig(shoe_length_mm=bad, geometry_csv=str(CSV_PATH))
+        SoleConfig(shoe_length_mm=bad, geometry_csv=str(CSV_PATH))
 
 
 # 3-4. Toe maps to L mm, heel-bottom to the origin.
 @pytest.mark.parametrize("length_mm", [240.0, 270.0, 310.0])
 def test_toe_and_heel_mapping(meas_cfg, length_mm) -> None:
-    g = build_measured_geometry(meas_cfg.normalized_geometry, length_mm)
+    g = build_sole_geometry(meas_cfg.normalized_geometry, length_mm)
     assert g.landmarks["toe_tip"][0] == pytest.approx(length_mm / 1000.0, rel=1e-12)
     np.testing.assert_allclose(g.landmarks["heel_bottom"], [0.0, 0.0], atol=1e-15)
 
@@ -288,10 +291,10 @@ def test_corners_convex_and_names_ignored(tmp_path) -> None:
     rows.append({"record_type": "point", "name": "corner_2_interior", "index": "", "x_over_length": "0.5", "y_over_length": "0.5"})
     norm = load_normalized_sole_csv(_write_rows(tmp_path / "extra.csv", rows))
     assert "corner_2_interior" in norm.ignored_names
-    g = build_measured_geometry(norm, SHOE_MM)
+    g = build_sole_geometry(norm, SHOE_MM)
     assert set(g.corner_angles_deg) == {"heel_bottom", "toe_tip", "heel_top"}
     assert all(0.0 < ang < 180.0 for ang in g.corner_angles_deg.values())
-    ref = build_measured_geometry(load_normalized_sole_csv(CSV_PATH), SHOE_MM)
+    ref = build_sole_geometry(load_normalized_sole_csv(CSV_PATH), SHOE_MM)
     np.testing.assert_array_equal(g.exterior, ref.exterior)
 
 
@@ -380,7 +383,7 @@ def test_positive_areas(meas_mesh) -> None:
     p, t = meas_mesh.mesh.p, meas_mesh.mesh.t
     a, b, c = p[:, t[0]], p[:, t[1]], p[:, t[2]]
     area = 0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
-    assert np.all(area > 1e-6 * meas_mesh.config.mesh_size**2)
+    assert np.all(area > 1e-6 * meas_mesh.config.mesh_size_m**2)
 
 
 # 27. Mesh quality is enforced near the point toe.
@@ -391,7 +394,7 @@ def test_toe_quality_enforced(meas_mesh, meas_cfg) -> None:
     assert q["toe_min_angle_deg"] <= meas_mesh.geometry.corner_angles_deg["toe_tip"] + 1e-9
     strict = dataclasses.replace(meas_cfg, min_angle_deg=58.0)
     with pytest.raises(MeshQualityError):
-        generate_measured_mesh(strict)
+        generate_mesh(strict)
 
 
 # 28. Unequal top / bottom node counts.
@@ -447,7 +450,7 @@ def test_constraints_only_on_plate(meas_fem) -> None:
     assert meas_fem.B_p.shape[0] == meas_fem.n_plate_nodes - 1 == meas_fem.constraint_rank
     allowed = set(np.concatenate([meas_fem.plate_u_dof_ids, meas_fem.plate_v_dof_ids]).tolist())
     assert set(B.col.tolist()) <= allowed
-    assert meas_fem.inextensibility_residuals["top"] <= 1e-12 * L_M
+    assert meas_fem.inextensibility_residuals.top <= 1e-12 * L_M
 
 
 # 35. Element tangents / normals.
@@ -598,7 +601,7 @@ def test_closure_places_contact_on_ground(coarse_lookup) -> None:
 
 
 def _fixed_frame_state(lookup, sel):
-    from compliance_fem.corotation import affine_coefficients
+    from compliance_fem.contact.corotation import affine_coefficients
 
     row = sel.selected_row
     varphi = float(sel.varphi)
@@ -639,17 +642,48 @@ def test_lookup_matches_direct_fem(coarse_fem) -> None:
         "toe": ContactInterval((2 * n_b) // 3, n_b - 1, n_b),
         "full": ContactInterval(0, n_b - 1, n_b),
     }
-    out = run_standard_direct_comparisons(coarse_fem, A_SOFT, KAPPA, intervals=specs)
+    out = run_standard_direct_comparisons(coarse_fem, TOE_LENGTH_SOFT, KAPPA, intervals=specs)
     for name, comps in out.items():
         worst = max(c.max_rel_error for c in comps)
         assert worst < 1e-6, (name, worst)
         assert max(c.free_traction_rel for c in comps) < 1e-8
 
 
+def _rel(a, b) -> float:
+    return float(np.linalg.norm(np.asarray(a) - np.asarray(b)) / max(np.linalg.norm(a), np.linalg.norm(b), 1e-30))
+
+
+# 55b. Generated lookup records (not just the interval solver) agree with direct FEM and balance.
+def test_lookup_records_match_direct_fem(coarse_fem, coarse_lookup) -> None:
+    lk = coarse_lookup
+    xt, yt = np.asarray(coarse_fem.x_top), np.asarray(coarse_fem.y_top)
+    xb, yb = np.asarray(coarse_fem.x_bottom), np.asarray(coarse_fem.y_bottom)
+    L = float(coarse_fem.config.L)
+    for name, spec in standard_validation_intervals(xb, L).items():
+        row = interval_row(spec.start, spec.end, spec.n_bottom)
+        assert lk.valid_mask[row], name
+        free, contact = spec.sets()
+        f = {key: value[0] for key, value in lk.record_fields([row]).items()}
+        for k in range(N_AFFINE_COLUMNS):
+            fem = solve_direct_fem_contact(coarse_fem, spec, k, lk.softplus_toe_length, lk.softplus_kappa)
+            ft_x, ft_y = f["top_force_x"][k], f["top_force_y"][k]
+            rc_x, rc_y = f["reaction_x"][k, contact], f["reaction_y"][k, contact]
+            assert _rel(np.r_[ft_x, ft_y], fem.f_t) < 1e-6, (name, k)
+            assert _rel(np.r_[rc_x, rc_y], fem.r_c) < 1e-6, (name, k)
+            if free.size:
+                assert _rel(np.r_[f["bottom_u"][k, free], f["bottom_v"][k, free]], fem.g_f) < 1e-6, (name, k)
+            fx, fy = np.r_[ft_x, rc_x], np.r_[ft_y, rc_y]
+            x, y = np.r_[xt, xb[contact]], np.r_[yt, yb[contact]]
+            scale = max(float(np.sum(np.abs(np.r_[ft_x, ft_y]))), 1e-30)
+            assert np.hypot(fx.sum(), fy.sum()) / scale < 1e-8, (name, k)
+            assert abs(np.sum(x * fy - y * fx)) / (scale * L) < 1e-8, (name, k)
+            assert np.linalg.norm(fem.r_free) / max(np.linalg.norm(fem.f_t), 1e-30) < 1e-8, (name, k)
+
+
 # 56. Passive toe equilibrium with k = 25 N m/rad.
 def test_passive_toe_exact(coarse_lookup) -> None:
     from compliance_fem.gait.passive_toe import solve_passive_toe_candidates
-    from compliance_fem.toe_spring import ToeSpringConfig
+    from compliance_fem.contact.toe_spring import ToeSpringConfig
 
     cfg = ToeSpringConfig()
     assert cfg.toe_stiffness_Nm_per_rad == 25.0
@@ -667,7 +701,7 @@ def test_passive_toe_exact(coarse_lookup) -> None:
 def test_no_runtime_fem_solve(coarse_lookup, monkeypatch) -> None:
     import scipy.sparse.linalg as spla
 
-    import compliance_fem.compliance as comp
+    import compliance_fem.fem.compliance as comp
 
     def _forbidden(*_a, **_k):
         raise AssertionError("FEM solve during runtime evaluation")
@@ -687,7 +721,7 @@ def test_no_runtime_fem_solve(coarse_lookup, monkeypatch) -> None:
 # 58-61. Geometry metadata, shoe length, tags and the toe convention survive serialization.
 def test_lookup_serialization(saved_lookup, coarse_lookup) -> None:
     _, lk = saved_lookup
-    assert lk.schema_version == LOOKUP_SCHEMA_VERSION and lk.is_measured
+    assert lk.schema_version == LOOKUP_SCHEMA_VERSION
     gm, ref = lk.geometry_metadata, coarse_lookup.geometry_metadata
     assert gm["shoe_length_mm"] == SHOE_MM
     for key in ("normalized_landmarks", "physical_landmarks", "plate_start_reference_coordinate",
@@ -697,9 +731,9 @@ def test_lookup_serialization(saved_lookup, coarse_lookup) -> None:
     assert gm["foam_region_tags"] == list(FOAM_REGION_TAGS)
     assert gm["boundary_tags"] == list(BOUNDARY_TAGS)
     assert gm["shared_toe_policy"] == SHARED_TOE_POLICY
-    assert gm["shared_toe_node_id"] == int(coarse_lookup.measured_render["bottom_curve_node_ids"][-1])
-    for key, arr in coarse_lookup.measured_render.items():
-        np.testing.assert_array_equal(lk.measured_render[key], arr)
+    assert gm["shared_toe_node_id"] == int(coarse_lookup.render_section["bottom_curve_node_ids"][-1])
+    for key, arr in coarse_lookup.render_section.items():
+        np.testing.assert_array_equal(lk.render_section[key], arr)
     np.testing.assert_array_equal(lk.plate_node_ids, coarse_lookup.plate_node_ids)
     np.testing.assert_array_equal(lk.rigid_alpha_basis, coarse_lookup.rigid_alpha_basis)
 
@@ -710,48 +744,20 @@ def _flat(obj):
     return np.asarray(obj, dtype=float).ravel().tolist()
 
 
-def test_compliance_npz_roundtrip(coarse_fem, coarse_cfg, tmp_path) -> None:
+def test_compliance_npz_stores_settings(coarse_fem, coarse_cfg, tmp_path) -> None:
     path = tmp_path / "compliance_results.npz"
     save_compliance_npz(coarse_fem, path)
-    assert is_measured_compliance_npz(path)
-    cfg = measured_config_from_compliance_npz(path)
-    for f in ("shoe_length_mm", "upper_foam_material", "lower_foam_material", "EI_plate", "mesh_size",
-              "ffturbo_E", "ffleap_E_heel", "ffleap_E_toe", "toe_refinement"):
-        assert getattr(cfg, f) == getattr(coarse_cfg, f), f
-    assert cfg.normalized_geometry.to_payload() == coarse_cfg.normalized_geometry.to_payload()
-
-
-# 62. Rectangle and layered modes are unchanged.
-def test_simple_modes_unchanged() -> None:
-    from conftest import small_config
-
-    from compliance_fem.boundaries import vector_boundary_data
-    from compliance_fem.config import LayeredPlateConfig
-
-    rect = compute_compliance(small_config())
-    assert rect.compliance_schema_version == 3 and rect.plate_node_ids is None
-    u, v, _, _ = vector_boundary_data(rect.basis, "bottom")
-    np.testing.assert_array_equal(rect.selector_dofs("bottom")[0], u)
-    lay_cfg = LayeredPlateConfig(
-        L=0.30, h1_heel=0.025, h1_toe=0.015, h2_heel=0.020, h2_toe=0.030, E1=2.0e6, nu1=0.30,
-        E_heel=5.0e5, E_toe=1.5e6, nu2=0.30, EI_plate=10.0, nx=8, ny1=2, ny2=2,
-    )
-    lay = compute_compliance(lay_cfg)
-    assert lay.compliance_schema_version == 3 and lay.geometry_metadata is None
-    coords = np.vstack([lay.x_plate, lay.y_plate])
-    _, t, n = plate_element_frames(coords)
-    K_global = assemble_plate_bending(lay.basis.N, lay.plate_u_dof_ids, lay.plate_v_dof_ids, coords, lay_cfg.plate_normal, 2.0)
-    K_local = assemble_plate_bending(lay.basis.N, lay.plate_u_dof_ids, lay.plate_v_dof_ids, coords, n, 2.0)
-    assert abs(K_global - K_local).max() <= 1e-12 * abs(K_global).max()
-    B1 = assemble_axial_constraints(lay.n_primal, lay.plate_u_dof_ids, lay.plate_v_dof_ids, lay_cfg.plate_tangent, lay.n_plate_rotation_dofs)
-    B2 = assemble_axial_constraints(lay.n_primal, lay.plate_u_dof_ids, lay.plate_v_dof_ids, t, lay.n_plate_rotation_dofs)
-    assert abs(B1 - B2).max() <= 1e-14
+    data = np.load(path)
+    for name in SOLE_SCALAR_FIELDS:
+        assert data[name].item() == getattr(coarse_cfg, name), name
+    stored = json.loads(str(data["normalized_geometry_json"]))
+    assert stored == json.loads(json.dumps(coarse_cfg.normalized_geometry.to_payload()))
 
 
 # 63. Changing the shoe length scales the whole geometry uniformly.
 def test_gui_scaling_uniform(meas_cfg) -> None:
-    g1 = build_measured_geometry(meas_cfg.normalized_geometry, 250.0)
-    g2 = build_measured_geometry(meas_cfg.normalized_geometry, 300.0)
+    g1 = build_sole_geometry(meas_cfg.normalized_geometry, 250.0)
+    g2 = build_sole_geometry(meas_cfg.normalized_geometry, 300.0)
     k = 300.0 / 250.0
     for a, b in ((g1.top, g2.top), (g1.bottom, g2.bottom), (g1.interface, g2.interface), (g1.exterior, g2.exterior)):
         np.testing.assert_allclose(b, k * a, rtol=1e-12, atol=1e-15)
@@ -762,7 +768,7 @@ def test_gui_scaling_uniform(meas_cfg) -> None:
 
 # 64. GUI colours follow the material of each region.
 def test_gui_material_colors(coarse_lookup) -> None:
-    from compliance_fem.app import MATERIAL_FILL_COLORS, _draw_shape
+    from compliance_fem.gui.app import MATERIAL_FILL_COLORS, _draw_shape
 
     _, sel = _selection(coarse_lookup)
     for upper, lower in (("FFTurbo", "FFLeap"), ("FFLeap", "FFTurbo")):
@@ -792,7 +798,7 @@ def test_gui_plate_partial_span(coarse_lookup) -> None:
     tol = 1e-9 * L_M
     assert sh.plate_x_def[0] == pytest.approx(sh.plate_node_x[0], abs=tol)
     assert sh.plate_x_def[-1] == pytest.approx(sh.plate_node_x[-1], abs=tol)
-    sec = coarse_lookup.measured_render
+    sec = coarse_lookup.render_section
     iface = np.asarray(sec["interface_node_ids"])
     on_plate = np.isin(iface, sec["plate_curve_node_ids"])
     np.testing.assert_allclose(sh.interface_def[0][on_plate], sh.plate_node_x, atol=1e-7 * L_M)
@@ -807,20 +813,20 @@ def test_gui_contact_follows_bottom(coarse_lookup) -> None:
     i, j = sel.interval
     np.testing.assert_allclose(sh.contact_curve_x, sh.x_bottom_def[i : j + 1], atol=1e-9 * L_M)
     np.testing.assert_allclose(sh.contact_curve_y, sh.y_bottom_def[i : j + 1], atol=1e-9 * L_M)
-    assert sh.is_measured and set(sh.region_def) == set(FOAM_REGION_TAGS)
+    assert sh.has_render_mesh and set(sh.region_def) == set(FOAM_REGION_TAGS)
 
 
 # 67. Incompatible old schemas are identified clearly.
 def test_old_schema_messages(saved_lookup, tmp_path) -> None:
     path, _ = saved_lookup
     data = dict(np.load(path, allow_pickle=True))
-    for version, match in ((8, "schema_version=8"), (9, "cannot contain measured-sole")):
+    for version, match in ((8, "schema_version=8"), (9, "schema_version=9")):
         old = dict(data)
         old["schema_version"] = np.asarray(version)
         np.savez_compressed(tmp_path / f"v{version}.npz", **old)
         with pytest.raises(ValueError, match=match):
             load_contact_lookup(tmp_path / f"v{version}.npz")
-    assert "schema_version=10" in REGENERATE_LOOKUP_MESSAGE
+    assert "schema_version=11" in REGENERATE_LOOKUP_MESSAGE
     broken = {k: v for k, v in data.items() if k != "render_influence_loads"}
     np.savez_compressed(tmp_path / "broken.npz", **broken)
     with pytest.raises(ValueError, match="missing geometry arrays"):

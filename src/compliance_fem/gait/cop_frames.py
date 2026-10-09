@@ -7,10 +7,6 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-TOE_ANGLE_METHOD = "force-phi-relu-neg-phi"
-TOE_ANGLE_METHOD_VERSION = "1"
-
-
 @dataclass(frozen=True)
 class LabSagittalPoint:
     """Point in the laboratory/OpenSim ground sagittal plane (+x anterior, +y up)."""

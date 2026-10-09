@@ -9,18 +9,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from compliance_fem.compliance import compute_layered_compliance
-from compliance_fem.config import LayeredPlateConfig
-from compliance_fem.contact_basis import COL_ALPHA, COL_BRX, COL_BX, shape_mode_phi1
-from compliance_fem.contact_lookup import (
-    REGENERATE_LOOKUP_MESSAGE,
+from compliance_fem.fem.compliance import compute_compliance
+from compliance_fem.contact.basis import COL_ALPHA, COL_BRX, COL_BX, shape_mode_phi1
+from compliance_fem.contact.lookup import (
     SCALAR_TOE,
     compute_toe_moment,
-    from_compliance_result,
+    get_compliance_block_matrix,
     generate_contact_lookup,
     solve_candidate,
 )
-from compliance_fem.corotation import (
+from compliance_fem.contact.corotation import (
     SHAPE_MODE_SIGN,
     basis_coefficients,
     contract_basis,
@@ -33,7 +31,7 @@ from compliance_fem.corotation import (
     shape_amplitude,
     transform_to_fixed_frame,
 )
-from compliance_fem.force_control import (
+from compliance_fem.contact.force_control import (
     Tolerances,
     angles_to_coefficients,
     evaluate_candidates,
@@ -41,28 +39,34 @@ from compliance_fem.force_control import (
     export_evaluation_csv,
     export_selected_result,
 )
-from compliance_fem.shape_render import build_shape_plot_data
+from compliance_fem.plotting.shape_render import build_shape_plot_data
 
-from conftest import SMALL_A, SMALL_KAPPA
+from conftest import SMALL_KAPPA, SMALL_TOE_LENGTH, small_config
 
 
 @pytest.fixture(scope="module")
 def sloped_lookup():
-    """Layered geometry whose reference top chord is deliberately not horizontal."""
-    config = LayeredPlateConfig(
-        L=0.25, h1_heel=0.025, h1_toe=0.010, h2_heel=0.020, h2_toe=0.030, E1=2.0e6, nu1=0.3,
-        E_heel=4.0e5, E_toe=8.0e5, nu2=0.3, EI_plate=5.0, nx=8, ny1=2, ny2=2,
+    """Synthetic sole whose reference top chord is deliberately not horizontal."""
+    result = compute_compliance(small_config(top_slope=0.02, EI_plate_Nm2_per_m=5.0, min_angle_deg=5.0))
+    return generate_contact_lookup(
+        get_compliance_block_matrix(result), toe_length=SMALL_TOE_LENGTH, kappa=30.0, fem_result=result
     )
-    result = compute_layered_compliance(config)
-    return generate_contact_lookup(from_compliance_result(result), a=0.15, kappa=30.0)
 
 
 def test_shape_mode_vanishes_at_endpoints_and_top_is_clamped(flat_lookup) -> None:
-    for L, a, kappa in ((1.0, 0.5, 30.0), (0.25, 0.15, 60.0), (2.0, 1.7, 8.0)):
-        np.testing.assert_allclose(shape_mode_phi1(np.array([0.0, L]), L=L, a=a, kappa=kappa), 0.0, atol=1e-14)
+    for L, toe_length, kappa in ((1.0, 0.5, 30.0), (0.25, 0.10, 60.0), (2.0, 0.3, 8.0)):
+        np.testing.assert_allclose(
+            shape_mode_phi1(np.array([0.0, L]), L=L, toe_length=toe_length, kappa=kappa), 0.0, atol=1e-14
+        )
     n_t = flat_lookup.n_top_nodes
     W = flat_lookup.basis_top_displacements
-    assert abs(W[n_t, COL_ALPHA]) < 1e-14 and abs(W[-1, COL_ALPHA]) < 1e-14
+    assert flat_lookup.x_top[0] == 0.0 and abs(W[n_t, COL_ALPHA]) < 1e-14
+    np.testing.assert_allclose(
+        W[n_t:, COL_ALPHA],
+        shape_mode_phi1(flat_lookup.x_top, flat_lookup.L, flat_lookup.softplus_toe_length, flat_lookup.softplus_kappa),
+        rtol=0.0,
+        atol=1e-14,
+    )
     np.testing.assert_array_equal(W[:, COL_BX:], 0.0)
     np.testing.assert_array_equal(W[:n_t, :], 0.0)
 
@@ -71,8 +75,8 @@ def test_lookup_generation_takes_no_angle_and_is_reproducible(flat_case) -> None
     for fn in (generate_contact_lookup, solve_candidate):
         names = set(inspect.signature(fn).parameters)
         assert not (names & {"phi", "phi_deg", "varphi", "theta", "theta_deg"})
-    blocks = from_compliance_result(flat_case[0])
-    first = generate_contact_lookup(blocks, a=SMALL_A, kappa=SMALL_KAPPA, store_fields=True)
+    blocks = get_compliance_block_matrix(flat_case[0])
+    first = generate_contact_lookup(blocks, toe_length=SMALL_TOE_LENGTH, kappa=SMALL_KAPPA, store_fields=True)
     np.testing.assert_array_equal(first.scalar_lookup, flat_case[1].scalar_lookup)
     np.testing.assert_array_equal(first.reaction_x_basis, flat_case[1].reaction_x_basis)
 
@@ -96,12 +100,12 @@ def test_force_rotation_to_local_and_back(varphi_deg) -> None:
 
 
 def test_positive_theta_bends_the_toe_up() -> None:
-    L, a, kappa = 1.0, 0.5, 30.0
+    L, toe_length, kappa = 1.0, 0.5, 30.0
     x = np.linspace(0.0, L, 401)
-    v = shape_amplitude(np.deg2rad(10.0)) * shape_mode_phi1(x, L=L, a=a, kappa=kappa)
+    v = shape_amplitude(np.deg2rad(10.0)) * shape_mode_phi1(x, L=L, toe_length=toe_length, kappa=kappa)
     slope = np.gradient(v, x)
-    assert float(np.mean(slope[x >= a])) > 0.0
-    assert float(np.mean(slope[x <= a])) < 0.0
+    assert float(np.mean(slope[x >= L - toe_length])) > 0.0
+    assert float(np.mean(slope[x <= L - toe_length])) < 0.0
     assert SHAPE_MODE_SIGN == 1.0
 
 
@@ -123,9 +127,8 @@ def test_gui_angle_conversion(flat_lookup) -> None:
 
 def test_runtime_rejects_stale_lookup(flat_lookup) -> None:
     stale = dataclasses.replace(flat_lookup, schema_version=8)
-    with pytest.raises(ValueError, match="schema_version=10"):
+    with pytest.raises(ValueError, match="schema_version=11"):
         evaluate_candidates(stale, 0.0, -1.0e3, 0.0, 0.0)
-    assert "cannot be migrated" in REGENERATE_LOOKUP_MESSAGE
 
 
 def test_sloped_top_reference_chord(sloped_lookup) -> None:
@@ -147,7 +150,7 @@ def test_toe_moment_superposes_and_uses_reference_levers(rocker_lookup) -> None:
     gamma = basis_coefficients(sel.alpha, sel.d_ax, sel.d_ay, sel.varphi)
     assert sel.T_toe == pytest.approx(float(contract_basis(lk.scalar_lookup[row, :, SCALAR_TOE], gamma)), rel=1e-12)
     y_top = lk.y_top if lk.y_top is not None else np.full(lk.n_top_nodes, lk.H)
-    T_direct, _, _ = compute_toe_moment(sel.top_force_x, sel.top_force_y, lk.x_top, y_top, lk.softplus_a)
+    T_direct, _, _ = compute_toe_moment(sel.top_force_x, sel.top_force_y, lk.x_top, y_top, lk.L - lk.softplus_toe_length)
     assert float(T_direct) == pytest.approx(sel.T_toe, rel=1e-9)
 
 

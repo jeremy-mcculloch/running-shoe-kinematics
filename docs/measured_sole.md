@@ -1,7 +1,7 @@
-# Measured carbon-plated sole (`geometry_type = "measured_sole"`)
+# Measured carbon-plated sole
 
-The measured-sole model replaces the rectangle / layered-trapezoid outline with
-an image-derived shoe profile: two conforming foam regions separated by a
+The measured-sole model is the only geometry: an image-derived shoe profile
+with two conforming foam regions separated by a
 measured foam interface, and an inextensible Euler–Bernoulli carbon plate that
 covers only part of that interface. It reuses the existing solver stack
 unchanged in structure: the same plane-strain foam assembly, Hermite plate,
@@ -11,7 +11,7 @@ separate solver.
 
 ## Geometry file
 
-Use the **normalized** CSV (`data/geometry/sole_geometry_normalized.csv`), never
+Use the normalized CSV (`data/geometry/sole_geometry.csv`), never
 the original pixel-coordinate file. Columns:
 
 | column | meaning |
@@ -92,8 +92,8 @@ nodes (no duplicated nodes, no contact between foams):
 | `upper_foam` (above the interface) | FFTurbo | \(E=2.6\times10^5\) Pa, \(\nu=0.113\) |
 | `lower_foam` (below, contacts the ground) | FFLeap | \(E(x)=E_h+(E_t-E_h)\,x/L\), \(E_h=3.54\times10^5\), \(E_t=2.07\times10^5\) Pa, \(\nu=0.113\) |
 
-Either region may be assigned either foam (`--upper-foam`, `--lower-foam` or
-the GUI selectboxes). Each element belongs to exactly one region; the foam
+Either region may be assigned either foam (`sole.upper_foam_material`,
+`sole.lower_foam_material` in the config, or the GUI selectboxes). Each element belongs to exactly one region; the foam
 stiffness is the sum of per-region plane-strain assemblies.
 
 ## Partial curved plate
@@ -116,9 +116,8 @@ L_e=\lVert \mathbf x_{e,2}-\mathbf x_{e,1}\rVert,\qquad
 Bending uses the Hermite element in each element's local normal direction, and
 inextensibility rows are \(\mathbf t_e\cdot(\mathbf u_{e,2}-\mathbf u_{e,1})=0\)
 per element. Both plate ends are free (natural rotation conditions); interface
-nodes outside the plate are ordinary shared foam nodes. On the straight
-layered plate all frames coincide and the assembly reduces exactly to the
-previous one.
+nodes outside the plate are ordinary shared foam nodes. On a straight plate all
+element frames coincide.
 
 ## Selectors and the shared toe
 
@@ -173,28 +172,22 @@ because the top selector is no longer at constant height.
 
 ## Lookup schema and compatibility
 
-| artefact | previous | new |
-|----------|----------|-----|
-| contact lookup `schema_version` | 9 | **10** |
-| compliance schema (rectangle / layered) | 3 | 3 (unchanged) |
-| compliance schema (measured sole) | — | **4** |
-
-Schema v10 adds `rigid_alpha_basis` (per-record rigid amplitudes about
-\(x_r=L/2,\ y_r=0\)) for every lookup, plus a measured geometry section
+The contact lookup uses `schema_version = 11` and the compliance NPZ uses
+`compliance_schema_version = 5`. The lookup stores `rigid_alpha_basis` (per-record rigid amplitudes
+about \(x_r=L/2,\ y_r=0\)) plus a measured geometry section
 (mesh points, triangles, element regions, curve / loop node ids, render
 influence matrices, `geometry_metadata_json`, `normalized_geometry_json`).
-v9 rectangle and layered files are migrated on load
-(`migrated_from_schema = 9`); v1–v8 files and any v9 file claiming
-measured-sole geometry are rejected with a regenerate message. A v10 measured
-file missing any geometry array is rejected. Measured compliance NPZs store
-the normalized geometry, so a lookup can be regenerated without the original
-CSV.
+Files with any other schema version are rejected with a regenerate message,
+and a lookup with only part of the geometry section is rejected. Compliance
+NPZs store the normalized geometry and every scalar `SoleConfig` setting under
+its field name (`EI_plate_Nm2_per_m`, `mesh_size_m`, ...) for reference; lookups
+are always regenerated from the config.
 
 ## Configuration file
 
 Everything that is not in the geometry CSV lives in one JSON file (example:
-[`configs/measured_sole_270mm.json`](../configs/measured_sole_270mm.json)),
-handled by `compliance_fem.measured_config_file`. Unknown keys, booleans in
+[`configs/setup.json`](../configs/setup.json)),
+handled by `compliance_fem.contact.model_setup`. Unknown keys, booleans in
 numeric fields, non-finite numbers and missing required keys are rejected with
 a `ConfigFileError`. Relative paths resolve against the config file's directory.
 
@@ -211,8 +204,8 @@ a `ConfigFileError`. Relative paths resolve against the config file's directory.
 | mesh | `toe_refinement`, `heel_corner_refinement`, `interface_refinement`, `plate_end_refinement` | factor | 0.4, 0.5, 0.6, 0.4 |
 | mesh | `curvature_max_turn_deg`, `min_angle_deg` | deg | 12, 12 |
 | mesh | `element_order` | 1 or 2 | 1 |
-| lookup | `a_over_length` **or** `a_m` | — / m | 0.78 × L |
-| lookup | `kappa` | — | 160 |
+| lookup | `toe_length_mm` | mm | 59.4 |
+| lookup | `min_bend_radius_mm` | mm | 6.75 |
 | lookup | `reciprocity_tol` | — | 1e-6 |
 | lookup | `output_dir` | path | none |
 | lookup | `store_nodal_fields` | bool | false |
@@ -221,37 +214,37 @@ a `ConfigFileError`. Relative paths resolve against the config file's directory.
 | toe_spring | `low_force_threshold_N`, `equilibrium_abs_tol_Nm`, `equilibrium_rel_tol`, `root_scan_points` | | 50, 1e-6, 1e-8, 721 |
 | runtime | `shoe_width_m` | m | 0.10 |
 
-`a_over_length` keeps the softplus parameter proportional when the shoe length
-changes; give `a_m` to pin it absolutely (exactly one of the two).
+`toe_length_mm` is the distance from the softplus joint to the toe tip, so the
+joint sits at `L - toe_length` from the heel. `min_bend_radius_mm`
+is the tightest radius of that shape at a 45° toe angle (α = tan 45° = 1). The
+dimensionless softplus sharpness used by the solver is `κ = 4L / R`.
 
 **Fingerprint.** A SHA-256 over the normalized geometry values (not the CSV
 path), shoe length, landmark tolerance, materials, plate EI, mesh settings,
-`a`, `kappa` and `reciprocity_tol`. `toe_spring`, `runtime` and
+toe length, `kappa` and `reciprocity_tol`. `toe_spring`, `runtime` and
 `store_nodal_fields` are excluded because they do not change the model. Building a lookup from a config
-stores the full setup (`measured_setup`) and the fingerprint
-(`measured_setup_fingerprint`) in the lookup metadata and writes a copy of the
+stores the full setup (`model_setup`) and the fingerprint
+(`model_setup_fingerprint`) in the lookup metadata and writes a copy of the
 config as `measured_sole_config.json` next to the lookup.
 
 ```bash
-python -m compliance_fem.measured_config_file template my_sole.json --shoe-length-mm 260
-python -m compliance_fem.measured_config_file check configs/measured_sole_270mm.json
-python -m compliance_fem.measured_config_file build configs/measured_sole_270mm.json [--force] [--store-fields]
+compliance-fem-contact-lookup configs/setup.json [--force] [--save-fem] [--skip-plots]
 ```
 
-`store_nodal_fields` (or `--store-fields`) keeps the per-node bases in the NPZ.
+`store_nodal_fields` keeps the per-node bases in the NPZ.
 By default they are left out and recomputed on demand, bitwise identically
 ([interval_contact.md](interval_contact.md#stored-scalars-on-demand-nodal-fields)).
 
-`build` reuses `lookup.output_dir` if it already holds a lookup with the same
-fingerprint, unless `--force` is given or the config asks for stored nodal
-fields that the existing file lacks. Both CLIs accept `--config`; any
-explicit flag (`--mesh-size-mm`, `--a`, `--kappa`, `--output`, ...) overrides the
-file value. The written `measured_sole_config.json` records the values that
-were actually used.
+`compliance-fem-contact-lookup` skips the build if `lookup.output_dir` already
+holds a lookup with the same fingerprint, unless `--force` is given or the config
+asks for stored nodal fields that the existing file lacks. It uses the
+file as is: there are no per-parameter override flags, so edit (or copy) the
+config to change a value. A copy is written next to the lookup as
+`measured_sole_config.json`.
 
 ```python
 from compliance_fem.api import SoleModel
-model = SoleModel.from_config("configs/measured_sole_270mm.json")  # build_if_missing=True to build
+model = SoleModel.from_config("configs/setup.json")  # build_if_missing=True to build
 state = model.step(Fx_N=-100.0, Fy_N=-1500.0, phi_deg=5.0)
 ```
 
@@ -260,8 +253,7 @@ fingerprint differs from the config (pass `require_matching_lookup=False` to
 override), warns if the lookup has no fingerprint, and takes the toe spring
 and shoe width from the file.
 
-In the GUI, with the measured geometry selected, set **Measured-sole parameters
-from → Config file (JSON)**. The config then supplies every model parameter.
+In the GUI, set **Measured-sole parameters from → Config file (JSON)**. The config then supplies every model parameter.
 If its `output_dir` holds a lookup with a matching fingerprint, that lookup is
 loaded instead of being rebuilt. **Download measured-sole config** exports the
 current sidebar values as a config file.
@@ -269,26 +261,12 @@ current sidebar values as a config file.
 ## Usage
 
 ```bash
-# compliance
-python -m compliance_fem.cli --geometry measured-sole \
-  --geometry-csv data/geometry/sole_geometry_normalized.csv \
-  --shoe-length-mm 270 --output outputs/measured_sole
-
-# contact lookup (FEM recomputed in-process for plate / render recovery)
-python -m compliance_fem.contact_lookup_cli --geometry measured-sole \
-  --geometry-csv data/geometry/sole_geometry_normalized.csv \
-  --shoe-length-mm 270 --a 0.2106 --kappa 160 --output outputs/measured_sole_lookup
-
-# end-to-end validation report (writes validation.json)
-python examples/measured_sole_validation.py --shoe-length-mm 270
+# mesh -> FEM -> contact lookup, written to lookup.output_dir;
+# --save-fem also writes mesh, compliance NPZ, heatmaps and fem_summary.json to <output_dir>/fem/
+compliance-fem-contact-lookup configs/setup.json --save-fem
 ```
 
-Optional flags: `--upper-foam`, `--lower-foam`, `--mesh-size-mm`,
-`--toe-refinement`, `--heel-corner-refinement`, `--interface-refinement`,
-`--plate-end-refinement`, `--EI-plate`.
-
-In the Streamlit app choose **Geometry model → Measured carbon-plated sole**.
-The sidebar then exposes the CSV path, **Overall shoe length (mm)** (default
+The Streamlit sidebar exposes the CSV path, **Overall shoe length (mm)** (default
 270), upper/lower foam, mesh size and the four refinement factors, and shows a
 geometry summary. The model is cached by a key that includes the CSV SHA-256.
 The plot is drawn from the stored mesh coordinates: both foam regions filled by
@@ -299,7 +277,9 @@ influence matrices, so no FEM solve is needed at runtime.
 
 ## Validation at 270 mm (3 mm mesh)
 
-From `examples/measured_sole_validation.py`:
+Recorded on the full-resolution model. `test_lookup_records_match_direct_fem` in
+`tests/test_measured_sole.py` runs the same lookup-vs-direct-FEM and balance checks
+on a coarse mesh of the same geometry.
 
 - Landmarks: toe tip (270.0, 52.5) mm, heel top (2.19, 26.9) mm. Areas: upper
   foam 2110 mm², lower foam 5561 mm². Plate arc length 236.4 mm.
@@ -332,8 +312,7 @@ From `examples/measured_sole_validation.py`:
   normwise backward error of at most 1e-13 when the relative residual sits
   near 1e-8.
 - The stored per-record plate elongation residual \(\lVert B_p q\rVert\) reaches
-  about 5e-6 m per unit translation coefficient, the same order as the layered
-  lookup. For physical translations of millimetres this is negligible.
+  about 5e-6 m per unit translation coefficient. For physical translations of millimetres this is negligible.
 - File size: about 20 MB for the 270 mm lookup with on-demand nodal fields (the
   default; loads in about 0.1–0.3 s), or 377 MB with `store_nodal_fields`. The
   first GUI build takes about 1–2 minutes; cached reruns take under a second.

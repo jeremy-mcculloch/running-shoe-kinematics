@@ -8,9 +8,9 @@ import numpy as np
 import pytest
 
 from compliance_fem.api import SoleModel
-from compliance_fem.contact_lookup import save_contact_lookup
+from compliance_fem.contact.lookup import save_contact_lookup
 from compliance_fem.gait.passive_toe import pick_instant_best_passive, solve_passive_toe_candidates
-from compliance_fem.toe_spring import TOE_MODEL_PRESCRIBED_LEGACY, ToeSpringConfig
+from compliance_fem.contact.toe_spring import ToeSpringConfig
 
 WIDTH = 0.10
 LOAD = (-8.0, -80.0)  # N per shoe, foot on shoe (compressive)
@@ -85,5 +85,3 @@ def test_loads_from_path(rocker_lookup, tmp_path) -> None:
 def test_rejects_bad_configuration(rocker_lookup) -> None:
     with pytest.raises(ValueError, match="shoe_width_m"):
         SoleModel(rocker_lookup, shoe_width_m=0.0)
-    with pytest.raises(ValueError, match="passive"):
-        SoleModel(rocker_lookup, toe_config=ToeSpringConfig(toe_model=TOE_MODEL_PRESCRIBED_LEGACY))

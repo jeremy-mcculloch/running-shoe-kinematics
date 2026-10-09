@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from compliance_fem.plate import (
+from compliance_fem.fem.plate import (
     assemble_plate_bending,
     element_transformation,
     hermite_bending_matrix,

@@ -8,23 +8,23 @@ import itertools
 import numpy as np
 import pytest
 
-from compliance_fem.compliance import compute_compliance
-from compliance_fem.config import LayeredPlateConfig
-from compliance_fem.contact_lookup import (
+from compliance_fem.fem.compliance import compute_compliance
+from compliance_fem.contact.lookup import (
     NODAL_FIELD_ARRAY_KEYS,
     NODAL_FIELD_NAMES,
     PLATE_BASIS_ARRAY_KEYS,
     PLATE_FIELD_NAMES,
-    from_compliance_result,
+    get_compliance_block_matrix,
     generate_contact_lookup,
     load_contact_lookup,
     save_contact_lookup,
 )
-from compliance_fem.force_control import evaluate_candidates, evaluate_from_angles, refine_top_k
+from compliance_fem.contact.force_control import evaluate_candidates, evaluate_from_angles, refine_top_k
 from compliance_fem.gait.passive_toe import solve_passive_toe_candidates
-from compliance_fem.gait.wrench_control import pick_instant_best, solve_wrench_control
-from compliance_fem.plate_response import plate_state_for_selection
-from compliance_fem.toe_spring import ToeSpringConfig
+from compliance_fem.fem.plate_response import plate_state_for_selection
+from compliance_fem.contact.toe_spring import ToeSpringConfig
+
+from conftest import SMALL_TOE_LENGTH, small_config
 
 LOADS = list(itertools.product((-200.0, 0.0, 300.0), (-3000.0, -800.0, -50.0), (-20.0, 0.0, 15.0)))
 
@@ -125,7 +125,7 @@ def _same(a, b) -> None:
             assert va == vb, attr
 
 
-def test_passive_toe_and_wrench_control_match_stored_lookup(asym_lookup, asym_lookup_full) -> None:
+def test_passive_toe_matches_stored_lookup(asym_lookup, asym_lookup_full) -> None:
     cfg = ToeSpringConfig(toe_stiffness_Nm_per_rad=2.0)
     for Fx, Fy, phi in LOADS:
         kw = dict(Fx_star=Fx, Fy_star=Fy, Mz_meas=0.0, phi_rad=np.deg2rad(phi), config=cfg, width_m=0.1)
@@ -134,9 +134,6 @@ def test_passive_toe_and_wrench_control_match_stored_lookup(asym_lookup, asym_lo
         assert len(ca) == len(cb)
         for x, y in zip(ca, cb):
             _same(x, y)
-        wk = dict(Fx_star=Fx, Fy_star=Fy, Mz_star=0.0, phi_rad=np.deg2rad(phi))
-        _same(pick_instant_best(solve_wrench_control(asym_lookup_full, **wk)),
-              pick_instant_best(solve_wrench_control(asym_lookup, **wk)))
 
 
 def test_refine_top_k_orders_exactly() -> None:
@@ -157,20 +154,15 @@ def test_refine_top_k_orders_exactly() -> None:
 
 
 @pytest.fixture(scope="module")
-def layered_pair():
-    config = LayeredPlateConfig(
-        L=0.30, h1_heel=0.025, h1_toe=0.015, h2_heel=0.020, h2_toe=0.030,
-        E1=2.0e6, nu1=0.30, E_heel=5.0e5, E_toe=1.5e6, nu2=0.30, EI_plate=10.0,
-        nx=8, ny1=2, ny2=2, element_order=1, sole_rocker_height=0.003, sole_rocker_apex=0.4,
-    )
-    fem = compute_compliance(config)
-    blocks = from_compliance_result(fem)
-    kw = dict(a=0.18, kappa=30.0, fem_result=fem, require_plate=True)
+def plate_pair():
+    fem = compute_compliance(small_config(rocker=0.008))
+    blocks = get_compliance_block_matrix(fem)
+    kw = dict(toe_length=SMALL_TOE_LENGTH, kappa=30.0, fem_result=fem, require_plate=True)
     return generate_contact_lookup(blocks, **kw), generate_contact_lookup(blocks, store_fields=True, **kw)
 
 
-def test_plate_fields_on_demand(layered_pair, tmp_path) -> None:
-    lazy, full = layered_pair
+def test_plate_fields_on_demand(plate_pair, tmp_path) -> None:
+    lazy, full = plate_pair
     assert lazy.has_plate_response and all(getattr(lazy, k) is None for k in PLATE_BASIS_ARRAY_KEYS)
     rows = np.arange(lazy.n_records)
     a, b = lazy.record_fields(rows, plate=True), full.record_fields(rows, plate=True)

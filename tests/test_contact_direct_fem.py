@@ -10,33 +10,26 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from compliance_fem.boundaries import vector_boundary_data
-from compliance_fem.compliance import compute_compliance
-from compliance_fem.config import LayeredPlateConfig
-from compliance_fem.contact_basis import N_AFFINE_COLUMNS
-from compliance_fem.contact_direct_fem import (
+from compliance_fem.contact.basis import N_AFFINE_COLUMNS
+from compliance_fem.contact.direct_fem import (
     run_standard_direct_comparisons,
     solve_direct_fem_contact,
     standard_validation_intervals,
 )
-from compliance_fem.contact_lookup import (
-    from_compliance_result,
-    generate_contact_lookup,
+from compliance_fem.contact.lookup import (
     lookup_q_alpha_basis,
     lookup_rearfoot_geometry,
 )
-from compliance_fem.corotation import contract_basis
-from compliance_fem.force_control import Tolerances, evaluate_candidates, reconstruct_rows, select_contact_candidate
+from compliance_fem.contact.corotation import contract_basis
+from compliance_fem.contact.force_control import Tolerances, evaluate_candidates, reconstruct_rows, select_contact_candidate
 from compliance_fem.gait.passive_toe import pick_instant_best_passive, solve_passive_toe_candidates
-from compliance_fem.toe_spring import (
+from compliance_fem.contact.toe_spring import (
     ToeSpringConfig,
     q_alpha_shoe_on_foot,
     rearfoot_toe_mode,
     spring_dU_dalpha,
     top_shape_mode_vertical,
 )
-
-from conftest import SMALL_A, SMALL_KAPPA
 
 TOL = 1e-8
 WIDTH = 0.1
@@ -50,22 +43,10 @@ def _rel(a, b) -> float:
     return float(np.linalg.norm(a - b) / max(np.linalg.norm(a), np.linalg.norm(b), 1e-300))
 
 
-@pytest.fixture(scope="module")
-def layered_case():
-    config = LayeredPlateConfig(
-        L=0.30, h1_heel=0.025, h1_toe=0.015, h2_heel=0.020, h2_toe=0.030,
-        E1=2.0e6, nu1=0.30, E_heel=5.0e5, E_toe=1.5e6, nu2=0.30, EI_plate=10.0,
-        nx=8, ny1=2, ny2=2, element_order=1, sole_rocker_height=0.003, sole_rocker_apex=0.4,
-    )
-    result = compute_compliance(config)
-    lookup = generate_contact_lookup(from_compliance_result(result), a=SMALL_A, kappa=60.0, fem_result=result, store_fields=True)
-    return result, lookup
-
-
-@pytest.mark.parametrize("case_name", ["flat_case", "rocker_case", "asym_case", "layered_case"])
+@pytest.mark.parametrize("case_name", ["flat_case", "rocker_case", "asym_case"])
 def test_every_affine_column_agrees_with_direct_fem(request, case_name) -> None:
     result, lookup = request.getfixturevalue(case_name)
-    comps = run_standard_direct_comparisons(result, lookup.softplus_a, lookup.softplus_kappa)
+    comps = run_standard_direct_comparisons(result, lookup.softplus_toe_length, lookup.softplus_kappa)
     names = set(standard_validation_intervals(result.x_bottom, result.config.L))
     assert set(comps) == names
     for name, cols in comps.items():
@@ -81,22 +62,23 @@ def test_every_affine_column_agrees_with_direct_fem(request, case_name) -> None:
 def _validate_state(result, lk, row, gamma, varphi, F_star, *, toe_alpha=None):
     """Compare a combined runtime state against a direct FEM solve; return relative errors."""
     iv = lk.interval(row)
-    fem = solve_direct_fem_contact(result, iv, 0, lk.softplus_a, lk.softplus_kappa, gamma=gamma)
-    u = fem["u"]
+    fem = solve_direct_fem_contact(result, iv, 0, lk.softplus_toe_length, lk.softplus_kappa, gamma=gamma)
+    u = fem.u
     n_t = lk.n_top_nodes
     rec = reconstruct_rows(lk, np.array([row]), np.asarray(gamma)[None, :], varphi, F_star, Tolerances())
     errs: dict[str, float] = {}
 
     ftx = rec["top_force_x"][0]
     fty = rec["top_force_y"][0]
-    errs["top_force"] = _rel(np.concatenate([ftx, fty]), fem["f_t"])
+    errs["top_force"] = _rel(np.concatenate([ftx, fty]), fem.f_t)
     contact, free = iv.contact_node_ids, iv.free_node_ids
     rx = rec["full_bottom_reaction_x"][0][contact]
     ry = rec["full_bottom_reaction_y"][0][contact]
-    errs["contact_force"] = _rel(np.concatenate([rx, ry]), fem["r_c"])
+    errs["contact_force"] = _rel(np.concatenate([rx, ry]), fem.r_c)
 
     # Fixed-frame gaps at all bottom nodes from the direct displacement field.
-    u_bot, v_bot, x_b, y_b = vector_boundary_data(result.basis, "bottom")
+    u_bot, v_bot = result.selector_dofs("bottom")
+    x_b, y_b = result.x_bottom, result.y_bottom
     np.testing.assert_allclose(x_b, lk.x_bottom, atol=1e-14)
     x_a, y_a = lk.contact_anchor_reference_x[row], lk.contact_anchor_reference_y[row]
     d_ax, d_ay = gamma[1], gamma[2]
@@ -108,9 +90,9 @@ def _validate_state(result, lk, row, gamma, varphi, F_star, *, toe_alpha=None):
     errs["free_gap"] = float(np.max(np.abs(g_lookup[free] - g_direct[free])) / gap_scale) if free.size else 0.0
     errs["contact_ground"] = float(np.max(np.abs(g_direct[contact])) / gap_scale)
 
-    r_scale = max(np.max(np.abs(fem["r_c"])), 1e-300)
+    r_scale = max(np.max(np.abs(fem.r_c)), 1e-300)
     n_c = contact.size
-    fem_rx, fem_ry = fem["r_c"][:n_c], fem["r_c"][n_c:]
+    fem_rx, fem_ry = fem.r_c[:n_c], fem.r_c[n_c:]
     errs["heel_edge"] = float(max(abs(rec["heel_edge_reaction_local_x"][0] - fem_rx[0]),
                                   abs(rec["heel_edge_reaction_local_y"][0] - fem_ry[0])) / r_scale)
     errs["toe_edge"] = float(max(abs(rec["toe_edge_reaction_local_x"][0] - fem_rx[-1]),
@@ -125,8 +107,8 @@ def _validate_state(result, lk, row, gamma, varphi, F_star, *, toe_alpha=None):
 
     geometry = lookup_rearfoot_geometry(lk)
     psi = rearfoot_toe_mode(top_shape_mode_vertical(lk.basis_top_displacements, n_t), lk.x_top,
-                            geometry.a, geometry.phi1_a)
-    fem_fty = fem["f_t"][n_t:]
+                            geometry.L, geometry.toe_length, geometry.phi1_mtp)
+    fem_fty = fem.f_t[n_t:]
     Q_direct = float(q_alpha_shoe_on_foot(fem_fty, psi))
     Q_lookup = float(contract_basis(lookup_q_alpha_basis(lk)[row], gamma))
     errs["toe_generalized_force"] = abs(Q_lookup - Q_direct) / max(abs(Q_direct), np.sum(np.abs(fem_fty)) * lk.L, 1e-300)
@@ -142,11 +124,11 @@ def _validate_state(result, lk, row, gamma, varphi, F_star, *, toe_alpha=None):
                                           np.concatenate([u[lk.plate_u_dof_ids], u[lk.plate_v_dof_ids]]))
         errs["plate_rotation"] = _rel(pth, u[lk.plate_rotation_dof_ids])
 
-    f_tx_fem, f_ty_fem = fem["f_t"][:n_t], fem["f_t"][n_t:]
+    f_tx_fem, f_ty_fem = fem.f_t[:n_t], fem.f_t[n_t:]
     y_t = lk.y_top if lk.y_top is not None else np.full(n_t, lk.H)
     F_tot = np.array([f_tx_fem.sum() + fem_rx.sum(), f_ty_fem.sum() + fem_ry.sum()])
     M_tot = (lk.x_top @ f_ty_fem - y_t @ f_tx_fem) + (lk.x_bottom[contact] @ fem_ry - lk.y_bottom[contact] @ fem_rx)
-    f_scale = np.sum(np.abs(fem["f_t"]))
+    f_scale = np.sum(np.abs(fem.f_t))
     errs["force_equilibrium"] = float(np.max(np.abs(F_tot)) / f_scale)
     errs["moment_equilibrium"] = float(abs(M_tot) / (f_scale * lk.L))
     return errs, rec
@@ -168,7 +150,6 @@ CASES = {
     "one_free_node_each_side": ("rocker_case", dict(Fx=0.0, Fy=-2000.0, phi_deg=0.0, mode="specific",
                                                     specific_interval=(1, 11)), "interior"),
     "tensile_interior": ("rocker_case", dict(Fx=0.0, Fy=-50.0, phi_deg=0.0, mode="full"), "full"),
-    "layered_plate_interior": ("layered_case", dict(Fx=5.0, Fy=-200.0, phi_deg=0.0), None),
 }
 
 

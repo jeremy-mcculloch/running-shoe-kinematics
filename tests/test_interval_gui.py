@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from compliance_fem.force_control import NOT_AVAILABLE, evaluate_candidates, format_optional, select_contact_candidate
-from compliance_fem.shape_render import build_shape_plot_data
+from compliance_fem.contact.force_control import NOT_AVAILABLE, evaluate_candidates, format_optional, select_contact_candidate
+from compliance_fem.plotting.shape_render import build_shape_plot_data
 
 
 def _shape(lookup, Fx, Fy, phi, theta=0.0, **kw):
@@ -34,7 +34,7 @@ def test_shading_matches_reference_interval(request, lookup_name) -> None:
 
 
 def test_edge_markers_distinct_from_numerical_anchor(rocker_lookup) -> None:
-    from compliance_fem.app import _draw_shape
+    from compliance_fem.gui.app import _draw_shape
 
     sel, shape = _shape(rocker_lookup, 0.0, -2000.0, 0.0)
     i, j = sel.interval
@@ -71,10 +71,10 @@ def test_missing_outside_gaps_display_as_na(flat_lookup) -> None:
 
 
 def test_gui_update_does_not_trigger_fem_solve(rocker_lookup, monkeypatch) -> None:
-    import compliance_fem.compliance as compliance
-    import compliance_fem.contact_lookup as contact_lookup
+    import compliance_fem.fem.compliance as compliance
+    import compliance_fem.contact.lookup as contact_lookup
     import scipy.sparse.linalg as spla
-    from compliance_fem.app import _draw_shape
+    from compliance_fem.gui.app import _draw_shape
 
     def boom(*args, **kwargs):
         raise AssertionError("runtime FEM solve attempted")

@@ -5,23 +5,23 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from compliance_fem.contact_basis import COL_ALPHA, COL_BRX, COL_BRY, COL_BX, COL_BY, COL_CONST
-from compliance_fem.contact_lookup import (
+from compliance_fem.contact.basis import COL_ALPHA, COL_BRX, COL_BRY, COL_BX, COL_BY, COL_CONST
+from compliance_fem.contact.lookup import (
     SCALAR_FX,
     SCALAR_FY,
     lookup_q_alpha_basis,
     lookup_rearfoot_geometry,
     recompute_q_alpha_basis,
 )
-from compliance_fem.corotation import contract_basis, rotate_force_to_local, rotate_vector_to_fixed
-from compliance_fem.force_control import (
+from compliance_fem.contact.corotation import contract_basis, rotate_force_to_local, rotate_vector_to_fixed
+from compliance_fem.contact.force_control import (
     angles_to_coefficients,
     evaluate_candidates,
     select_contact_candidate,
     solve_force_control,
 )
 from compliance_fem.gait.passive_toe import pick_instant_best_passive, solve_passive_toe_candidates
-from compliance_fem.toe_spring import (
+from compliance_fem.contact.toe_spring import (
     ToeSpringConfig,
     rearfoot_toe_model,
     relaxed_root_index,
@@ -93,7 +93,6 @@ def test_default_spring_parameters() -> None:
     assert cfg.toe_stiffness_Nm_per_rad == 25.0
     assert cfg.toe_neutral_angle_rad == 0.0
     assert cfg.toe_damping_Nms_per_rad == 0.0
-    assert cfg.to_provenance()["damping_enters_equation"] is False
 
 
 def test_spring_force_is_exact_not_small_angle() -> None:
@@ -187,8 +186,8 @@ def test_changing_interval_changes_passive_equilibrium(rocker_lookup) -> None:
 
 
 def test_no_fem_solve_when_angle_or_interval_changes(rocker_lookup, monkeypatch) -> None:
-    import compliance_fem.compliance as compliance
-    import compliance_fem.contact_lookup as contact_lookup
+    import compliance_fem.fem.compliance as compliance
+    import compliance_fem.contact.lookup as contact_lookup
     import scipy.sparse.linalg as spla
 
     def boom(*args, **kwargs):

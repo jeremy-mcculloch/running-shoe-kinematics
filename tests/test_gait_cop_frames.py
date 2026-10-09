@@ -1,4 +1,4 @@
-"""Tests for Wang COP frames, units, and θ regression (θ method frozen)."""
+"""Tests for Wang COP frames and units."""
 
 from __future__ import annotations
 
@@ -18,9 +18,8 @@ from compliance_fem.gait.cop_frames import (
     translate_moment_between_points,
 )
 from compliance_fem.gait.sagittal import lab_grf_to_model_top_wrench
-from compliance_fem.gait.toe_angle import prescribed_toe_angle_deg
-from compliance_fem.gait.units import resolve_moment_units, resolve_position_units, resolve_units
-from compliance_fem.gait.wang_io import read_opensim_mot, read_opensim_trc, read_wang_forces_csv
+from compliance_fem.gait.units import resolve_position_units, resolve_units
+from compliance_fem.gait.wang_io import read_opensim_mot, read_wang_forces_csv
 
 
 def test_mot_cop_columns_are_global_lab_axes(tmp_path: Path):
@@ -234,33 +233,13 @@ def test_out_of_shoe_flagged_not_clipped():
     assert bool(oos[0]) is True
 
 
-def test_toe_angle_characterization_unchanged():
-    """Frozen characterization of the authoritative θ formula."""
-    phi = np.deg2rad(np.array([-10.0, -20.0, 5.0, -5.0]))
-    fy = np.array([-1000.0, -500.0, -800.0, 0.0])
-    fy_max = 1000.0
-    theta = prescribed_toe_angle_deg(phi, fy, fy_max, theta_min_deg=0.0, theta_max_deg=45.0)
-    alpha = np.tan(np.deg2rad(theta))
-    # Golden values from the formula (relu(-φ_deg) * load factor)
-    expected = np.array(
-        [
-            10.0 * (1.0 - (1.0 - 1.0) ** 4),
-            20.0 * (1.0 - (1.0 - 0.5) ** 4),
-            0.0,
-            0.0,
-        ]
-    )
-    np.testing.assert_allclose(theta, expected, rtol=0, atol=1e-12)
-    np.testing.assert_allclose(alpha, np.tan(np.deg2rad(expected)), rtol=0, atol=1e-12)
-
-
 @pytest.mark.skipif(
     not Path("data/wang/trc/P4/P4 pr1 01.trc").exists()
     or not Path("outputs/contact_lookup/contact_lookup.npz").exists(),
     reason="Wang data / lookup not present",
 )
-def test_real_wang_stance_cop_and_theta_regression():
-    from compliance_fem.contact_lookup import load_contact_lookup
+def test_real_wang_stance_cop_frames():
+    from compliance_fem.contact.lookup import load_contact_lookup
     from compliance_fem.gait.replay import replay_stance
 
     lookup = load_contact_lookup("outputs/contact_lookup")
@@ -268,7 +247,6 @@ def test_real_wang_stance_cop_and_theta_regression():
         lookup,
         trc_path="data/wang/trc/P4/P4 pr1 01.trc",
         mot_path="data/wang/MOT/P4/P4 pr1 01_force.mot",
-        theta_mode="force-phi",
         shoe_width_m=0.10,
         position_units="m",
         moment_units="N-m",
@@ -282,19 +260,3 @@ def test_real_wang_stance_cop_and_theta_regression():
     x = result.cop_foot_x[valid]
     assert float(np.nanmin(x)) > -0.5
     assert float(np.nanmax(x)) < float(lookup.L) + 0.5
-    # θ regression vs baseline if present
-    baseline = Path("outputs/gait_replay_P4_pr1_01/theta_baseline.npz")
-    if baseline.exists():
-        b = np.load(baseline)
-        np.testing.assert_allclose(result.theta_deg, b["theta_deg"], rtol=0, atol=1e-9)
-        np.testing.assert_allclose(result.alpha, b["alpha"], rtol=0, atol=1e-9)
-    # θ must match direct formula on the same φ, Fy used by replay
-    from compliance_fem.gait.toe_angle import compressive_fy_load, prescribed_toe_angle_deg
-
-    fy_c = compressive_fy_load(result.elastic_Fy)
-    fy_max = float(np.max(fy_c))
-    theta_direct = prescribed_toe_angle_deg(
-        result.phi, result.elastic_Fy, fy_max, theta_min_deg=0.0, theta_max_deg=45.0
-    )
-    np.testing.assert_allclose(result.theta_deg, theta_direct, rtol=0, atol=1e-9)
-    assert result.provenance["toe_angle_method"] == "force-phi-relu-neg-phi"
