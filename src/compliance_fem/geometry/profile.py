@@ -43,7 +43,7 @@ from pathlib import Path
 
 import numpy as np
 
-from compliance_fem.contact.config import validate_shoe_length_mm
+from compliance_fem.contact.sole_config import validate_shoe_length_mm
 
 REQUIRED_COLUMNS = ("record_type", "name", "index", "x_over_length", "y_over_length")
 REQUIRED_LANDMARKS = (
@@ -103,7 +103,9 @@ class NormalizedSoleGeometry:
             "source_filename": self.source_filename,
         }
 
-def _parse_float(text: str, where: str) -> float:
+def _parse_float(text: str | None, where: str) -> float:
+    if text is None:
+        raise GeometryFileError(f"{where}: coordinate {text!r} is not a number.")
     try:
         value = float(text)
     except (TypeError, ValueError) as exc:

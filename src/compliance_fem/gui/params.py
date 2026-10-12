@@ -7,12 +7,12 @@ are converted to SI before they reach ``SoleConfig`` / the solvers.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import streamlit as st
 
-from compliance_fem.contact.config import SoleConfig
+from compliance_fem.contact.sole_config import SoleConfig
 
 
 @dataclass(frozen=True)
@@ -310,6 +310,11 @@ def dual_log(
 
 def sole_config_from_gui(params: dict) -> SoleConfig:
     """Measured-sole config from canonical GUI params (SI moduli, mm lengths)."""
+    optional: dict[str, Any] = {
+        k: float(params[k])
+        for k in ("landmark_tolerance", "curvature_max_turn_deg", "min_angle_deg")
+        if k in params
+    }
     return SoleConfig(
         shoe_length_mm=float(params["shoe_length_mm"]),
         geometry_csv=str(params["geometry_csv"]),
@@ -326,11 +331,7 @@ def sole_config_from_gui(params: dict) -> SoleConfig:
         heel_corner_refinement=float(params["heel_corner_refinement"]),
         interface_refinement=float(params["interface_refinement"]),
         plate_end_refinement=float(params["plate_end_refinement"]),
-        **{
-            k: float(params[k])
-            for k in ("landmark_tolerance", "curvature_max_turn_deg", "min_angle_deg")
-            if k in params
-        },
+        **optional,
     )
 
 

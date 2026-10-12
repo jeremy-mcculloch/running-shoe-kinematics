@@ -118,7 +118,9 @@ def test_auto_selection_finds_known_admissible_interval(rocker_lookup, asym_look
     sel2 = select_contact_candidate(ev2)
     assert sel2.exactly_admissible and sel2.topology_label == "interior"
     # Off-centre: the asymmetric apex (0.35 L) pulls the interval toward the heel.
-    assert 0.5 * (sel2.contact_start_x + sel2.contact_end_x) < 0.5 * asym_lookup.L
+    span = sel2.contact_span()
+    assert span is not None
+    assert 0.5 * (span[0] + span[1]) < 0.5 * asym_lookup.L
 
 
 @pytest.mark.parametrize(

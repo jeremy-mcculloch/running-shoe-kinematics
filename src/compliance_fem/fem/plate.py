@@ -16,9 +16,13 @@ Curvature is ``kappa = d^2 w / ds^2`` and the bending moment ``M = EI kappa``.
 
 from __future__ import annotations
 
+from typing import cast
+
 import numpy as np
 from scipy import sparse
 from skfem import Basis
+
+from compliance_fem.fem.skfem_types import dof_table
 
 
 def plate_element_frames(coords: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -73,11 +77,12 @@ def plate_translational_dofs(
     nodes = np.asarray(node_indices, dtype=int)
     if nodes.ndim != 1 or nodes.size < 2:
         raise ValueError("Plate node_indices must be a 1D array with at least two nodes.")
-    n_nodal = basis.nodal_dofs.shape[1]
+    nodal_dofs = dof_table(basis.nodal_dofs)
+    n_nodal = nodal_dofs.shape[1]
     if int(np.max(nodes)) >= n_nodal:
         raise ValueError("Plate node index exceeds the continuum nodal DOF table.")
-    u_dofs = np.asarray(basis.nodal_dofs[0, nodes], dtype=int)
-    v_dofs = np.asarray(basis.nodal_dofs[1, nodes], dtype=int)
+    u_dofs = np.asarray(nodal_dofs[0, nodes], dtype=int)
+    v_dofs = np.asarray(nodal_dofs[1, nodes], dtype=int)
     return u_dofs, v_dofs
 
 
@@ -166,16 +171,20 @@ def assemble_plate_bending(
     return sparse.csc_matrix((data, (rows, cols)), shape=(n_q, n_q))
 
 
-def enlarge_foam_stiffness(K_foam: sparse.spmatrix, n_theta: int) -> sparse.csc_matrix:
+def enlarge_foam_stiffness(K_foam: sparse.csc_matrix, n_theta: int) -> sparse.csc_matrix:
     """Embed K_foam into the enlarged primal space with zero rotation block."""
     K_foam = K_foam.tocsc()
     n_foam = K_foam.shape[0]
     if n_theta == 0:
         return K_foam
-    return sparse.bmat(
-        [
-            [K_foam, None],
-            [None, sparse.csc_matrix((n_theta, n_theta))],
-        ],
-        format="csc",
+    # The stubs type bmat() as returning spmatrix whatever the format.
+    return cast(
+        sparse.csc_matrix,
+        sparse.bmat(
+            [
+                [K_foam, None],
+                [None, sparse.csc_matrix((n_theta, n_theta))],
+            ],
+            format="csc",
+        ),
     )

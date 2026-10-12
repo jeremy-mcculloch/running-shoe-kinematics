@@ -43,6 +43,7 @@ import numpy as np
 
 from compliance_fem import compute_compliance
 from compliance_fem.contact.sole_config import SoleConfig
+from compliance_fem.geometry.profile import NormalizedSoleGeometry
 from compliance_fem.contact.toe_spring import ToeSpringConfig
 
 CONFIG_SCHEMA_VERSION = 2
@@ -258,7 +259,8 @@ def model_setup_from_dict(data: dict, *, base_dir: Path | str | None = None, sou
 
     parsed_data: dict[str, dict] = {} # Dictionary of section name -> parsed data for each config section in ModelSetup
     for name, cls in section_classes.items():
-        hints = get_type_hints(cls)
+        # SoleConfig imports NormalizedSoleGeometry only for type checking (import cycle).
+        hints = get_type_hints(cls, localns={"NormalizedSoleGeometry": NormalizedSoleGeometry})
         file_fields = [f.name for f in _file_fields(cls)] # List of config class fields
         sec = _section(data, name, file_fields) # Tests for unknown / misspelled keys in the section
         parsed_data[name] = {
@@ -421,8 +423,9 @@ def ensure_lookup_exists(
 
     # Directory to save fem mesh
     mesh_dir = None
+    fem_dir = None
     if save_fem:
-        fem_dir = out / "fem" 
+        fem_dir = out / "fem"
         fem_dir.mkdir(parents=True, exist_ok=True)
         mesh_dir = fem_dir / "mesh.msh"
 

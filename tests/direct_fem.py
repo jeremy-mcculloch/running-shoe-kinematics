@@ -10,6 +10,7 @@ code path with the boundary-compliance solve except the assembled stiffness.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 from scipy import sparse
@@ -35,6 +36,9 @@ from compliance_fem.contact.lookup import (
 )
 from compliance_fem.contact.topology import ContactInterval, interval_anchor_x, interval_anchor_y
 from compliance_fem.contact.corotation import affine_coefficients
+
+# ``condense(A, x=..., D=...)`` returns this member of skfem's ``CondensedSystem`` union.
+_Condensed = tuple[sparse.csc_matrix, np.ndarray, np.ndarray, np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -158,13 +162,13 @@ def solve_direct_fem_contact(
         A = sparse.bmat([[K0, B.T], [B, sparse.csc_matrix((n_l, n_l))]], format="csc")
         x0_aug = np.zeros(n_primal + n_l, dtype=float)
         x0_aug[:n_primal] = x0
-        A_cond, f_cond, x_out, I_out = condense(A, x=x0_aug, D=D)
+        A_cond, f_cond, x_out, I_out = cast(_Condensed, condense(A, x=x0_aug, D=D))
         x_full = x_out.copy()
         x_full[I_out] = spsolve(A_cond.tocsc(), f_cond)
         u = x_full[:n_primal]
         residual = np.asarray(K0 @ u + B.T @ x_full[n_primal:], dtype=float)
     else:
-        K_cond, f_cond, x_out, I_out = condense(K0, x=x0, D=D)
+        K_cond, f_cond, x_out, I_out = cast(_Condensed, condense(K0, x=x0, D=D))
         u = x_out.copy()
         u[I_out] = spsolve(K_cond.tocsc(), f_cond)
         residual = np.asarray(K0 @ u, dtype=float)
@@ -215,6 +219,7 @@ def compare_compliance_to_direct_fem(
     k = int(column_index)
     fem = solve_direct_fem_contact(result, spec, k, toe_length, kappa)
 
+    assert sol.F_t is not None and sol.F_c is not None and sol.G_f is not None and sol.scalars is not None
     f_t_c = sol.F_t[:, k]
     r_c_c = sol.F_c[:, k]
     g_f_c = sol.G_f[:, k] if sol.n_free else np.zeros(0)

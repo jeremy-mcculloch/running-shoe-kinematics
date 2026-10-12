@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from compliance_fem.geometry.profile import load_normalized_sole_csv
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from compliance_fem.geometry.profile import NormalizedSoleGeometry
 
 PLATE_AXIAL_MODEL = "exact_inextensible"
 NU_LOCKING_WARN_THRESHOLD = 0.45
@@ -66,9 +69,10 @@ class SoleConfig:
     coordinates with one common scale for both axes.
     """
 
-    shoe_length_mm: float | None
+    shoe_length_mm: float
     geometry_csv: str | None = None
-    normalized_geometry: object | None = field(default=None, compare=False, repr=False)
+    # Loaded from geometry_csv in __post_init__ when not given, so never None afterwards.
+    normalized_geometry: NormalizedSoleGeometry = field(default=None, compare=False, repr=False)  # pyright: ignore[reportAssignmentType]
     upper_foam_material: str = DEFAULT_UPPER_FOAM
     lower_foam_material: str = DEFAULT_LOWER_FOAM
     ffturbo_E_Pa: float = 2.6e5
@@ -90,11 +94,13 @@ class SoleConfig:
     element_order: int = 1
 
     def __post_init__(self) -> None:
-        validate_shoe_length_mm(self.shoe_length_mm)
+        object.__setattr__(self, "shoe_length_mm", validate_shoe_length_mm(self.shoe_length_mm))
         if self.normalized_geometry is None:
             if self.geometry_csv is None:
                 raise ValueError("Measured-sole geometry requires geometry_csv (normalized CSV path).")
-            self.normalized_geometry = load_normalized_sole_csv(self.geometry_csv)
+            from compliance_fem.geometry.profile import load_normalized_sole_csv
+
+            object.__setattr__(self, "normalized_geometry", load_normalized_sole_csv(self.geometry_csv))
         for name in (self.upper_foam_material, self.lower_foam_material):
             if name not in FOAM_MATERIALS:
                 raise ValueError(f"Unknown foam material {name!r}; expected one of {FOAM_MATERIALS}.")

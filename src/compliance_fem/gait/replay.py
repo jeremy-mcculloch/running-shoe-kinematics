@@ -166,7 +166,7 @@ class GaitReplayResult:
     def interval_column_dict(self) -> dict[str, Any]:
         n = int(self.times.size)
 
-        def col(arr, fill=np.nan, dtype=np.float64):
+        def col(arr, fill: float = np.nan, dtype: type[np.generic] = np.float64) -> np.ndarray:
             a = np.asarray(arr)
             return a if a.size == n else np.full(n, fill, dtype=dtype)
 
@@ -191,7 +191,7 @@ class GaitReplayResult:
     def toe_column_dict(self) -> dict[str, Any]:
         n = int(self.times.size)
 
-        def col(arr, fill=np.nan, dtype=np.float64):
+        def col(arr, fill: float = np.nan, dtype: type[np.generic] = np.float64) -> np.ndarray:
             a = np.asarray(arr)
             return a if a.size == n else np.full(n, fill, dtype=dtype)
 

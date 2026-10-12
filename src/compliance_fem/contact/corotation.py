@@ -191,7 +191,7 @@ def transform_to_fixed_frame(
     d_ax: float,
     d_ay: float,
     varphi: float,
-    anchor: tuple[float, float] = None,
+    anchor: tuple[float, float] | None = None,
     elastic_scale: float = 1.0,
     y_anchor: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:

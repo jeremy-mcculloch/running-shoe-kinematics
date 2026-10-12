@@ -28,7 +28,7 @@ import csv
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -376,8 +376,9 @@ def reconstruct_rows(
             & _edge_ok(h_Rn, tau_R) & _edge_ok(t_Rn, tau_R)
         )
 
+    n_t = int(lookup.n_top_nodes)
+    nodal: dict[str, np.ndarray] = {}
     if full_fields:
-        n_t = int(lookup.n_top_nodes)
         nodal = {
             name: np.full((m, n_t if name.startswith("top_force") else n_b), np.nan)
             for name in (
@@ -671,7 +672,7 @@ class CandidateEvaluation:
         if need.size and self.refiner is not None:
             self.refiner(need)
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> np.ndarray:
         fields = self.__dict__.get("fields")
         if fields is not None and name in fields:
             return fields[name]
@@ -982,7 +983,8 @@ class ContactSelection:
         self.candidate_search_method = candidate_search_method
         self.plate = plate
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> Any:
+        # Only reached for names not found normally: per-record fields of the selected row.
         ev = self.__dict__.get("evaluation")
         if ev is None:
             raise AttributeError(name)
@@ -998,9 +1000,36 @@ class ContactSelection:
                     return int(value)
                 return float(value)
             return np.array(value, copy=True)
-        if name in ("phi", "theta", "varphi", "alpha", "Fx_star", "Fy_star", "phi_ref"):
-            return getattr(ev, name)
         raise AttributeError(name)
+
+    # Load-case scalars, shared by every record.
+    @property
+    def phi(self) -> float:
+        return self.evaluation.phi
+
+    @property
+    def theta(self) -> float:
+        return self.evaluation.theta
+
+    @property
+    def varphi(self) -> float:
+        return self.evaluation.varphi
+
+    @property
+    def alpha(self) -> float:
+        return self.evaluation.alpha
+
+    @property
+    def Fx_star(self) -> float:
+        return self.evaluation.Fx_star
+
+    @property
+    def Fy_star(self) -> float:
+        return self.evaluation.Fy_star
+
+    @property
+    def phi_ref(self) -> float:
+        return self.evaluation.phi_ref
 
     def _row_value(self, arr) -> float | int | None:
         if self.selected_row is None:
@@ -1008,10 +1037,11 @@ class ContactSelection:
         return arr[self.selected_row]
 
     @property
-    def interval(self) -> tuple[int, int] | None:
-        if self.selected_row is None:
-            return None
-        return int(self.contact_start_index), int(self.contact_end_index)
+    def interval(self) -> Any:
+        row = self.selected_row
+        if row is None:
+            return None, None
+        return int(self.evaluation.contact_start_index[row]), int(self.evaluation.contact_end_index[row])
 
     @property
     def contact_start_index(self) -> int | None:
@@ -1056,23 +1086,26 @@ class ContactSelection:
 
     @property
     def contact_node_ids(self) -> np.ndarray | None:
-        if self.selected_row is None:
+        interval = self.interval
+        if interval is None:
             return None
-        return np.arange(self.contact_start_index, self.contact_end_index + 1)
+        return np.arange(interval[0], interval[1] + 1)
 
     @property
     def free_node_ids(self) -> np.ndarray | None:
-        if self.selected_row is None:
+        interval = self.interval
+        if interval is None:
             return None
         nodes = np.arange(self.evaluation.n_bottom)
-        mask = (nodes < self.contact_start_index) | (nodes > self.contact_end_index)
+        mask = (nodes < interval[0]) | (nodes > interval[1])
         return nodes[mask]
 
     @property
     def x_anchor_rot(self) -> float | None:
-        if self.selected_row is None:
+        row = self.selected_row
+        if row is None:
             return None
-        return float(self.anchor_x + self.d_ax)
+        return float(self.evaluation.anchor_x[row] + self.d_ax)
 
     @property
     def kf_cond(self) -> float | None:
@@ -1082,9 +1115,10 @@ class ContactSelection:
     def contact_span(self, L: float | None = None) -> tuple[float, float] | None:
         """Reference material contact interval ``[x_i, x_j]`` of the selected record."""
         del L
-        if self.selected_row is None:
+        row = self.selected_row
+        if row is None:
             return None
-        return float(self.contact_start_x), float(self.contact_end_x)
+        return float(self.evaluation.contact_start_x[row]), float(self.evaluation.contact_end_x[row])
 
 
 def select_contact_candidate(
@@ -1242,7 +1276,7 @@ def evaluation_to_csv_rows(selection: ContactSelection) -> list[dict]:
             "row": int(i),
             "contact_start_index": int(ev.contact_start_index[i]),
             "contact_end_index": int(ev.contact_end_index[i]),
-            "topology_label": ev.contact_type(i).value,
+            "topology_label": ev.contact_type(int(i)).value,
             "contact_start_x": float(ev.contact_start_x[i]),
             "contact_end_x": float(ev.contact_end_x[i]),
             "anchor_x": float(ev.anchor_x[i]),
@@ -1288,6 +1322,9 @@ def export_selected_result(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     row = selection.selected_row
+    contact_mask = lookup.contact_mask
+    if contact_mask is None:
+        raise ValueError("Contact lookup has no contact_mask array; regenerate it.")
     payload = {
         "contact_start_index": selection.contact_start_index,
         "contact_end_index": selection.contact_end_index,
@@ -1308,7 +1345,7 @@ def export_selected_result(
         "kf_cond": selection.kf_cond,
         "x_top": lookup.x_top,
         "x_bottom": lookup.x_bottom,
-        "contact_mask": lookup.contact_mask[row],
+        "contact_mask": contact_mask[row],
         "exactly_admissible": selection.exactly_admissible,
         "approximate": selection.approximate,
         "softplus_toe_length": lookup.softplus_toe_length,

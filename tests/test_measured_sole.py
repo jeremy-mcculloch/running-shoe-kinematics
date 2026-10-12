@@ -20,7 +20,7 @@ from compliance_fem.fem.compliance import (
     compute_compliance,
     save_compliance_npz,
 )
-from compliance_fem.contact.config import SoleConfig, validate_shoe_length_mm
+from compliance_fem.contact.sole_config import SoleConfig, validate_shoe_length_mm
 from compliance_fem.contact.basis import N_AFFINE_COLUMNS
 from direct_fem import (
     run_standard_direct_comparisons,
@@ -161,7 +161,7 @@ def _selection(lookup, phi_deg=0.0, theta_deg=0.0, Fx=0.0, Fy=-1500.0):
 # 1. shoe_length_mm is required.
 def test_shoe_length_required() -> None:
     with pytest.raises(ValueError, match="shoe_length_mm is required"):
-        SoleConfig(shoe_length_mm=None, geometry_csv=str(CSV_PATH))
+        SoleConfig(shoe_length_mm=None, geometry_csv=str(CSV_PATH))  # pyright: ignore[reportArgumentType]  (deliberately invalid)
 
 
 # 2. Nonpositive / nonfinite lengths are rejected.
@@ -630,6 +630,7 @@ def test_fixed_frame_gap_and_reaction(coarse_lookup, phi, theta) -> None:
     np.testing.assert_allclose(gap[contact], 0.0, atol=1e-10 * coarse_lookup.L)
     assert sel.min_contact_reaction == pytest.approx(rn[contact].min(), rel=1e-9, abs=1e-9)
     shape = build_shape_plot_data(coarse_lookup, sel)
+    assert shape.contact_curve_y is not None
     np.testing.assert_allclose(shape.contact_curve_y, 0.0, atol=1e-9 * coarse_lookup.L)
 
 
@@ -658,7 +659,7 @@ def test_lookup_records_match_direct_fem(coarse_fem, coarse_lookup) -> None:
     lk = coarse_lookup
     xt, yt = np.asarray(coarse_fem.x_top), np.asarray(coarse_fem.y_top)
     xb, yb = np.asarray(coarse_fem.x_bottom), np.asarray(coarse_fem.y_bottom)
-    L = float(coarse_fem.config.L)
+    L = float(coarse_fem.config.shoe_length_m)
     for name, spec in standard_validation_intervals(xb, L).items():
         row = interval_row(spec.start, spec.end, spec.n_bottom)
         assert lk.valid_mask[row], name
@@ -777,7 +778,7 @@ def test_gui_material_colors(coarse_lookup) -> None:
             geometry_metadata={**coarse_lookup.geometry_metadata, "upper_foam_material": upper, "lower_foam_material": lower},
         )
         fig = _draw_shape(build_shape_plot_data(lk, sel))
-        fills = {tr.name: tr.fillcolor for tr in fig.data if getattr(tr, "fill", None) == "toself"}
+        fills = {tr.name: tr.fillcolor for tr in fig.data if getattr(tr, "fill", None) == "toself"}  # pyright: ignore[reportAttributeAccessIssue]  (plotly leaves Figure.data untyped)
         assert fills[f"upper foam ({upper})"] == MATERIAL_FILL_COLORS[upper]
         assert fills[f"lower foam ({lower})"] == MATERIAL_FILL_COLORS[lower]
 
@@ -796,6 +797,8 @@ def test_gui_plate_partial_span(coarse_lookup) -> None:
         gm["plate_end_reference_coordinate"], atol=1e-12 * L_M,
     )
     tol = 1e-9 * L_M
+    assert sh.plate_x_def is not None and sh.plate_node_x is not None and sh.plate_node_y is not None
+    assert sh.interface_def is not None
     assert sh.plate_x_def[0] == pytest.approx(sh.plate_node_x[0], abs=tol)
     assert sh.plate_x_def[-1] == pytest.approx(sh.plate_node_x[-1], abs=tol)
     sec = coarse_lookup.render_section
@@ -811,6 +814,7 @@ def test_gui_contact_follows_bottom(coarse_lookup) -> None:
     _, sel = _selection(coarse_lookup, -8.0, 10.0)
     sh = build_shape_plot_data(coarse_lookup, sel)
     i, j = sel.interval
+    assert sh.contact_curve_x is not None and sh.contact_curve_y is not None
     np.testing.assert_allclose(sh.contact_curve_x, sh.x_bottom_def[i : j + 1], atol=1e-9 * L_M)
     np.testing.assert_allclose(sh.contact_curve_y, sh.y_bottom_def[i : j + 1], atol=1e-9 * L_M)
     assert sh.has_render_mesh and set(sh.region_def) == set(FOAM_REGION_TAGS)

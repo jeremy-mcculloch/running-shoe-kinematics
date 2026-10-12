@@ -33,7 +33,7 @@ EXAMPLE = ROOT / "configs" / "setup.json"
 CSV = ROOT / "data" / "geometry" / "sole_geometry.csv"
 
 
-def _minimal(csv=CSV, **sections) -> dict:
+def _minimal(csv: str | Path = CSV, **sections) -> dict:
     sole = {"geometry_csv": str(csv), "shoe_length_mm": 270.0, **sections.pop("sole", {})}
     return {"sole": sole, **sections}
 
@@ -48,6 +48,7 @@ def _write(path: Path, data: dict) -> Path:
 
 def test_example_config_loads() -> None:
     s = load_model_setup(EXAMPLE)
+    assert s.sole.geometry_csv is not None
     assert Path(s.sole.geometry_csv) == CSV.resolve()
     assert s.sole.shoe_length_mm == 270.0 and s.sole.mesh_size_m == pytest.approx(0.003)
     assert s.toe_length_m == pytest.approx(0.0594) and s.softplus_kappa == 160.0
@@ -70,6 +71,7 @@ def test_relative_paths_resolve_against_config_dir(tmp_path) -> None:
     shutil.copy(CSV, tmp_path / "sole.csv")
     path = _write(sub / "c.json", _minimal(csv="../sole.csv", lookup={"output_dir": "out"}))
     s = load_model_setup(path)
+    assert s.sole.geometry_csv is not None
     assert Path(s.sole.geometry_csv) == (tmp_path / "sole.csv").resolve()
     assert s.output_dir == (sub / "out").resolve()
 

@@ -29,7 +29,7 @@ try:
 except Exception:
     pass
 
-from compliance_fem.contact.config import DEFAULT_LOWER_FOAM, DEFAULT_UPPER_FOAM, FOAM_MATERIALS
+from compliance_fem.contact.sole_config import DEFAULT_LOWER_FOAM, DEFAULT_UPPER_FOAM, FOAM_MATERIALS
 from compliance_fem.contact.basis import kappa_from_min_bend_radius, min_bend_radius_mm_from_kappa
 from compliance_fem.contact.lookup import (
     LOOKUP_SCHEMA_VERSION,
@@ -1195,7 +1195,14 @@ def main() -> None:
             f"Calculation time: {_fmt_ms(t_calc)}; model rebuild: {_fmt_ms(t_rebuild)}"
         )
         st.stop()
-    st.session_state["previous_contact_interval"] = selection.interval
+    # A record is selected, so its interval quantities are set.
+    interval = selection.interval
+    span = selection.contact_span()
+    contact_type = selection.contact_type
+    anchor_x, anchor_y = selection.anchor_x, selection.anchor_y
+    assert interval is not None and span is not None and contact_type is not None
+    assert anchor_x is not None and anchor_y is not None
+    st.session_state["previous_contact_interval"] = interval
 
     if selection.approximate:
         st.warning(selection.message)
@@ -1209,7 +1216,7 @@ def main() -> None:
         )
 
     na = NOT_AVAILABLE
-    span_lo, span_hi = selection.contact_span()
+    span_lo, span_hi = span
 
     t1 = time.perf_counter()
     shape = build_shape_plot_data(
@@ -1259,7 +1266,7 @@ def main() -> None:
             float(selection.d_ay),
             float(selection.varphi),
             elastic_scale=1.0,
-            y_anchor=float(selection.anchor_y),
+            y_anchor=float(anchor_y),
         )
         u_tr = float(np.asarray(x_def).reshape(-1)[0] - x_ref)
         v_tr = float(np.asarray(y_def).reshape(-1)[0] - y_ref)
@@ -1319,7 +1326,7 @@ def main() -> None:
     with st.expander("Detailed outputs", expanded=False):
         cols = st.columns(4)
         cols[0].metric("Topology label", selection.topology_label)
-        cols[1].metric("Interval (i, j)", f"({selection.contact_start_index}, {selection.contact_end_index})")
+        cols[1].metric("Interval (i, j)", f"({interval[0]}, {interval[1]})")
         cols[2].metric("Contact x_i … x_j", f"[{span_lo:.4g}, {span_hi:.4g}]")
         cols[3].metric("Neutral anchor x_a (numerical)", f"{selection.anchor_x:.6g}")
         cols = st.columns(4)
@@ -1365,7 +1372,7 @@ def main() -> None:
         cols[0].metric("Toe moment about (L − toe length, H_mtp)", f"{selection.T_toe:.6g}")
         cols[1].metric("Complementarity score", _num(selection.complementarity_score, ".3e"))
         cols[2].metric("# admissible intervals", str(selection.n_admissible))
-        cols[3].metric("Contact nodes", str(selection.contact_end_index - selection.contact_start_index + 1))
+        cols[3].metric("Contact nodes", str(interval[1] - interval[0] + 1))
         st.caption(
             "Absent adjacent nodes (interval touching the heel or toe end) are shown as N/A. "
             "x_cm uses the visualization gauge r_a^F = (x_a, 0); only x_cm − x_a is gauge "
@@ -1417,7 +1424,7 @@ def main() -> None:
                 grid[ends[ok], starts[ok]] = values[ok]
                 fig, ax = plt.subplots(figsize=(5, 4))
                 im = ax.imshow(grid, origin="lower", aspect="auto", interpolation="nearest")
-                ax.plot([selection.contact_start_index], [selection.contact_end_index], "rx", ms=10)
+                ax.plot([interval[0]], [interval[1]], "rx", ms=10)
                 ax.set_xlabel("start index i")
                 ax.set_ylabel("end index j")
                 ax.set_title(title)
@@ -1429,9 +1436,9 @@ def main() -> None:
             ax.plot(lookup.x_bottom, selection.full_bottom_gap, "-o", markersize=3)
             for xe in (span_lo, span_hi):
                 ax.axvline(xe, color="C3", ls="--")
-            ax.axvline(selection.anchor_x, color="0.5", ls=":")
+            ax.axvline(anchor_x, color="0.5", ls=":")
             ax.set_title(
-                f"Selected ({selection.contact_type.value}) bottom fixed-frame normal gap"
+                f"Selected ({contact_type.value}) bottom fixed-frame normal gap"
             )
             ax.set_xlabel("x (material)")
             ax.set_ylabel("g^F")
@@ -1455,7 +1462,7 @@ def main() -> None:
             for xe in (span_lo, span_hi):
                 ax.axvline(xe, color="C3", ls="--")
             ax.set_title(
-                f"Selected ({selection.contact_type.value}) bottom nodal reaction force "
+                f"Selected ({contact_type.value}) bottom nodal reaction force "
                 "(not pressure)"
             )
             ax.set_xlabel("x (material)")

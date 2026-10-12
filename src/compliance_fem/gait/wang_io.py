@@ -222,7 +222,8 @@ def read_opensim_mot(
         if not line.strip() or line.strip().startswith("#"):
             continue
         data_lines.append([float(x) for x in line.replace("\t", " ").split()])
-    data = np.asarray(data_lines, dtype=np.float64)
+    # Annotated so the shape stays general: numpy's stubs type a list of rows as 1-D.
+    data: np.ndarray = np.asarray(data_lines, dtype=np.float64)
     if data.ndim != 2 or data.shape[1] != len(colnames):
         raise ValueError(
             f"{path}: data shape {data.shape} incompatible with columns {len(colnames)}"

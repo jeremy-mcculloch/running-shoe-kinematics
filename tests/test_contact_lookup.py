@@ -60,7 +60,7 @@ def test_restricted_block_dimensions(blocks) -> None:
 
 
 @pytest.mark.parametrize("interval", [(0, 4), (3, 8), (6, 6), (0, 12)])
-def test_boundary_matrix_symmetry(blocks, interval) -> None:
+def test_boundary_matrix_symmetry(blocks, interval: tuple[int, int]) -> None:
     free, contact = ContactInterval(*interval, len(blocks.x_bottom)).sets()
     A = build_boundary_matrix(blocks, free, contact, x_r=0.5 * blocks.L).A
     n = 2 * len(blocks.x_top) + 2 * contact.size + 3
@@ -73,6 +73,7 @@ def test_one_factorization_matches_separate_direct_solves(blocks) -> None:
     W = build_top_affine_matrix(blocks.x_top, blocks.L, SMALL_TOE_LENGTH, SMALL_KAPPA)
     sol = solve_candidate(blocks, iv, W, 0.5 * blocks.L, toe_length=SMALL_TOE_LENGTH)
     A = sol.A
+    assert sol.F_t is not None
     free, contact = iv.sets()
     n_t = 2 * len(blocks.x_top)
     rhs = np.zeros((A.shape[0], N_AFFINE_COLUMNS))

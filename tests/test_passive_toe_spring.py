@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import dataclasses
 from pathlib import Path
 
@@ -194,7 +196,7 @@ def test_q_alpha_units_force_times_length(lookup) -> None:
         s * q_alpha_foot_on_shoe(f, shape_mode_phi1(x, 1.0, TOE_LENGTH_SOFT, KAPPA))
     )
     cfg = ToeSpringConfig(toe_stiffness_Nm_per_rad=0.0)
-    kw = dict(Fx_star=0.0, Fy_star=-2.0e3, Mz_meas=0.0, phi_rad=0.0, config=cfg)
+    kw: dict[str, Any] = dict(Fx_star=0.0, Fy_star=-2.0e3, Mz_meas=0.0, phi_rad=0.0, config=cfg)
     c1 = solve_passive_toe_candidates(lookup, width_m=1.0, **kw)
     c2 = solve_passive_toe_candidates(lookup, width_m=0.1, **kw)
     for a, b in zip(c1, c2):
@@ -484,7 +486,9 @@ def test_low_load_no_spurious_angle(lookup) -> None:
     from reference import relaxed_root_index
 
     assert sol.n_roots == 3
-    assert abs(sol.roots[relaxed_root_index(sol.roots)].theta_deg) < 1e-3
+    idx = relaxed_root_index(sol.roots)
+    assert idx is not None
+    assert abs(sol.roots[idx].theta_deg) < 1e-3
 
 
 # 20. Continuity under small force perturbations.
@@ -725,10 +729,11 @@ def test_gui_and_export_show_same_theta(lookup, tmp_path: Path) -> None:
     fig = toe_equilibrium_figure(r, i, ToeSpringConfig())
     vline = [s for s in fig.layout.shapes if s.type == "line"][0]
     assert vline.x0 == pytest.approx(float(r.theta_deg[i]))
-    roots_trace = [d for d in fig.data if d.name == "all roots"][0]
-    assert np.min(np.abs(np.asarray(roots_trace.x) - r.theta_deg[i])) < 1e-9
+    # plotly leaves Figure.data untyped.
+    roots_trace = [d for d in fig.data if d.name == "all roots"][0]  # pyright: ignore[reportAttributeAccessIssue]
+    assert np.min(np.abs(np.asarray(roots_trace.x) - r.theta_deg[i])) < 1e-9  # pyright: ignore[reportAttributeAccessIssue]
     stance = toe_stance_figure(r)
-    np.testing.assert_array_equal(np.asarray(stance.data[0].y), r.theta_deg)
+    np.testing.assert_array_equal(np.asarray(stance.data[0].y), r.theta_deg)  # pyright: ignore[reportAttributeAccessIssue]
     proxy = selection_proxy_for_frame(lookup, r, i)
     assert proxy.alpha == pytest.approx(np.tan(np.deg2rad(r.theta_deg[i])))
 

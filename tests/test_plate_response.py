@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from compliance_fem.fem.compliance import compute_compliance
-from compliance_fem.contact.config import SoleConfig
+from compliance_fem.contact.sole_config import SoleConfig
 from compliance_fem.contact.lookup import (
     LOOKUP_SCHEMA_VERSION,
     get_compliance_block_matrix,
@@ -91,7 +91,7 @@ def _disp_atol(cfg: SoleConfig, magnitude: float, rtol: float = 1e-8) -> float:
     return rtol * max(abs(float(magnitude)), 1.0) + 1e-9 * _mesh_h(cfg)
 
 
-def _rel_atol(ref: np.ndarray, cfg: SoleConfig, rtol: float = 1e-8) -> float:
+def _rel_atol(ref: np.ndarray | float, cfg: SoleConfig, rtol: float = 1e-8) -> float:
     mag = float(np.linalg.norm(np.ravel(ref)))
     return _disp_atol(cfg, mag, rtol=rtol)
 
@@ -231,6 +231,9 @@ def test_serialization_preserves_plate_fields(lookup, tmp_path, sole_config) -> 
     reloaded = load_contact_lookup(out / "contact_lookup.npz")
     assert reloaded.has_plate_response
     assert reloaded.schema_version == LOOKUP_SCHEMA_VERSION
+    assert reloaded.plate_u_local_basis is not None and reloaded.plate_v_local_basis is not None
+    assert reloaded.plate_rotation_local_basis is not None and reloaded.plate_axial_force_basis is not None
+    assert reloaded.plate_reference_x is not None and reloaded.plate_reference_y is not None
     np.testing.assert_allclose(
         reloaded.plate_u_local_basis,
         lookup.plate_u_local_basis,
@@ -505,6 +508,7 @@ def test_fixed_frame_plate_coordinates_agree_with_foam_transform(
         y_ref[idx] = X[1]
     u_samp = state.sample_x_local - x_ref
     v_samp = state.sample_y_local - y_ref
+    assert sel.anchor_x is not None and sel.anchor_y is not None
     x_f, y_f = transform_to_fixed_frame(
         x_ref,
         y_ref,
@@ -553,6 +557,7 @@ def test_plate_and_foam_interface_nodes_coincide_after_transform(
     np.testing.assert_allclose(u_p, u_foam, atol=_rel_atol(u_foam, sole_config, rtol=1e-6))
     np.testing.assert_allclose(v_p, v_foam, atol=_rel_atol(v_foam, sole_config, rtol=1e-6))
 
+    assert sel.anchor_x is not None
     x_a, d_ax, d_ay, varphi = (
         float(sel.anchor_x),
         float(sel.d_ax),

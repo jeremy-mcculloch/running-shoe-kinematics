@@ -15,11 +15,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import gmsh
 import numpy as np
 from scipy.spatial import cKDTree
 from skfem import MeshTri
+
+from compliance_fem.fem.skfem_types import mesh_facets
 
 from compliance_fem.geometry.gmsh_util import gmsh_session, initialize_gmsh
 from compliance_fem.geometry.profile import (
@@ -165,7 +168,8 @@ def _components(t: np.ndarray, n_nodes: int) -> int:
     rows = np.repeat(np.arange(n_el), 3)
     cols = t.T.reshape(-1)
     incidence = coo_matrix((np.ones(rows.size), (rows, cols)), shape=(n_el, n_nodes)).tocsr()
-    adj = (incidence @ incidence.T) >= 2  # share an edge
+    # scipy-stubs does not type sparse-vs-scalar comparison, which scipy supports.
+    adj = (incidence @ incidence.T) >= 2  # share an edge  # pyright: ignore[reportOperatorIssue]
     n, _ = connected_components(adj, directed=False)
     return int(n)
 
@@ -347,7 +351,7 @@ def generate_mesh(config, output_msh: Path | None = None) -> SoleMeshData:
     mesh = MeshTri(np.ascontiguousarray(p), np.ascontiguousarray(t_all), sort_t=False)
     upper_el = np.flatnonzero(element_region == REGION_CODES[REGION_UPPER])
     lower_el = np.flatnonzero(element_region == REGION_CODES[REGION_LOWER])
-    facet_index = {(int(a), int(b)): k for k, (a, b) in enumerate(np.sort(mesh.facets, axis=0).T)}
+    facet_index = {(int(a), int(b)): k for k, (a, b) in enumerate(np.sort(mesh_facets(mesh), axis=0).T)}
 
     def facets_of(edge_array: np.ndarray) -> np.ndarray:
         out = []
@@ -358,7 +362,8 @@ def generate_mesh(config, output_msh: Path | None = None) -> SoleMeshData:
             out.append(facet_index[key])
         return np.asarray(sorted(out), dtype=int)
 
-    boundaries = {
+    # Annotated loosely: MeshTri.with_boundaries takes an invariant Dict of arrays or callables.
+    boundaries: dict[str, Any] = {
         TAG_TOP: facets_of(edges["top"]),
         TAG_BOTTOM: facets_of(edges["bottom"]),
         TAG_HEEL: facets_of(edges["heel"]),

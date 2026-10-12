@@ -478,7 +478,7 @@ src/compliance_fem/
     boundaries.py         Boundary selectors and mass matrices
     compliance.py         Saddle-point solves and compliance blocks
   contact/
-    config.py             SoleConfig and foam materials
+    sole_config.py        SoleConfig and foam materials
     model_setup.py        ModelSetup JSON config: parse, fingerprint, build/reuse lookup
     corotation.py         Frame math: Q(varphi), phi_ref, gamma, basis contraction
     topology.py           Contact intervals I_ij, labels, mode filters, validation

@@ -1,7 +1,9 @@
 outputs
+.idea
 .cursor
+venv
 */__pycache__
 */*.egg-info
 */*/__pycache__
 */*/*/__pycache__
-
+*/*/*/*/__pycache__

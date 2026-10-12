@@ -77,13 +77,13 @@ def assemble_axial_constraints(
     return B
 
 
-def constraint_rank(B: sparse.spmatrix, tol: float | None = None) -> int:
+def constraint_rank(B: sparse.csc_matrix | np.ndarray, tol: float | None = None) -> int:
     """Return the numerical rank of B_p."""
     dense = B.toarray() if sparse.issparse(B) else np.asarray(B, dtype=float)
     return int(np.linalg.matrix_rank(dense, tol=tol))
 
 
-def verify_constraint_rank(B: sparse.spmatrix, n_plate: int, tol: float | None = None) -> int:
+def verify_constraint_rank(B: sparse.csc_matrix, n_plate: int, tol: float | None = None) -> int:
     """Assert that B_p has n_plate - 1 independent rows."""
     expected = n_plate - 1
     if B.shape[0] != expected:

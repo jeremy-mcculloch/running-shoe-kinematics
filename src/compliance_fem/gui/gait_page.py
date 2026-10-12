@@ -167,7 +167,7 @@ def render_gait_replay_page() -> None:
     lookup_path = Path(
         st.text_input(
             "Contact lookup path",
-            value="outputs/contact_lookup",
+            value="outputs/measured_sole_lookup",
             key="gait_lookup",
             help="Directory containing contact_lookup.npz, or the .npz file itself.",
         )
@@ -516,8 +516,9 @@ def render_gait_replay_page() -> None:
                 row=2,
                 col=1,
             )
-            fig_cop.add_vline(x=float(t[i]), line=dict(color="#444", dash="dot"), row=1, col=1)
-            fig_cop.add_vline(x=float(t[i]), line=dict(color="#444", dash="dot"), row=2, col=1)
+            # plotly infers row/col as str from their "all" default; ints are valid.
+            fig_cop.add_vline(x=float(t[i]), line=dict(color="#444", dash="dot"), row=1, col=1)  # pyright: ignore[reportArgumentType]
+            fig_cop.add_vline(x=float(t[i]), line=dict(color="#444", dash="dot"), row=2, col=1)  # pyright: ignore[reportArgumentType]
             fig_cop.update_layout(height=520, title="COP time histories (explicit frames)")
             st.plotly_chart(fig_cop, use_container_width=True)
 
@@ -622,8 +623,8 @@ def render_gait_replay_page() -> None:
                 fig.add_vline(
                     x=ti,
                     line=dict(color="#444444", width=1, dash="dot"),
-                    row=r,
-                    col=c,
+                    row=r,  # pyright: ignore[reportArgumentType]  (plotly infers str from the "all" default)
+                    col=c,  # pyright: ignore[reportArgumentType]
                 )
         fig.update_layout(height=800, title="Gait replay diagnostics (SI)")
         st.plotly_chart(fig, use_container_width=True)

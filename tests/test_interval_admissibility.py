@@ -89,7 +89,7 @@ def test_adjacent_gaps_match_direct_coordinate_reconstruction(rocker_lookup, phi
         u = ev.full_bottom_u[row]
         v = ev.full_bottom_v[row]
         _, yF = transform_to_fixed_frame(
-            lk.x_bottom, lk.y_bottom, u, v, x_a, ev.d_ax[row], ev.d_ay[row], ev.varphi, y_anchor=y_a
+            lk.x_bottom, lk.y_bottom, u, v, x_a, float(ev.d_ax[row]), float(ev.d_ay[row]), float(ev.varphi), y_anchor=y_a
         )
         if i > 0:
             assert ev.heel_adjacent_free_gap[row] == pytest.approx(yF[i - 1], rel=1e-9, abs=1e-14)

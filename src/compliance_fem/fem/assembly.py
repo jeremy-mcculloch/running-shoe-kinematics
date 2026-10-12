@@ -21,7 +21,7 @@ def _vector_element(mesh: Mesh, order: int):
     return ElementVector(scalar)
 
 
-def verify_stiffness_symmetry(K: sparse.spmatrix, rtol: float = 1e-10) -> float:
+def verify_stiffness_symmetry(K: sparse.csc_matrix, rtol: float = 1e-10) -> float:
     """Return the relative symmetry error ||K-K^T|| / ||K||."""
     diff = K - K.T
     norm = sparse.linalg.norm(K)
@@ -60,7 +60,7 @@ def assemble_region_foam_stiffness(
 ) -> tuple[sparse.csc_matrix, Basis, dict[str, sparse.csc_matrix]]:
     """Plane-strain ``K = sum_r K_r``, each region with its own material.
 
-    ``region_materials[name]`` is a :class:`compliance_fem.contact.config.FoamMaterial`;
+    ``region_materials[name]`` is a :class:`compliance_fem.contact.sole_config.FoamMaterial`;
     its modulus ``E(x)`` is evaluated at quadrature points (constant unless the
     material is graded heel to toe). Every element must belong to exactly one region.
     """
@@ -76,11 +76,13 @@ def assemble_region_foam_stiffness(
     if np.any(owner < 0):
         raise ValueError(f"{int(np.count_nonzero(owner < 0))} elements belong to no foam region.")
     blocks: dict[str, sparse.csc_matrix] = {}
-    K = None
+    K: sparse.csc_matrix | None = None
     for name, idx in region_elements.items():
         mat = region_materials[name]
         sub = Basis(mesh, element, elements=np.asarray(idx, dtype=int))
         K_r = spatially_varying_plane_strain(mat.E_heel, mat.E_toe, L, mat.nu).assemble(sub).tocsc()
         blocks[name] = K_r
         K = K_r if K is None else K + K_r
+    if K is None:
+        raise ValueError("region_elements must name at least one foam region.")
     return K.tocsc(), basis, blocks

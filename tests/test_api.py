@@ -28,6 +28,7 @@ def test_step_matches_passive_toe_pipeline(model, rocker_lookup) -> None:
         phi_rad=np.deg2rad(2.0), config=ToeSpringConfig(), width_m=WIDTH,
     )
     best = pick_instant_best_passive(cands)
+    assert best is not None
     assert st.valid and st.contact_interval == best.interval
     assert st.theta_deg == pytest.approx(best.theta_deg, abs=1e-12)
     assert st.Fx_N == pytest.approx(best.Fx_pred * WIDTH, rel=1e-12)

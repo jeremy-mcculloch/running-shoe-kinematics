@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 
@@ -19,17 +21,20 @@ def _shape(lookup, Fx, Fy, phi, theta=0.0, **kw):
 def test_shading_matches_reference_interval(request, lookup_name) -> None:
     lk = request.getfixturevalue(lookup_name)
     sel, shape = _shape(lk, 0.0, -500.0, 0.0)
+    assert sel.interval is not None
     i, j = sel.interval
+    cx, cy, free_x = shape.contact_curve_x, shape.contact_curve_y, shape.free_node_x
+    assert cx is not None and cy is not None and free_x is not None
     assert shape.contact_span == (lk.x_bottom[i], lk.x_bottom[j])
     assert (shape.contact_start_index, shape.contact_end_index) == (i, j)
-    assert shape.contact_curve_x.size == j - i + 1
+    assert cx.size == j - i + 1
     # The contact curve follows the deformed curved bottom of nodes i..j and lies on the ground.
-    assert np.max(np.abs(shape.contact_curve_y)) <= 1e-9 * lk.L
+    assert np.max(np.abs(cy)) <= 1e-9 * lk.L
     assert shape.scale == 1.0
-    assert (shape.contact_curve_x[0], shape.contact_curve_y[0]) == shape.heel_edge_xy
-    assert (shape.contact_curve_x[-1], shape.contact_curve_y[-1]) == shape.toe_edge_xy
+    assert (cx[0], cy[0]) == shape.heel_edge_xy
+    assert (cx[-1], cy[-1]) == shape.toe_edge_xy
     n_free = lk.n_bottom_nodes - (j - i + 1)
-    assert shape.free_node_x.size == n_free
+    assert free_x.size == n_free
     assert len(shape.free_curves) == int(i > 0) + int(j < lk.n_bottom_nodes - 1)
 
 
@@ -37,13 +42,14 @@ def test_edge_markers_distinct_from_numerical_anchor(rocker_lookup) -> None:
     from compliance_fem.gui.app import _draw_shape
 
     sel, shape = _shape(rocker_lookup, 0.0, -2000.0, 0.0)
+    assert sel.interval is not None
     i, j = sel.interval
     assert j > i
     assert shape.heel_edge_xy != shape.toe_edge_xy
     assert shape.anchor_xy[0] == pytest.approx(0.5 * (rocker_lookup.x_bottom[i] + rocker_lookup.x_bottom[j]))
     assert shape.anchor_xy != shape.heel_edge_xy and shape.anchor_xy != shape.toe_edge_xy
     fig = _draw_shape(shape)
-    traces = {t.name: t for t in fig.data if t.name}
+    traces: dict[str, Any] = {t.name: t for t in fig.data if t.name}  # pyright: ignore[reportAttributeAccessIssue]  (plotly leaves Figure.data untyped)
     heel = next(t for n, t in traces.items() if n.startswith("heel contact edge"))
     toe = next(t for n, t in traces.items() if n.startswith("toe contact edge"))
     anchor = next(t for n, t in traces.items() if n.startswith("neutral anchor"))
@@ -64,6 +70,7 @@ def test_missing_outside_gaps_display_as_na(flat_lookup) -> None:
     assert format_optional(None) == "N/A"
     assert format_optional(1.25e-4, ".3e") == "1.250e-04"
     heel, shape = _shape(flat_lookup, 0.0, -500.0, 0.3)
+    assert heel.interval is not None
     assert heel.interval[0] == 0
     assert format_optional(heel.heel_adjacent_free_gap) == "N/A"
     assert format_optional(heel.toe_adjacent_free_gap) != "N/A"

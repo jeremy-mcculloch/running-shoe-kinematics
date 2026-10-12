@@ -159,6 +159,7 @@ def test_center_of_effort_in_fixed_frame(rocker_lookup) -> None:
     sel = evaluate_from_angles(lk, 60.0, -900.0, -1.0, 3.0)
     y_top = lk.y_top if lk.y_top is not None else np.full(lk.n_top_nodes, lk.H)
     _, fty_F = rotate_vector_to_fixed(sel.top_force_x, sel.top_force_y, sel.varphi)
+    assert sel.anchor_x is not None and sel.anchor_y is not None
     x_top_F, _ = transform_to_fixed_frame(
         lk.x_top, y_top, sel.top_u, sel.top_v, sel.anchor_x, sel.d_ax, sel.d_ay, sel.varphi, y_anchor=sel.anchor_y
     )

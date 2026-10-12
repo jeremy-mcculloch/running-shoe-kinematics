@@ -12,11 +12,13 @@ spaced. A flat sole has ``y_b = 0``; curved soles set ``rocker``.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 
 from compliance_fem.fem.compliance import compute_compliance
-from compliance_fem.contact.config import SoleConfig
+from compliance_fem.contact.sole_config import SoleConfig
 from compliance_fem.contact.lookup import get_compliance_block_matrix, generate_contact_lookup
 from compliance_fem.geometry.profile import NormalizedSoleGeometry, validate_normalized_geometry
 
@@ -87,7 +89,7 @@ def small_config(
     nodes and the top / bottom nodes are exactly the geometry samples.
     """
     toe_drop = float(np.hypot(1.0 / (n - 1), height))
-    params = dict(
+    params: dict[str, Any] = dict(
         shoe_length_mm=L * 1000.0,
         normalized_geometry=synthetic_sole_geometry(rocker, apex, n, height, top_slope),
         mesh_size_m=1.05 * toe_drop * L,

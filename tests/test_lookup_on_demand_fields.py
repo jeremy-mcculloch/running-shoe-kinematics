@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import dataclasses
 import itertools
 
@@ -128,7 +130,7 @@ def _same(a, b) -> None:
 def test_passive_toe_matches_stored_lookup(asym_lookup, asym_lookup_full) -> None:
     cfg = ToeSpringConfig(toe_stiffness_Nm_per_rad=2.0)
     for Fx, Fy, phi in LOADS:
-        kw = dict(Fx_star=Fx, Fy_star=Fy, Mz_meas=0.0, phi_rad=np.deg2rad(phi), config=cfg, width_m=0.1)
+        kw: dict[str, Any] = dict(Fx_star=Fx, Fy_star=Fy, Mz_meas=0.0, phi_rad=np.deg2rad(phi), config=cfg, width_m=0.1)
         ca = solve_passive_toe_candidates(asym_lookup_full, **kw)
         cb = solve_passive_toe_candidates(asym_lookup, **kw)
         assert len(ca) == len(cb)
@@ -157,7 +159,7 @@ def test_refine_top_k_orders_exactly() -> None:
 def plate_pair():
     fem = compute_compliance(small_config(rocker=0.008))
     blocks = get_compliance_block_matrix(fem)
-    kw = dict(toe_length=SMALL_TOE_LENGTH, kappa=30.0, fem_result=fem, require_plate=True)
+    kw: dict[str, Any] = dict(toe_length=SMALL_TOE_LENGTH, kappa=30.0, fem_result=fem, require_plate=True)
     return generate_contact_lookup(blocks, **kw), generate_contact_lookup(blocks, store_fields=True, **kw)
 
 

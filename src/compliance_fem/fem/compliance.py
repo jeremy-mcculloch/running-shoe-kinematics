@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from typing import Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar, cast
 
 import numpy as np
 from scipy import sparse
-from scipy.sparse.linalg import splu
+from scipy.sparse.linalg import SuperLU, splu
+from skfem import CellBasis
 
 from compliance_fem.fem.assembly import (
     assemble_region_foam_stiffness,
@@ -18,7 +19,7 @@ from compliance_fem.fem.boundaries import (
     build_vector_selector,
     yy_block,
 )
-from compliance_fem.contact.config import SoleConfig
+from compliance_fem.contact.sole_config import SoleConfig
 from compliance_fem.fem.constraints import (
     assemble_axial_constraints,
     verify_constraint_rank,
@@ -34,7 +35,11 @@ from compliance_fem.fem.rigid_modes import (
     verify_constraint_on_modes,
     verify_rigid_modes,
 )
+from compliance_fem.fem.skfem_types import dof_table, mesh_boundaries
 from pathlib import Path
+
+if TYPE_CHECKING:
+    from compliance_fem.geometry.mesh import SoleMeshData
 
 COMPLIANCE_SCHEMA_VERSION = 5
 # SoleConfig settings saved in the NPZ under their field names.
@@ -114,8 +119,8 @@ class ComplianceResult:
     reciprocity: ReciprocityErrors = field(default_factory=ReciprocityErrors)
     solve_residuals: TopBottom[float] = field(default_factory=_zero_pair)
     K: sparse.csc_matrix | None = None
-    basis: object | None = None
-    factorization: splu | None = None
+    basis: CellBasis | None = None
+    factorization: SuperLU | None = None
     Ctt_traction: np.ndarray | None = None
     Ctb_traction: np.ndarray | None = None
     y_top: np.ndarray | None = None
@@ -149,7 +154,7 @@ class ComplianceResult:
     plate_element_normals: np.ndarray | None = None
     shared_toe_node_id: int | None = None
     geometry_metadata: dict | None = None
-    mesh_data: object | None = None
+    mesh_data: SoleMeshData | None = None
 
     @property
     def reciprocity_error(self) -> float:
@@ -161,17 +166,23 @@ class ComplianceResult:
         n = 0 if self.plate_node_ids is None else max(int(len(self.plate_node_ids)) - 1, 0)
         return np.arange(n, dtype=int)
 
+    def require_basis(self) -> CellBasis:
+        """Return the FE basis, which :func:`compute_compliance` always stores."""
+        if self.basis is None:
+            raise ValueError("ComplianceResult has no stored FE basis.")
+        return self.basis
+
     @property
     def plate_u_dof_ids(self) -> np.ndarray:
-        return np.asarray(self.basis.nodal_dofs[0, self.plate_node_ids], dtype=int)
+        return np.asarray(dof_table(self.require_basis().nodal_dofs)[0, self.plate_node_ids], dtype=int)
 
     @property
     def plate_v_dof_ids(self) -> np.ndarray:
-        return np.asarray(self.basis.nodal_dofs[1, self.plate_node_ids], dtype=int)
+        return np.asarray(dof_table(self.require_basis().nodal_dofs)[1, self.plate_node_ids], dtype=int)
 
     @property
     def plate_rotation_dof_ids(self) -> np.ndarray:
-        n_foam = int(self.basis.N)
+        n_foam = int(self.require_basis().N)
         return n_foam + np.arange(int(self.n_plate_rotation_dofs), dtype=int)
 
     @property
@@ -212,25 +223,29 @@ def build_augmented_matrix(
         raise ValueError("Stiffness matrix must be square.")
     if R.shape[0] != n:
         raise ValueError(f"R has {R.shape[0]} rows; expected {n}.")
+    # The stubs type bmat() as returning spmatrix whatever the format.
     if B is None:
-        return sparse.bmat(
-            [[K, R], [R.T, sparse.csc_matrix((n_r, n_r))]],
-            format="csc",
+        return cast(
+            sparse.csc_matrix,
+            sparse.bmat([[K, R], [R.T, sparse.csc_matrix((n_r, n_r))]], format="csc"),
         )
     if B.shape[1] != n:
         raise ValueError(f"B_p has {B.shape[1]} columns; expected {n}.")
     n_l = B.shape[0]
-    return sparse.bmat(
-        [
-            [K, B.T, R],
-            [B, sparse.csc_matrix((n_l, n_l)), sparse.csc_matrix((n_l, n_r))],
-            [R.T, sparse.csc_matrix((n_r, n_l)), sparse.csc_matrix((n_r, n_r))],
-        ],
-        format="csc",
+    return cast(
+        sparse.csc_matrix,
+        sparse.bmat(
+            [
+                [K, B.T, R],
+                [B, sparse.csc_matrix((n_l, n_l)), sparse.csc_matrix((n_l, n_r))],
+                [R.T, sparse.csc_matrix((n_r, n_l)), sparse.csc_matrix((n_r, n_r))],
+            ],
+            format="csc",
+        ),
     )
 
 
-def _relative_residual(A: sparse.spmatrix, x: np.ndarray, b: np.ndarray) -> float:
+def _relative_residual(A: sparse.csc_matrix, x: np.ndarray, b: np.ndarray) -> float:
     r = b - A @ x
     r_norm = np.linalg.norm(r)
     b_norm = np.linalg.norm(b)
@@ -238,9 +253,9 @@ def _relative_residual(A: sparse.spmatrix, x: np.ndarray, b: np.ndarray) -> floa
 
 
 def solve_multiple_rhs(
-    lu: splu,
+    lu: SuperLU,
     rhs: np.ndarray,
-    A: sparse.spmatrix | None = None,
+    A: sparse.csc_matrix | None = None,
     n_refine: int = 2,
 ) -> np.ndarray:
     """Solve A X = rhs for multiple right-hand sides.
@@ -258,7 +273,7 @@ def solve_multiple_rhs(
 
 
 def _solve_compliance_block(
-    lu: splu,
+    lu: SuperLU,
     A: sparse.csc_matrix,
     S: sparse.csc_matrix,
     label: str,
@@ -288,7 +303,7 @@ def _solve_compliance_block(
     return U, residual, extras
 
 
-def _normwise_backward_error(A: sparse.spmatrix, X: np.ndarray, Bmat: np.ndarray) -> float:
+def _normwise_backward_error(A: sparse.csc_matrix, X: np.ndarray, Bmat: np.ndarray) -> float:
     a_norm = float(sparse.linalg.norm(A, ord=np.inf))
     worst = 0.0
     for j in range(Bmat.shape[1]):
@@ -544,15 +559,16 @@ def compute_compliance(config: SoleConfig, mesh_path: Path | None = None) -> Com
 
     def _selection(nodes: np.ndarray) -> BoundarySelection:
         return BoundarySelection(
-            u_dofs=np.asarray(basis.nodal_dofs[0, nodes], dtype=int),
-            v_dofs=np.asarray(basis.nodal_dofs[1, nodes], dtype=int),
+            u_dofs=np.asarray(dof_table(basis.nodal_dofs)[0, nodes], dtype=int),
+            v_dofs=np.asarray(dof_table(basis.nodal_dofs)[1, nodes], dtype=int),
             x=p[0, nodes].copy(),
             y=p[1, nodes].copy(),
         )
 
+    boundaries = mesh_boundaries(mesh)
     masses = TopBottom(
-        _boundary_mass_on_nodes(basis, mesh.boundaries["TOP_SURFACE"], top_nodes),
-        _boundary_mass_on_nodes(basis, mesh.boundaries["BOTTOM_SURFACE"], bottom_nodes),
+        _boundary_mass_on_nodes(basis, boundaries["TOP_SURFACE"], top_nodes),
+        _boundary_mass_on_nodes(basis, boundaries["BOTTOM_SURFACE"], bottom_nodes),
     )
     plate_nodes = np.asarray(mesh_data.plate_node_ids, dtype=int)
     plate_coords = p[:, plate_nodes]
@@ -624,6 +640,9 @@ def measured_compliance_payload(result: ComplianceResult) -> dict:
     import json
 
     cfg = result.config
+    shared_toe_node_id = result.shared_toe_node_id
+    if shared_toe_node_id is None:
+        raise ValueError("ComplianceResult has no shared_toe_node_id; build it with compute_compliance().")
     upper = cfg.material(cfg.upper_foam_material)
     lower = cfg.material(cfg.lower_foam_material)
     out = {
@@ -645,7 +664,7 @@ def measured_compliance_payload(result: ComplianceResult) -> dict:
         "top_node_ids": result.top_node_ids,
         "bottom_node_ids": result.bottom_node_ids,
         "plate_node_ids": result.plate_node_ids,
-        "shared_toe_node_id": int(result.shared_toe_node_id),
+        "shared_toe_node_id": int(shared_toe_node_id),
         "upper_foam_material": np.asarray(upper.name),
         "lower_foam_material": np.asarray(lower.name),
         "upper_E_heel": upper.E_heel,

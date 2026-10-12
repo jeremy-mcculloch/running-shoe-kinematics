@@ -6,6 +6,8 @@ import numpy as np
 from scipy import sparse
 from skfem import Basis
 
+from compliance_fem.fem.skfem_types import dof_table
+
 
 def mesh_centroid(mesh) -> tuple[float, float]:
     """Return the area-weighted centroid of a 2D mesh."""
@@ -48,19 +50,16 @@ def mesh_centroid(mesh) -> tuple[float, float]:
 
 def _component_dofs(basis: Basis, component: int) -> np.ndarray:
     """Return all global DOF indices for a vector component."""
-    parts = [basis.nodal_dofs[component]]
-    if basis.facet_dofs.size:
-        parts.append(basis.facet_dofs[component])
-    if basis.edge_dofs.size:
-        parts.append(basis.edge_dofs[component])
-    if basis.interior_dofs.size:
-        parts.append(basis.interior_dofs[component])
+    parts = [dof_table(basis.nodal_dofs)[component]]
+    for table in (basis.facet_dofs, basis.edge_dofs, basis.interior_dofs):
+        if dof_table(table).size:
+            parts.append(dof_table(table)[component])
     return np.unique(np.concatenate(parts))
 
 
 def verify_rigid_modes(
-    K: sparse.spmatrix,
-    R: sparse.spmatrix,
+    K: sparse.csc_matrix,
+    R: sparse.csc_matrix,
     rtol: float = 1e-8,
 ) -> float:
     """Verify K @ R ≈ 0 and return the relative residual norm."""
@@ -113,8 +112,8 @@ def build_enlarged_rigid_modes(
 
 
 def verify_constraint_on_modes(
-    B: sparse.spmatrix,
-    R: sparse.spmatrix,
+    B: sparse.csc_matrix,
+    R: sparse.csc_matrix,
     rtol: float = 1e-8,
 ) -> float:
     """Verify B @ R ≈ 0 and return a relative residual."""

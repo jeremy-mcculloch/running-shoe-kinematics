@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from compliance_fem.contact.lookup import ContactLookupResult
+from compliance_fem.contact.lookup import ContactLookupResult, required_array
 from compliance_fem.contact.topology import ContactType
 from compliance_fem.contact.corotation import basis_coefficients, contract_basis
 from compliance_fem.gait.replay import GaitReplayResult
@@ -43,8 +43,8 @@ def selection_proxy_for_frame(
     fields = lookup.record_fields([row])
     u_bot = np.asarray(contract_basis(fields["bottom_u"][0], gamma, mode_axis=0), dtype=float)
     v_bot = np.asarray(contract_basis(fields["bottom_v"][0], gamma, mode_axis=0), dtype=float)
-    anchor_x = float(lookup.contact_anchor_reference_x[row])
-    anchor_y = float(lookup.contact_anchor_reference_y[row])
+    anchor_x = float(required_array(lookup, "contact_anchor_reference_x")[row])
+    anchor_y = float(required_array(lookup, "contact_anchor_reference_y")[row])
 
     return SimpleNamespace(
         selected_row=row,

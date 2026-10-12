@@ -18,11 +18,15 @@ values; the fixed-frame transform is applied by the renderer.
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING, TypeGuard
 
 import numpy as np
 from scipy import sparse
 
 from compliance_fem.fem.boundaries import build_vector_selector
+
+if TYPE_CHECKING:
+    from compliance_fem.fem.compliance import ComplianceResult
 
 RENDER_INT_KEYS = (
     "mesh_triangles",
@@ -44,7 +48,7 @@ RENDER_FLOAT_KEYS = (
 RENDER_KEYS = RENDER_INT_KEYS + RENDER_FLOAT_KEYS
 
 
-def has_render_inputs(fem_result) -> bool:
+def has_render_inputs(fem_result: ComplianceResult | None) -> TypeGuard[ComplianceResult]:
     return fem_result is not None and getattr(fem_result, "geometry_metadata", None) is not None and (
         getattr(fem_result, "mesh_data", None) is not None
     )

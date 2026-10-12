@@ -171,6 +171,8 @@ def test_rank_deficient_interval_rejected_with_structured_reason(flat_case, monk
     row = lookup.row_of(2, 4)
     assert not lookup.valid_mask[row]
     assert lookup.rejection_reason[row].startswith(REJECT_RANK_DEFICIENT)
+    assert lookup.boundary_matrix_rank is not None
+    assert lookup.boundary_matrix_size is not None
     assert lookup.boundary_matrix_rank[row] < lookup.boundary_matrix_size[row]
     assert lookup.status[row] == "rejected"
     assert np.all(np.isnan(lookup.scalar_lookup[row]))

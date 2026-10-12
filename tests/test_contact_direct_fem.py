@@ -47,7 +47,7 @@ def _rel(a, b) -> float:
 def test_every_affine_column_agrees_with_direct_fem(request, case_name) -> None:
     result, lookup = request.getfixturevalue(case_name)
     comps = run_standard_direct_comparisons(result, lookup.softplus_toe_length, lookup.softplus_kappa)
-    names = set(standard_validation_intervals(result.x_bottom, result.config.L))
+    names = set(standard_validation_intervals(result.x_bottom, result.config.shoe_length_m))
     assert set(comps) == names
     for name, cols in comps.items():
         assert [c.column_index for c in cols] == list(range(N_AFFINE_COLUMNS))
@@ -164,6 +164,7 @@ def test_direct_validation_of_runtime_states(request, name) -> None:
     if label is not None:
         assert sel.topology_label == label
     if name == "asymmetric_interior":
+        assert sel.interval is not None
         i, j = sel.interval
         assert i + j != lk.n_bottom_nodes - 1  # not centred on mid-length
     if name == "tensile_interior":
@@ -196,7 +197,7 @@ def test_direct_validation_of_gait_sample_with_passive_toe(rocker_case) -> None:
 
 def test_validation_intervals_cover_required_cases(flat_case) -> None:
     result, _ = flat_case
-    specs = standard_validation_intervals(result.x_bottom, result.config.L)
+    specs = standard_validation_intervals(result.x_bottom, result.config.shoe_length_m)
     n = len(result.x_bottom)
     assert specs["flat_heel"].topology_label.value == "heel"
     assert specs["flat_toe"].topology_label.value == "toe"

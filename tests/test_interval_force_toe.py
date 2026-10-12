@@ -140,7 +140,7 @@ def test_passive_equilibrium_matches_direct_residual(rocker_lookup, passive_cand
             # Force control holds at the toe solution.
             S = lk.scalar_lookup[c.row]
             F_loc = contract_basis(S[:, :2], gamma)
-            fx, fy = rotate_vector_to_fixed(F_loc[0], F_loc[1], varphi)
+            fx, fy = rotate_vector_to_fixed(F_loc[0], F_loc[1], float(varphi))
             assert np.hypot(fx - 0.0, fy - Fy) <= 1e-8 * abs(Fy)
             assert c.force_residual <= 1e-8 * abs(Fy)
 
@@ -180,7 +180,9 @@ def test_changing_interval_changes_passive_equilibrium(rocker_lookup) -> None:
         model = rearfoot_toe_model(lk.scalar_lookup[row], q_all[row], F, 0.0, geometry, WIDTH)
         sol = solve_toe_equilibrium_model(model, cfg)
         assert sol.roots
-        thetas[interval] = sol.roots[relaxed_root_index(sol.roots)].theta_rad
+        idx = relaxed_root_index(sol.roots)
+        assert idx is not None
+        thetas[interval] = sol.roots[idx].theta_rad
     vals = np.array(list(thetas.values()))
     assert np.ptp(vals) > 1e-4
 

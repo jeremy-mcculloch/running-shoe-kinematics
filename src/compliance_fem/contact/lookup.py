@@ -36,7 +36,7 @@ from collections import Counter, OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeGuard
 
 import numpy as np
 from scipy import linalg
@@ -96,6 +96,7 @@ from compliance_fem.fem.plate_response import (
     PLATE_NORMAL_SIGN,
     PLATE_ROTATION_SIGN,
     PlateInfluence,
+    PlateMeshInfo,
     build_plate_influence,
     empty_plate_basis,
     extract_plate_mesh_info,
@@ -830,6 +831,12 @@ class CandidateSolution:
     def solved(self) -> bool:
         return self.F_t is not None
 
+    def solved_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """``(F_t, F_c, Alpha)`` of a solved interval."""
+        if self.F_t is None or self.F_c is None or self.Alpha is None:
+            raise ValueError("Interval was not solved; it has no boundary solution.")
+        return self.F_t, self.F_c, self.Alpha
+
     def reject(self, reason: str) -> None:
         self.valid = False
         self.rejection_reason = reason
@@ -1076,7 +1083,8 @@ class RecordFieldSolver:
         sol = solve_candidate(self.blocks, lookup.interval(row), self.W, self.x_r, toe_length=self.toe_length, y_r=self.y_r)
         self.n_solves += 1
         if sol.solved:
-            plate_inputs = _PlateInputs(F_t=sol.F_t, F_c=sol.F_c, Alpha=sol.Alpha, W_c=sol.W_c, contact=sol.contact)
+            F_t, F_c, Alpha = sol.solved_arrays()
+            plate_inputs = _PlateInputs(F_t=F_t, F_c=F_c, Alpha=Alpha, W_c=sol.W_c, contact=sol.contact)
             return _CachedRow(fields=sol.nodal_fields(), plate_inputs=plate_inputs)
         n_b, n_t = len(self.blocks.x_bottom), len(self.blocks.x_top)
         nan_b = np.full((N_AFFINE_COLUMNS, n_b), np.nan)
@@ -1119,7 +1127,7 @@ class RecordFieldSolver:
             self._cache.clear()
 
 
-def _supports_plate_recovery(fem_result: ComplianceResult | None) -> bool:
+def _supports_plate_recovery(fem_result: ComplianceResult | None) -> TypeGuard[ComplianceResult]:
     if fem_result is None:
         return False
     return (
@@ -1236,10 +1244,11 @@ def generate_contact_lookup(
             "require_plate=True but fem_result is missing B_p, factorization, basis, "
             "or x_plate (an NPZ-only build cannot recover plate_response)."
         )
-    plate_mesh = extract_plate_mesh_info(fem_result) if recover_plate else None
-    influence: PlateInfluence | None = (
-        build_plate_influence(fem_result, plate_mesh, x_r=x_r, y_r=y_r) if recover_plate else None
-    )
+    plate_mesh: PlateMeshInfo | None = None
+    influence: PlateInfluence | None = None
+    if recover_plate:
+        plate_mesh = extract_plate_mesh_info(fem_result)
+        influence = build_plate_influence(fem_result, plate_mesh, x_r=x_r, y_r=y_r)
     n_plate = int(plate_mesh.n_nodes) if plate_mesh is not None else 0
     n_el = int(plate_mesh.n_elements) if plate_mesh is not None else 0
 
@@ -1301,6 +1310,7 @@ def generate_contact_lookup(
             if node_fields is not None:
                 for name, value in sol.nodal_fields().items():
                     node_fields[name][row] = value
+            assert sol.edge is not None
             for name in EDGE_RESPONSE_FIELDS:
                 edge_responses[name][row] = sol.edge[name]
             kf_matrix[row] = sol.kf_matrix
@@ -1317,13 +1327,14 @@ def generate_contact_lookup(
         ok = sol.valid
         reason = sol.rejection_reason
         if ok and influence is not None:
-            assert plate_mesh is not None
+            assert plate_mesh is not None and plate_bp is not None
+            F_t, F_c, Alpha = sol.solved_arrays()
             plate = plate_basis_from_influence(
                 influence,
-                sol.F_t,
-                sol.F_c,
+                F_t,
+                F_c,
                 np.asarray(sol.contact, dtype=int),
-                sol.Alpha,
+                Alpha,
                 W,
                 sol.W_c,
             )
@@ -1337,6 +1348,8 @@ def generate_contact_lookup(
                 reason = f"{REJECT_PLATE}: bp={bp_max:.3e}, bc={bc_max:.3e}"
             else:
                 if store_plate:
+                    assert plate_u is not None and plate_v is not None and plate_th is not None
+                    assert plate_lam is not None and plate_ax is not None
                     plate_u[row] = plate.u_local
                     plate_v[row] = plate.v_local
                     plate_th[row] = plate.rotation_local
@@ -1344,6 +1357,7 @@ def generate_contact_lookup(
                     plate_ax[row] = plate.axial_force
                 plate_bp[row] = plate.bp_residual
         if ok:
+            assert sol.top_force_y is not None
             q_alpha[row] = q_alpha_shoe_on_foot_basis(sol.top_force_y, W, n_t, prepared.x_top, geom)
         valid[row] = ok
         reasons[row] = "" if ok else reason
@@ -1359,7 +1373,7 @@ def generate_contact_lookup(
     geometry_metadata: dict = {}
     if has_render_inputs(fem_result):
         render_section = build_render_section(fem_result, x_r=x_r, y_r=y_r)
-        geometry_metadata = dict(fem_result.geometry_metadata)
+        geometry_metadata = dict(fem_result.geometry_metadata or {})
 
     plate_metadata: dict = {"has_plate_response": False}
     if recover_plate and plate_mesh is not None:
@@ -1713,6 +1727,14 @@ def _jsonable(obj):
     return obj
 
 
+def required_array(result: ContactLookupResult, name: str) -> np.ndarray:
+    """Return the optional per-record array ``name``, raising if the lookup lacks it."""
+    value = getattr(result, name)
+    if value is None:
+        raise ValueError(f"Contact lookup has no {name!r} array; regenerate it.")
+    return np.asarray(value)
+
+
 def _write_lookup_csv(result: ContactLookupResult, path: Path) -> None:
     fieldnames = [
         "row",
@@ -1748,6 +1770,14 @@ def _write_lookup_csv(result: ContactLookupResult, path: Path) -> None:
     for col in AFFINE_COLUMN_NAMES:
         fieldnames.append(f"Q_alpha_shoe_on_foot_{col}")
     q = lookup_q_alpha_basis(result)
+    req = {
+        name: required_array(result, name)
+        for name in (
+            "contact_start_x", "contact_end_x", "contact_anchor_reference_x", "contact_anchor_reference_y",
+            "heel_adjacent_free_node_id", "toe_adjacent_free_node_id", "boundary_matrix_rank",
+            "boundary_matrix_size", "kf_cond", "kf_det", "balance_residuals",
+        )
+    }
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
@@ -1757,25 +1787,25 @@ def _write_lookup_csv(result: ContactLookupResult, path: Path) -> None:
                 "contact_start_index": int(result.contact_start_index[row]),
                 "contact_end_index": int(result.contact_end_index[row]),
                 "topology_label": result.contact_type(row).value,
-                "contact_start_x": float(result.contact_start_x[row]),
-                "contact_end_x": float(result.contact_end_x[row]),
-                "contact_anchor_reference_x": float(result.contact_anchor_reference_x[row]),
-                "contact_anchor_reference_y": float(result.contact_anchor_reference_y[row]),
-                "heel_adjacent_free_node_id": int(result.heel_adjacent_free_node_id[row]),
-                "toe_adjacent_free_node_id": int(result.toe_adjacent_free_node_id[row]),
+                "contact_start_x": float(req["contact_start_x"][row]),
+                "contact_end_x": float(req["contact_end_x"][row]),
+                "contact_anchor_reference_x": float(req["contact_anchor_reference_x"][row]),
+                "contact_anchor_reference_y": float(req["contact_anchor_reference_y"][row]),
+                "heel_adjacent_free_node_id": int(req["heel_adjacent_free_node_id"][row]),
+                "toe_adjacent_free_node_id": int(req["toe_adjacent_free_node_id"][row]),
                 "n_free": int(result.n_free[row]),
                 "n_contact": int(result.n_contact[row]),
                 "record_valid": bool(result.valid_mask[row]),
                 "rejection_reason": result.rejection_reason[row],
-                "boundary_matrix_rank": int(result.boundary_matrix_rank[row]),
-                "boundary_matrix_size": int(result.boundary_matrix_size[row]),
-                "kf_cond": float(result.kf_cond[row]),
-                "kf_det": float(result.kf_det[row]),
+                "boundary_matrix_rank": int(req["boundary_matrix_rank"][row]),
+                "boundary_matrix_size": int(req["boundary_matrix_size"][row]),
+                "kf_cond": float(req["kf_cond"][row]),
+                "kf_det": float(req["kf_det"][row]),
                 "condition_estimate": float(result.condition_estimates[row]),
                 "solve_residual": float(result.solve_residuals[row]),
                 "force_equilibrium_residual": float(result.force_equilibrium_residuals[row]),
                 "moment_equilibrium_residual": float(result.moment_equilibrium_residuals[row]),
-                "balance_residual": float(result.balance_residuals[row]),
+                "balance_residual": float(req["balance_residuals"][row]),
             }
             s = result.scalar_lookup[row]
             for k, col in enumerate(AFFINE_COLUMN_NAMES):
@@ -1913,7 +1943,8 @@ def load_contact_lookup(path: Path | str) -> ContactLookupResult:
             "n_plate_nodes": int(np.asarray(data["plate_node_ids"]).size),
             "n_plate_elements": int(np.asarray(data["plate_element_connectivity"]).shape[0]),
         }
-    moment_origin = tuple(float(v) for v in np.asarray(data["moment_origin"], dtype=float).reshape(-1)[:2])
+    mo = np.asarray(data["moment_origin"], dtype=float).reshape(-1)
+    moment_origin = (float(mo[0]), float(mo[1]))
 
     result = ContactLookupResult(
         contact_start_index=starts,

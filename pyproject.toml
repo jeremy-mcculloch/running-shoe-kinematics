@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=7.4", "pyright>=1.1.380", "scipy-stubs"]
 
 [project.scripts]
 compliance-fem-contact-lookup = "compliance_fem.cli.contact_lookup:main"
@@ -35,3 +35,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.pyright]
+include = ["src", "tests"]
+venvPath = "."
+venv = "venv"
+pythonVersion = "3.12"
+typeCheckingMode = "standard"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -17,7 +18,8 @@ def read_force_history(path: str | Path) -> tuple[NDArray[np.float64], NDArray[n
     FVE : (n, n_components)
     """
     path = Path(path)
-    data = np.genfromtxt(path, delimiter=",", names=True, dtype=np.float64)
+    # names=True returns a structured array; numpy's stubs type it as plain float64.
+    data = cast("NDArray[np.void]", np.genfromtxt(path, delimiter=",", names=True, dtype=np.float64))
     if data.dtype.names is None:
         raise ValueError(f"{path}: expected a header row with column names")
     names = [n.lower() for n in data.dtype.names]

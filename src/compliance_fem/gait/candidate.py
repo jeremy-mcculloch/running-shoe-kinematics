@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from compliance_fem.contact.lookup import ContactLookupResult, contact_type_from_code
+from compliance_fem.contact.lookup import ContactLookupResult, contact_type_from_code, required_array
 from compliance_fem.contact.topology import ContactType
 
 # Per-candidate diagnostics copied from ``reconstruct_rows`` (§9–§12, §15).
@@ -83,13 +83,13 @@ class WrenchCandidate:
 
 def _candidate_geometry(lookup: ContactLookupResult, row: int) -> dict:
     return {
-        "contact_type": contact_type_from_code(int(lookup.contact_type_codes[row])),
+        "contact_type": contact_type_from_code(int(required_array(lookup, "contact_type_codes")[row])),
         "contact_start_index": int(lookup.contact_start_index[row]),
         "contact_end_index": int(lookup.contact_end_index[row]),
-        "contact_start_x": float(lookup.contact_start_x[row]),
-        "contact_end_x": float(lookup.contact_end_x[row]),
-        "anchor_x": float(lookup.contact_anchor_reference_x[row]),
-        "anchor_y": float(lookup.contact_anchor_reference_y[row]),
+        "contact_start_x": float(required_array(lookup, "contact_start_x")[row]),
+        "contact_end_x": float(required_array(lookup, "contact_end_x")[row]),
+        "anchor_x": float(required_array(lookup, "contact_anchor_reference_x")[row]),
+        "anchor_y": float(required_array(lookup, "contact_anchor_reference_y")[row]),
     }
 
 
