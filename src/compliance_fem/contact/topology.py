@@ -189,14 +189,6 @@ def interval_row(start: int, end: int, n_bottom: int) -> int:
     return i * n - (i * (i - 1)) // 2 + (j - i)
 
 
-def interval_arrays(n_bottom: int) -> tuple[np.ndarray, np.ndarray]:
-    """``(starts, ends)`` of every interval in enumeration order."""
-    n = int(n_bottom)
-    starts = np.concatenate([np.full(n - i, i, dtype=int) for i in range(n)])
-    ends = np.concatenate([np.arange(i, n, dtype=int) for i in range(n)])
-    return starts, ends
-
-
 def labels_from_arrays(starts: np.ndarray, ends: np.ndarray, n_bottom: int) -> np.ndarray:
     """Vectorized topology codes for interval endpoint arrays."""
     s = np.asarray(starts, dtype=int)

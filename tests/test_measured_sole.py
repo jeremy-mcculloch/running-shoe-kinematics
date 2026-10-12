@@ -22,7 +22,7 @@ from compliance_fem.fem.compliance import (
 )
 from compliance_fem.contact.config import SoleConfig, validate_shoe_length_mm
 from compliance_fem.contact.basis import N_AFFINE_COLUMNS
-from compliance_fem.contact.direct_fem import (
+from direct_fem import (
     run_standard_direct_comparisons,
     solve_direct_fem_contact,
     standard_validation_intervals,
@@ -594,7 +594,7 @@ def test_closure_places_contact_on_ground(coarse_lookup) -> None:
     for row in coarse_lookup.valid_rows[::97]:
         iv = coarse_lookup.interval(row)
         c = iv.contact_node_ids
-        y_a = coarse_lookup.anchor_reference_y[row]
+        y_a = coarse_lookup.contact_anchor_reference_y[row]
         np.testing.assert_allclose(
             y_b[c] + coarse_lookup.bottom_v_basis[row, 0, c] - y_a, 0.0, atol=1e-12 * coarse_lookup.L
         )
@@ -612,7 +612,7 @@ def _fixed_frame_state(lookup, sel):
     rx = coef @ lookup.reaction_x_basis[row]
     ry = coef @ lookup.reaction_y_basis[row]
     c, s = np.cos(varphi), np.sin(varphi)
-    xa, ya = lookup.anchor_reference_x[row], lookup.anchor_reference_y[row]
+    xa, ya = lookup.contact_anchor_reference_x[row], lookup.contact_anchor_reference_y[row]
     gap = s * (lookup.x_bottom - xa + u - sel.d_ax) + c * (lookup.y_bottom - ya + v - sel.d_ay)
     rn = s * rx + c * ry
     return lookup.interval(row), gap, rn

@@ -33,7 +33,7 @@ from compliance_fem.geometry.profile import (
     TAG_TOP,
     SoleGeometry,
     distance_to_polyline,
-    geometry_from_config,
+    build_sole_geometry,
     turning_angles,
 )
 
@@ -172,7 +172,7 @@ def _components(t: np.ndarray, n_nodes: int) -> int:
 
 def generate_mesh(config, output_msh: Path | None = None) -> SoleMeshData:
     """Mesh the measured sole with conforming foams and an inserted plate segment."""
-    geom = geometry_from_config(config)
+    geom = build_sole_geometry(config.normalized_geometry, config.shoe_length_mm, config.landmark_tolerance)
     sizes = _local_sizes(geom, config)
     h = float(config.mesh_size_m)
 

@@ -486,7 +486,6 @@ src/compliance_fem/
     lookup.py             Interval contact lookup table
     toe_spring.py         Passive toe spring: exact equilibrium, roots, stability
     force_control.py      Fx/Fy/φ/θ runtime: K_F solve, all-node checks, interval search
-    direct_fem.py         Sparse FEM cross-checks
   plotting/
     compliance.py         Compliance diagnostic figures
     contact.py            Lookup diagnostic plots
@@ -503,6 +502,9 @@ src/compliance_fem/
     pages/1_Gait_replay.py Streamlit multipage entry for gait replay
   viscoelasticity/        Viscoelastic F_VE(t) → elastic F_e(t) mapper
   gait/                   Wang gait force-replay backend for the GUI page
+tests/
+  direct_fem.py           Direct sparse-FEM solves the lookup is validated against
+  reference.py            Independent reference implementations used by the tests
 docs/viscoelasticity.md   Viscoelastic force-map mathematics and usage
 docs/gait_replay.md       Gait replay conventions, citations, limitations
 docs/passive_toe_spring.md Passive toe spring model, signs, solver, limitations

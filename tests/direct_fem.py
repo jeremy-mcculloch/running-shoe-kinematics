@@ -140,7 +140,7 @@ def solve_direct_fem_contact(
         if gamma is None
         else affine_coefficients(np.asarray(gamma, dtype=float))
     )
-    W = build_top_affine_matrix(x_top, result.config.L, toe_length, kappa)
+    W = build_top_affine_matrix(x_top, result.config.shoe_length_m, toe_length, kappa)
     w_u, w_v = split_uv(W @ coeff, n_t)
     x0 = np.zeros(n_primal, dtype=float)
     x0[u_top] = w_u
@@ -176,7 +176,7 @@ def solve_direct_fem_contact(
 
     f_tx = residual[u_top]
     f_ty = residual[v_top]
-    T_toe, _T_vert, _H_mtp = compute_toe_moment(f_tx, f_ty, x_top, y_top, result.config.L - toe_length)
+    T_toe, _T_vert, _H_mtp = compute_toe_moment(f_tx, f_ty, x_top, y_top, result.config.shoe_length_m - toe_length)
     return DirectFEMSolution(
         u=u,
         f_t=np.asarray(f_t, dtype=float),
@@ -287,7 +287,7 @@ def run_standard_direct_comparisons(
     """Compare each validation interval against direct FEM for all six affine columns."""
     blocks = get_compliance_block_matrix(result)
     W = build_top_affine_matrix(blocks.x_top, blocks.L, toe_length, kappa)
-    specs = intervals or standard_validation_intervals(result.x_bottom, result.config.L)
+    specs = intervals or standard_validation_intervals(result.x_bottom, result.config.shoe_length_m)
     out: dict[str, list[DirectFEMComparison]] = {}
     for name, spec in specs.items():
         sol = solve_candidate(blocks, spec, W, 0.5 * blocks.L, toe_length=toe_length)

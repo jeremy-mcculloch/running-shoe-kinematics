@@ -55,26 +55,6 @@ def moment_about_origin(
     )
 
 
-def translate_moment(
-    mz_a: float | NDArray[np.float64],
-    fx: float | NDArray[np.float64],
-    fy: float | NDArray[np.float64],
-    *,
-    from_xy: tuple[float, float],
-    to_xy: tuple[float, float],
-) -> NDArray[np.float64]:
-    """Translate planar moment from point A to point B: ``M_B = M_A + r_{A→B} × F``."""
-    dx = from_xy[0] - to_xy[0]
-    dy = from_xy[1] - to_xy[1]
-    # r_A_from_B × F = dx*Fy - dy*Fx when going A→ expressed at B...
-    # M_B = M_A + (x_A - x_B) Fy - (y_A - y_B) Fx
-    return (
-        np.asarray(mz_a, dtype=np.float64)
-        + dx * np.asarray(fy, dtype=np.float64)
-        - dy * np.asarray(fx, dtype=np.float64)
-    )
-
-
 def lab_grf_to_model_top_wrench(
     *,
     times: NDArray[np.float64],

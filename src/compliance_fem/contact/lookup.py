@@ -508,14 +508,6 @@ class ContactLookupResult:
         return list(BASIS_ORDER)
 
     @property
-    def anchor_reference_x(self) -> np.ndarray:
-        return np.asarray(self.contact_anchor_reference_x, dtype=float)
-
-    @property
-    def anchor_reference_y(self) -> np.ndarray:
-        return np.asarray(self.contact_anchor_reference_y, dtype=float)
-
-    @property
     def valid_mask(self) -> np.ndarray:
         if self.record_valid is None:
             return np.ones(self.n_records, dtype=bool)
@@ -538,10 +530,6 @@ class ContactLookupResult:
         if self.contact_type_codes is None:
             raise ValueError(REGENERATE_LOOKUP_MESSAGE)
         return contact_type_from_code(int(self.contact_type_codes[int(row)]))
-
-    def record_sets(self, row: int) -> tuple[np.ndarray, np.ndarray]:
-        """``(free, contact)`` bottom-node ids of one record."""
-        return self.interval(row).sets()
 
     def contact_node_ids(self, row: int) -> np.ndarray:
         return self.interval(row).contact_node_ids
@@ -609,8 +597,8 @@ def get_compliance_block_matrix(result: ComplianceResult) -> ComplianceBlockMatr
         Cbb=np.asarray(result.Cbb_force, dtype=float),
         x_top=x_top,
         x_bottom=x_bottom,
-        L=float(cfg.L),
-        H=float(cfg.H),
+        L=float(cfg.shoe_length_m),
+        H=float(cfg.shoe_height_m),
         reciprocity_error=float(result.reciprocity_error),
         y_top=_optional_array(result.y_top),
         y_bottom=_optional_array(result.y_bottom),

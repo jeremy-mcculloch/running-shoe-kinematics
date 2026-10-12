@@ -49,7 +49,7 @@ def toe_equilibrium_figure(result, i: int, cfg: ToeSpringConfig):
 
     k = float(result.toe_stiffness_Nm_per_rad)
     th0 = float(result.toe_neutral_angle_rad)
-    th = np.linspace(cfg.theta_min_rad, cfg.theta_max_rad, 601)
+    th = np.linspace(cfg.toe_angle_min_rad, cfg.toe_angle_max_rad, 601)
     a = np.tan(th)
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=np.rad2deg(th), y=_frame_q_alpha_curve(result, i, a), name="Q_α shoe→foot(θ)"))

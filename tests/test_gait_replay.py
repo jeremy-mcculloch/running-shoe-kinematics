@@ -10,11 +10,7 @@ import pytest
 from compliance_fem.contact.topology import ContactType
 from compliance_fem.gait.phi_markers import estimate_phi, select_chord_markers
 from compliance_fem.gait.replay import replay_stance, save_replay_result
-from compliance_fem.gait.sagittal import (
-    lab_grf_to_model_top_wrench,
-    moment_about_origin,
-    translate_moment,
-)
+from compliance_fem.gait.sagittal import lab_grf_to_model_top_wrench
 from compliance_fem.gait.stance import detect_stances
 from compliance_fem.gait.temporal import TemporalWeights, viterbi_select
 from compliance_fem.gait.wang_io import (
@@ -132,14 +128,6 @@ def test_force_sign_compression():
         cop_y_lab=np.array([0.0, 0.0]),
     )
     assert wrench.Fy[1] == pytest.approx(-1000.0)
-
-
-def test_wrench_translation_invariance():
-    fx, fy = 10.0, -800.0
-    mz0 = moment_about_origin(fx, fy, 0.12, 0.0, x_o=0.0, y_o=0.0)
-    mz1 = translate_moment(mz0, fx, fy, from_xy=(0.0, 0.0), to_xy=(0.05, 0.0))
-    mz1_direct = moment_about_origin(fx, fy, 0.12, 0.0, x_o=0.05, y_o=0.0)
-    assert float(mz1) == pytest.approx(float(mz1_direct), rel=1e-12)
 
 
 def test_phi_from_markers_and_unwrap():

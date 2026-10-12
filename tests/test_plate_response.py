@@ -31,17 +31,19 @@ from compliance_fem.fem.plate_response import (
     COLOR_UNITS,
     axial_force_from_multiplier,
     extract_plate_mesh_info,
-    extract_plate_nodal_fields,
     hermite_curvature,
     hermite_deflection,
     hermite_rotation,
     hermite_shear,
     plate_mesh_from_lookup,
     plate_state_for_selection,
-    recover_plate_basis_for_record,
-    recover_primal_from_boundary_forces,
     rigid_primal_from_alpha,
     sample_plate_centerline,
+)
+from reference import (
+    extract_plate_nodal_fields,
+    recover_plate_basis_for_record,
+    recover_primal_from_boundary_forces,
 )
 
 from conftest import SMALL_TOE_LENGTH, small_config

@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from compliance_fem.contact.basis import N_AFFINE_COLUMNS
-from compliance_fem.contact.direct_fem import (
+from direct_fem import (
     run_standard_direct_comparisons,
     solve_direct_fem_contact,
     standard_validation_intervals,

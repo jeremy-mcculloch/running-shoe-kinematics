@@ -8,18 +8,15 @@ import numpy as np
 import pytest
 
 from compliance_fem.gait.cop_frames import (
-    cop_foot_to_lab,
     cop_lab_to_foot,
     cop_validity_mask,
     force_induced_moment_about_point,
-    foot_vector_to_lab,
     lab_vector_to_foot,
     model_cop_from_wrench,
-    translate_moment_between_points,
 )
 from compliance_fem.gait.sagittal import lab_grf_to_model_top_wrench
-from compliance_fem.gait.units import resolve_position_units, resolve_units
-from compliance_fem.gait.wang_io import read_opensim_mot, read_wang_forces_csv
+from compliance_fem.gait.units import resolve_moment_units, resolve_position_units
+from compliance_fem.gait.wang_io import read_opensim_mot
 
 
 def test_mot_cop_columns_are_global_lab_axes(tmp_path: Path):
@@ -45,43 +42,14 @@ def test_mot_cop_columns_are_global_lab_axes(tmp_path: Path):
     assert data["source_position_units"] == "m"
 
 
-def test_csv_cx_cy_cz_mapping(tmp_path: Path):
-    csv = tmp_path / "P4 pr1 01.csv"
-    csv.write_text(
-        "\n".join(
-            [
-                "Devices",
-                "1000",
-                ",,Kistler - Force,,,Kistler - Moment,,,Kistler - CoP,,,",
-                "Frame,Sub Frame,Fx,Fy,Fz,Mx,My,Mz,Cx,Cy,Cz",
-                ",,N,N,N,mm.N,mm.N,mm.N,mm,mm,mm",
-                # Cx=ML=100mm, Cy=AP=250mm, Cz=0
-                "1,0,10,20,800,0,0,1000,100,250,0",
-                "2,0,11,21,700,0,0,900,110,260,0",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    data = read_wang_forces_csv(csv, position_units="mm", moment_units="N-mm")
-    assert data["axis_mapping"]["csv_Cx"].startswith("mediolateral")
-    assert data["columns"]["1_force_px"][0] == pytest.approx(0.25)  # Cy mm→m AP
-    assert data["columns"]["1_force_pz"][0] == pytest.approx(0.10)  # Cx ML
-    assert data["columns"]["1_force_py"][0] == pytest.approx(0.0)
-    assert data["columns"]["1_torque_z"][0] == pytest.approx(1.0)  # 1000 N·mm
-
-
 def test_mm_and_nmm_convert_once():
-    u = resolve_units(
-        position_mode="mm",
-        moment_mode="N-mm",
-        sample_positions=np.array([250.0]),
-        sample_moments=np.array([12000.0]),
-    )
-    assert u.position_scale == pytest.approx(1e-3)
-    assert u.moment_scale == pytest.approx(1e-3)
+    _, position_scale, _ = resolve_position_units(declared=None, sample_positions=np.array([250.0]), mode="mm")
+    _, moment_scale, _ = resolve_moment_units(declared=None, sample_moments=np.array([12000.0]), mode="N-mm")
+    assert position_scale == pytest.approx(1e-3)
+    assert moment_scale == pytest.approx(1e-3)
     # Applying scale once
-    assert 250.0 * u.position_scale == pytest.approx(0.25)
-    assert 12000.0 * u.moment_scale == pytest.approx(12.0)
+    assert 250.0 * position_scale == pytest.approx(0.25)
+    assert 12000.0 * moment_scale == pytest.approx(12.0)
 
 
 def test_auto_units_reject_ambiguous_position():
@@ -130,23 +98,13 @@ def test_known_rotation_foot_cop():
     assert foot.y == pytest.approx(-s * 0.2)
 
 
-def test_inverse_recovers_global_cop():
-    phi = np.deg2rad(-15.0)
-    heel_x, heel_y = -1.5, 0.08
-    cop_x, cop_y = -1.35, 0.01
-    foot = cop_lab_to_foot(cop_x, cop_y, heel_x, heel_y, phi)
-    lab = cop_foot_to_lab(foot.x, foot.y, heel_x, heel_y, phi)
-    assert lab.x == pytest.approx(cop_x)
-    assert lab.y == pytest.approx(cop_y)
-
-
 def test_force_rotation_matches_cop_Q():
     phi = np.deg2rad(25.0)
     fx, fy = 100.0, 800.0
-    f_foot = lab_vector_to_foot(fx, fy, phi)
-    back = foot_vector_to_lab(*f_foot, phi)
-    assert back[0] == pytest.approx(fx)
-    assert back[1] == pytest.approx(fy)
+    fx_foot, fy_foot = lab_vector_to_foot(fx, fy, phi)
+    c, s = np.cos(phi), np.sin(phi)
+    assert c * fx_foot - s * fy_foot == pytest.approx(fx)  # Q(phi) v_foot recovers v_lab
+    assert s * fx_foot + c * fy_foot == pytest.approx(fy)
 
 
 def test_upward_grf_produces_compressive_top_force():
@@ -167,11 +125,8 @@ def test_moment_translation_and_rotation_invariance():
     fx, fy = 50.0, -800.0
     # Force through (0.2, 0) about origin
     m0 = force_induced_moment_about_point(fx, fy, 0.2, 0.0, 0.0, 0.0)
-    m_a = translate_moment_between_points(
-        m0, fx, fy, from_xy=(0.0, 0.0), to_xy=(0.1, 0.0)
-    )
-    m_a_direct = force_induced_moment_about_point(fx, fy, 0.2, 0.0, 0.1, 0.0)
-    assert m_a == pytest.approx(m_a_direct)
+    m_a = force_induced_moment_about_point(fx, fy, 0.2, 0.0, 0.1, 0.0)
+    assert m_a == pytest.approx(m0 - 0.1 * fy)  # M_A = M_O - [(r_A - r_O) x F]_z
     # Horizontal force with vertical lever: r=(0,0.05), F=(fx,0) → M = -0.05*fx
     m_h = force_induced_moment_about_point(fx, 0.0, 0.0, 0.05, 0.0, 0.0)
     assert m_h == pytest.approx(-0.05 * fx)

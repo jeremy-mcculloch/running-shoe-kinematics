@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
+from compliance_fem.geometry.profile import load_normalized_sole_csv
 
 import numpy as np
 
@@ -37,10 +38,6 @@ class FoamMaterial:
     E_heel: float
     E_toe: float
     nu: float
-
-    def E(self, x: float | np.ndarray, L: float) -> np.ndarray:
-        x_arr = np.asarray(x, dtype=float)
-        return self.E_heel + (self.E_toe - self.E_heel) * (x_arr / float(L))
 
 def validate_shoe_length_mm(shoe_length_mm) -> float:
     """Return a validated projected heel-to-toe shoe length in millimetres."""
@@ -93,13 +90,11 @@ class SoleConfig:
     element_order: int = 1
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "shoe_length_mm", validate_shoe_length_mm(self.shoe_length_mm))
+        validate_shoe_length_mm(self.shoe_length_mm)
         if self.normalized_geometry is None:
             if self.geometry_csv is None:
                 raise ValueError("Measured-sole geometry requires geometry_csv (normalized CSV path).")
-            from compliance_fem.geometry.profile import load_normalized_sole_csv
-
-            object.__setattr__(self, "normalized_geometry", load_normalized_sole_csv(self.geometry_csv))
+            self.normalized_geometry = load_normalized_sole_csv(self.geometry_csv)
         for name in (self.upper_foam_material, self.lower_foam_material):
             if name not in FOAM_MATERIALS:
                 raise ValueError(f"Unknown foam material {name!r}; expected one of {FOAM_MATERIALS}.")
@@ -131,15 +126,11 @@ class SoleConfig:
 
     @property
     def shoe_length_m(self) -> float:
+        """Shoe length in metres (the lookup length scale)."""
         return float(self.shoe_length_mm) / 1000.0
 
     @property
-    def L(self) -> float:
-        """Projected heel-to-toe length in metres (the lookup length scale)."""
-        return self.shoe_length_m
-
-    @property
-    def H(self) -> float:
+    def shoe_height_m(self) -> float:
         """Vertical extent of the scaled sole (display and lookup scale)."""
         geom = self.normalized_geometry
         ys = np.concatenate([np.asarray(c)[:, 1] for c in geom.curves.values()])

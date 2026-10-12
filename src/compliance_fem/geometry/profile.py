@@ -103,17 +103,6 @@ class NormalizedSoleGeometry:
             "source_filename": self.source_filename,
         }
 
-    @classmethod
-    def from_payload(cls, payload: dict) -> NormalizedSoleGeometry:
-        geom = cls(
-            landmarks={k: (float(v[0]), float(v[1])) for k, v in payload["landmarks"].items()},
-            curves={k: np.asarray(v, dtype=float).reshape(-1, 2) for k, v in payload["curves"].items()},
-            source_filename=str(payload.get("source_filename", "")),
-        )
-        validate_normalized_geometry(geom)
-        return geom
-
-
 def _parse_float(text: str, where: str) -> float:
     try:
         value = float(text)
@@ -136,13 +125,13 @@ def load_normalized_sole_csv(path: str | Path) -> NormalizedSoleGeometry:
         if missing:
             raise GeometryFileError(f"{path.name}: missing columns {missing}; found {list(header)}.")
         landmarks: dict[str, tuple[float, float]] = {}
-        samples: dict[str, dict[int, tuple[float, float]]] = {}
+        raw_curves: dict[str, dict[int, tuple[float, float]]] = {}
         ignored: set[str] = set()
         for line_no, raw in enumerate(reader, start=2):
             row = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in raw.items() if k}
             kind = (row.get("record_type") or "").lower()
             name = row.get("name") or ""
-            where = f"{path.name}:{line_no} ({kind} {name})"
+            where = f"{path.name}:{line_no} ({kind} {name})" # Location of the error if one occurs
             if kind == "point":
                 if name not in REQUIRED_LANDMARKS:
                     ignored.add(name)
@@ -162,7 +151,7 @@ def load_normalized_sole_csv(path: str | Path) -> NormalizedSoleGeometry:
                     index = int(str(index_text))
                 except (TypeError, ValueError) as exc:
                     raise GeometryFileError(f"{where}: curve index {index_text!r} is not an integer.") from exc
-                bucket = samples.setdefault(name, {})
+                bucket = raw_curves.setdefault(name, {})
                 if index in bucket:
                     raise GeometryFileError(f"{where}: duplicate index {index} on curve {name!r}.")
                 bucket[index] = (
@@ -172,16 +161,17 @@ def load_normalized_sole_csv(path: str | Path) -> NormalizedSoleGeometry:
             else:
                 raise GeometryFileError(f"{where}: unknown record_type {kind!r}.")
 
-    missing_landmarks = [n for n in REQUIRED_LANDMARKS if n not in landmarks]
+    missing_landmarks = [x for x in REQUIRED_LANDMARKS if x not in landmarks]
     if missing_landmarks:
         raise GeometryFileError(f"{path.name}: missing landmarks {missing_landmarks}.")
-    missing_curves = [n for n in REQUIRED_CURVES if n not in samples]
+    missing_curves = [x for x in REQUIRED_CURVES if x not in raw_curves]
     if missing_curves:
         raise GeometryFileError(f"{path.name}: missing curves {missing_curves}.")
 
+    # Convert dictionary from int->(float, float) to np array
     curves: dict[str, np.ndarray] = {}
     for name in REQUIRED_CURVES:
-        bucket = samples[name]
+        bucket = raw_curves[name]
         indices = sorted(bucket)
         if indices != list(range(len(indices))):
             raise GeometryFileError(
@@ -455,38 +445,38 @@ def build_sole_geometry(
     interface[0] = landmarks["foam_interface_heel_endpoint"]
     interface[-1] = landmarks["foam_interface_toe_endpoint"]
 
+    ## Project the foam interface endpoints onto the exterior boundary curves and insert the endpoints on the exterior boundary curves (so this interface point exists as a node)
     distances: dict[str, float] = {}
     endpoint_curves: dict[str, str] = {}
-    curves = {TAG_TOP: top, TAG_BOTTOM: bottom, TAG_HEEL: heel_edge}
+    exterior_curves = {TAG_TOP: top, TAG_BOTTOM: bottom, TAG_HEEL: heel_edge}
     for label in ("foam_interface_heel_endpoint", "foam_interface_toe_endpoint"):
-        p = landmarks[label]
-        best = min(
-            ((name, closest_point_on_polyline(poly, p)[3]) for name, poly in curves.items()),
+        foam_interface_endpoint = landmarks[label]
+        best_exterior_curve_name, dist = min(
+            ((name, closest_point_on_polyline(poly, foam_interface_endpoint)[3]) for name, poly in exterior_curves.items()),
             key=lambda item: item[1],
         )
-        name, dist = best
         if dist > tol:
             raise GeometryFileError(
                 f"{label} lies {dist:.3e} m from the exterior boundary (tolerance {tol:.3e} m)."
             )
         # Project onto the exterior so the supplied boundary curves (and the straight
         # heel edge) stay exact; the interface endpoint moves by ``dist`` <= tol.
-        poly = curves[name]
-        if name == TAG_HEEL:
+        best_exterior_curve = exterior_curves[best_exterior_curve_name]
+        if best_exterior_curve_name == TAG_HEEL:
             # Ordering is heel_top -> heel_bottom (x decreasing), so insert by segment.
-            seg, _, proj, _ = closest_point_on_polyline(poly, p)
-            hit = np.flatnonzero(np.hypot(*(poly - proj).T) <= coincide)
+            seg, _, proj, _ = closest_point_on_polyline(best_exterior_curve, foam_interface_endpoint)
+            hit = np.flatnonzero(np.hypot(*(best_exterior_curve - proj).T) <= coincide)
             if hit.size:
-                proj = poly[int(hit[0])].copy()
+                proj = best_exterior_curve[int(hit[0])].copy()
             else:
-                poly = np.insert(poly, seg + 1, proj, axis=0)
+                best_exterior_curve = np.insert(best_exterior_curve, seg + 1, proj, axis=0)
         else:
-            poly, _, _, proj = insert_point_on_polyline(poly, p, tol, use_projection=True, coincide_tol=coincide)
-        curves[name] = poly
-        endpoint_curves[label] = name
+            best_exterior_curve, _, _, proj = insert_point_on_polyline(best_exterior_curve, foam_interface_endpoint, tol, use_projection=True, coincide_tol=coincide)
+        exterior_curves[best_exterior_curve_name] = best_exterior_curve
+        endpoint_curves[label] = best_exterior_curve_name
         distances[label] = float(dist)
         landmarks[f"{label}_projected"] = np.asarray(proj, dtype=float).copy()
-    top, bottom, heel_edge = curves[TAG_TOP], curves[TAG_BOTTOM], curves[TAG_HEEL]
+    top, bottom, heel_edge = exterior_curves[TAG_TOP], exterior_curves[TAG_BOTTOM], exterior_curves[TAG_HEEL]
     interface[0] = landmarks["foam_interface_heel_endpoint_projected"]
     interface[-1] = landmarks["foam_interface_toe_endpoint_projected"]
 
@@ -619,12 +609,6 @@ def build_sole_geometry(
             "n_interface_samples": int(len(normalized.curves["foam_interface"])),
             "ignored_record_names": list(normalized.ignored_names),
         },
-    )
-
-
-def geometry_from_config(config) -> SoleGeometry:
-    return build_sole_geometry(
-        config.normalized_geometry, config.shoe_length_mm, config.landmark_tolerance
     )
 
 

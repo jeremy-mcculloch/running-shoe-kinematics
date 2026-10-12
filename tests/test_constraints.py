@@ -21,7 +21,7 @@ def plate_system():
     mesh_data = generate_mesh(config)
     regions = {name: mesh_data.region_elements(name) for name in (REGION_UPPER, REGION_LOWER)}
     _, basis, _ = assemble_region_foam_stiffness(
-        mesh_data.mesh, regions, config.region_materials(), config.L, config.element_order
+        mesh_data.mesh, regions, config.region_materials(), config.shoe_length_m, config.element_order
     )
     plate_nodes = np.asarray(mesh_data.plate_node_ids, dtype=int)
     coords = np.asarray(mesh_data.mesh.p, dtype=float)[:, plate_nodes]

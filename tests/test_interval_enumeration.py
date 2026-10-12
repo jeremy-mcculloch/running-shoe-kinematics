@@ -20,13 +20,13 @@ from compliance_fem.contact.topology import (
     ContactInterval,
     ContactType,
     enumerate_intervals,
-    interval_arrays,
     interval_label,
     interval_row,
     labels_from_arrays,
     n_intervals,
     validate_interval,
 )
+from reference import interval_arrays
 
 from conftest import SMALL_KAPPA, SMALL_TOE_LENGTH
 

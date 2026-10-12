@@ -23,11 +23,11 @@ from compliance_fem.contact.lookup import CONTACT_ANCHOR_DEFINITION, SCALAR_FX, 
 from compliance_fem.contact.corotation import (
     affine_coefficients,
     basis_coefficients,
-    contact_displacement,
     contract_basis,
     rotation_coefficients,
     rotation_matrix,
 )
+from reference import contact_displacement
 from compliance_fem.contact.force_control import Tolerances, reconstruct_rows
 
 

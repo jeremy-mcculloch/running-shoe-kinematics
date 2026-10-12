@@ -136,22 +136,14 @@ class ToeSpringConfig:
     def __post_init__(self) -> None:
         if self.toe_model not in TOE_MODELS:
             raise ValueError(f"toe_model must be one of {TOE_MODELS}, got {self.toe_model!r}.")
-        k = float(self.toe_stiffness_Nm_per_rad)
-        if not np.isfinite(k) or k < 0.0:
-            raise ValueError(f"toe_stiffness_Nm_per_rad must be finite and >= 0, got {k}.")
-        c = float(self.toe_damping_Nms_per_rad)
-        if not np.isfinite(c) or c < 0.0:
-            raise ValueError(f"toe_damping_Nms_per_rad must be finite and >= 0, got {c}.")
-        th0 = float(self.toe_neutral_angle_rad)
-        if not np.isfinite(th0) or abs(th0) >= 0.5 * np.pi:
-            raise ValueError(f"toe_neutral_angle_rad must lie strictly inside +-pi/2, got {th0}.")
-        lo = float(self.toe_angle_min_deg)
-        hi = float(self.toe_angle_max_deg)
-        if not (np.isfinite(lo) and np.isfinite(hi)) or not (-90.0 < lo < hi < 90.0):
-            raise ValueError(
-                "toe angle bounds must satisfy -90 < toe_angle_min_deg < toe_angle_max_deg < 90, "
-                f"got [{lo}, {hi}]."
-            )
+        if not np.isfinite(self.toe_stiffness_Nm_per_rad) or self.toe_stiffness_Nm_per_rad < 0.0:
+            raise ValueError(f"toe_stiffness_Nm_per_rad must be finite and >= 0, got {self.toe_stiffness_Nm_per_rad}.")
+        if not np.isfinite(self.toe_damping_Nms_per_rad) or self.toe_damping_Nms_per_rad < 0.0:
+            raise ValueError(f"toe_damping_Nms_per_rad must be finite and >= 0, got {self.toe_damping_Nms_per_rad}.")
+        if not np.isfinite(self.toe_neutral_angle_rad) or abs(self.toe_neutral_angle_rad) >= 0.5 * np.pi:
+            raise ValueError(f"toe_neutral_angle_rad must lie strictly inside +-pi/2, got {self.toe_neutral_angle_rad}.")
+        if not (np.isfinite(self.toe_angle_min_deg) and np.isfinite(self.toe_angle_max_deg)) or not (-90.0 < self.toe_angle_min_deg < self.toe_angle_max_deg < 90.0):
+            raise ValueError(f"toe angle bounds must satisfy -90 < toe_angle_min_deg < toe_angle_max_deg < 90, got [{self.toe_angle_min_deg}, {self.toe_angle_max_deg}].")
         if not self.toe_equilibrium_abs_tol_Nm > 0.0:
             raise ValueError("toe_equilibrium_abs_tol_Nm must be positive.")
         if not self.toe_equilibrium_rel_tol >= 0.0:
@@ -162,11 +154,11 @@ class ToeSpringConfig:
             raise ValueError("toe_low_force_threshold_N must be >= 0.")
 
     @property
-    def theta_min_rad(self) -> float:
+    def toe_angle_min_rad(self) -> float:
         return float(np.deg2rad(self.toe_angle_min_deg))
 
     @property
-    def theta_max_rad(self) -> float:
+    def toe_angle_max_rad(self) -> float:
         return float(np.deg2rad(self.toe_angle_max_deg))
 
     def to_dict(self) -> dict:
@@ -308,90 +300,6 @@ def q_alpha_shoe_on_foot_basis(
 # --------------------------------------------------------------------------------------
 # Affine reduction d(alpha), Q(alpha)
 # --------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ToeAffineModel:
-    """Force-controlled reduction for one record (per unit width).
-
-    Local resultant ``F = K_d d + F_alpha alpha + F_r``; prescribing ``F = F*`` gives
-    ``d(alpha) = d0 + d1 alpha`` and ``Q(alpha) = q0 + q1 alpha``.
-    """
-
-    K_d: np.ndarray
-    F_alpha: np.ndarray
-    F_r: np.ndarray
-    d0: np.ndarray
-    d1: np.ndarray
-    q0: float
-    q1: float
-    kd_cond: float
-    kd_smin: float
-    well_conditioned: bool
-
-    def displacement(self, alpha: float) -> np.ndarray:
-        return self.d0 + self.d1 * float(alpha)
-
-    def generalized_force(self, alpha):
-        return self.q0 + self.q1 * np.asarray(alpha, dtype=float)
-
-
-def toe_affine_model(
-    scalars_row: np.ndarray,
-    q_basis_row: np.ndarray,
-    F_local_star: np.ndarray,
-    r_x: float,
-    r_y: float,
-    *,
-    fx_index: int = 0,
-    fy_index: int = 1,
-    cond_limit: float = 1.0e8,
-    smin_threshold: float = 0.0,
-) -> ToeAffineModel:
-    """Build ``d0, d1, q0, q1`` analytically from the stored affine tables.
-
-    The curved-sole closure (affine column 0) enters ``F_r`` and ``q0`` with
-    coefficient 1. ``K_d`` is LU-factored once and both right-hand sides
-    ``F* - F_r`` and ``-F_alpha`` are solved against it; no inverse is formed.
-    """
-    S, q = _affine_tables(scalars_row, q_basis_row)
-    K_d = np.array(
-        [
-            [S[COL_BX, fx_index], S[COL_BY, fx_index]],
-            [S[COL_BX, fy_index], S[COL_BY, fy_index]],
-        ],
-        dtype=float,
-    )
-    F_alpha = np.array([S[COL_ALPHA, fx_index], S[COL_ALPHA, fy_index]], dtype=float)
-    F_r = (
-        np.array([S[COL_CONST, fx_index], S[COL_CONST, fy_index]])
-        + float(r_x) * np.array([S[COL_BRX, fx_index], S[COL_BRX, fy_index]])
-        + float(r_y) * np.array([S[COL_BRY, fx_index], S[COL_BRY, fy_index]])
-    )
-    nan2 = np.full(2, np.nan)
-    finite = (
-        np.all(np.isfinite(K_d))
-        and np.all(np.isfinite(F_alpha))
-        and np.all(np.isfinite(F_r))
-        and np.all(np.isfinite(q))
-    )
-    if not finite:
-        return ToeAffineModel(K_d, F_alpha, F_r, nan2, nan2, np.nan, np.nan, np.inf, np.nan, False)
-    svals = np.linalg.svd(K_d, compute_uv=False)
-    smin = float(svals[-1])
-    cond = float(svals[0] / smin) if smin > 0.0 else float("inf")
-    if smin <= float(smin_threshold) or not np.isfinite(cond) or cond > float(cond_limit):
-        return ToeAffineModel(K_d, F_alpha, F_r, nan2, nan2, np.nan, np.nan, cond, smin, False)
-    lu_piv = linalg.lu_factor(K_d, check_finite=True)
-    rhs = np.column_stack([np.asarray(F_local_star, dtype=float).reshape(2) - F_r, -F_alpha])
-    D = linalg.lu_solve(lu_piv, rhs, check_finite=True)
-    d0 = D[:, 0].copy()
-    d1 = D[:, 1].copy()
-    q_d = np.array([q[COL_BX], q[COL_BY]], dtype=float)
-    q_r = q[COL_CONST] + float(r_x) * q[COL_BRX] + float(r_y) * q[COL_BRY]
-    q0 = float(q_r + q_d @ d0)
-    q1 = float(q[COL_ALPHA] + q_d @ d1)
-    return ToeAffineModel(K_d, F_alpha, F_r, d0, d1, q0, q1, cond, smin, True)
 
 
 _GL_NODES, _GL_WEIGHTS = np.polynomial.legendre.leggauss(32)
@@ -624,7 +532,7 @@ def screen_toe_roots(
 
     k = cfg.toe_stiffness_Nm_per_rad
     th0 = cfg.toe_neutral_angle_rad
-    thetas = np.linspace(cfg.theta_min_rad, cfg.theta_max_rad, int(cfg.toe_root_scan_points))
+    thetas = np.linspace(cfg.toe_angle_min_rad, cfg.toe_angle_max_rad, int(cfg.toe_root_scan_points))
     alpha, z, _, _ = _z_of_theta(thetas, F_fixed, phi_rearfoot, geometry)
     G = coeff @ z + q_offset[:, None] - spring_dU_dalpha(alpha, k, th0)[None, :]
     G[~well] = np.nan
@@ -740,17 +648,6 @@ def toe_residual(alpha, q0: float, q1: float, k: float, theta0: float = 0.0):
     return float(q0) + float(q1) * a - spring_dU_dalpha(a, k, theta0)
 
 
-def total_potential(alpha, q0: float, q1: float, k: float, theta0: float = 0.0):
-    """Reduced potential with Pi'(alpha) = -g(alpha): U - (q0 alpha + q1 alpha^2 / 2)."""
-    a = np.asarray(alpha, dtype=float)
-    return spring_energy(a, k, theta0) - (float(q0) * a + 0.5 * float(q1) * a * a)
-
-
-def potential_curvature(alpha, q1: float, k: float, theta0: float = 0.0):
-    """Pi''(alpha) = d2U/dalpha2 - q1; stable when > 0."""
-    return spring_d2U_dalpha2(alpha, k, theta0) - float(q1)
-
-
 def model_residual(model, alpha, cfg: ToeSpringConfig):
     """g(alpha) = Q(alpha) - dU/dalpha for any generalized-force model (N·m)."""
     a = np.asarray(alpha, dtype=float)
@@ -823,8 +720,8 @@ def solve_toe_equilibrium_model(
     captured by refining local minima of |g| and accepting them only within
     tolerance.
     """
-    lo = cfg.theta_min_rad
-    hi = cfg.theta_max_rad
+    lo = cfg.toe_angle_min_rad
+    hi = cfg.toe_angle_max_rad
     q0 = float(model.generalized_force(0.0))
     q1 = float(model.generalized_force_derivative(0.0))
     if not (np.isfinite(q0) and np.isfinite(q1)):
@@ -936,8 +833,3 @@ def order_toe_roots(
     return sorted(range(n), key=key)
 
 
-def relaxed_root_index(roots: tuple[ToeRoot, ...] | list[ToeRoot], theta0: float = 0.0) -> int | None:
-    """Root on the branch connected to the unloaded neutral state (closest to theta0)."""
-    if not roots:
-        return None
-    return int(np.argmin([abs(r.theta_rad - float(theta0)) for r in roots]))

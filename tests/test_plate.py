@@ -9,7 +9,6 @@ from compliance_fem.fem.plate import (
     assemble_plate_bending,
     element_transformation,
     hermite_bending_matrix,
-    plate_normal_deflection,
 )
 
 
@@ -54,9 +53,7 @@ def test_normal_coupling_to_continuum_displacements() -> None:
     n_p = n_p / np.linalg.norm(n_p)
     u = np.array([0.1, -0.2])
     v = np.array([0.4, 0.5])
-    w = plate_normal_deflection(u, v, n_p)
-    np.testing.assert_allclose(w, n_p[0] * u + n_p[1] * v)
-
+    w = n_p[0] * u + n_p[1] * v
     n_foam = 4
     n_q = n_foam + 2
     T = element_transformation(n_q, 0, 1, 4, 2, 3, 5, n_p)

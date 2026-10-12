@@ -92,7 +92,7 @@ def test_prescribed_boundary_values_and_traction_free_bottom(rocker_lookup) -> N
     assert np.nanmax(lk.solve_residuals) < 1e-8
     fields = lk.record_fields(lk.valid_rows)
     for k, row in enumerate(lk.valid_rows):
-        free, contact = lk.record_sets(row)
+        free, contact = lk.interval(row).sets()
         np.testing.assert_array_equal(fields["reaction_x"][k][:, free], 0.0)
         np.testing.assert_array_equal(fields["reaction_y"][k][:, free], 0.0)
         # The top shape mode prescribes zero contact displacement.

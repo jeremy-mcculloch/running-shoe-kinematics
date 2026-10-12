@@ -10,7 +10,7 @@ import pytest
 
 from compliance_fem.fem.compliance import compute_compliance
 from compliance_fem.contact.basis import COL_ALPHA, MODE_PHI1, shape_mode_phi1
-from compliance_fem.contact.direct_fem import solve_direct_fem_contact
+from direct_fem import solve_direct_fem_contact
 from compliance_fem.contact.lookup import (
     LOOKUP_SCHEMA_VERSION,
     REGENERATE_LOOKUP_MESSAGE,
@@ -32,13 +32,11 @@ from compliance_fem.contact.corotation import (
 from compliance_fem.contact.force_control import evaluate_candidates
 from compliance_fem.gait.passive_toe import pick_instant_best_passive, solve_passive_toe_candidates
 from compliance_fem.gait.replay import replay_stance, resolve_toe_config, save_replay_result
-from compliance_fem.gait.candidate import unilateral_check
 from compliance_fem.contact.toe_spring import (
     DEFAULT_TOE_MODEL,
     TOE_MODEL_PASSIVE_SPRING,
     TOE_MODEL_PASSIVE_SPRING_ELASTIC_EQUIVALENT,
     ToeSpringConfig,
-    potential_curvature,
     q_alpha_foot_on_shoe,
     q_alpha_shoe_on_foot,
     q_theta_from_q_alpha,
@@ -51,11 +49,10 @@ from compliance_fem.contact.toe_spring import (
     spring_energy,
     spring_generalized_force_alpha,
     spring_moment_theta,
-    toe_affine_model,
     toe_residual,
     top_shape_mode_vertical,
-    total_potential,
 )
+from reference import potential_curvature, toe_affine_model, total_potential
 
 from conftest import small_config
 
@@ -484,7 +481,7 @@ def test_low_load_no_spurious_angle(lookup) -> None:
     # Synthetic three-root case: low-load keeps only the branch through theta0.
     q0, q1 = 1e-6, 5.0
     sol = solve_toe_equilibrium(q0, q1, ToeSpringConfig())
-    from compliance_fem.contact.toe_spring import relaxed_root_index
+    from reference import relaxed_root_index
 
     assert sol.n_roots == 3
     assert abs(sol.roots[relaxed_root_index(sol.roots)].theta_deg) < 1e-3
@@ -528,7 +525,7 @@ def test_roots_retained_per_topology(lookup) -> None:
 
 # 22. Both interval edge nodes stay on the ground after solving alpha.
 def test_transition_node_in_contact_after_toe_solve(lookup) -> None:
-    from compliance_fem.contact.corotation import contact_displacement, fixed_frame_normal_component
+    from reference import contact_displacement, fixed_frame_normal_component
 
     cands = solve_passive_toe_candidates(
         lookup, Fx_star=0.0, Fy_star=-5.0e3, Mz_meas=0.0, phi_rad=0.08, config=ToeSpringConfig(), width_m=1.0
@@ -541,8 +538,8 @@ def test_transition_node_in_contact_after_toe_solve(lookup) -> None:
         edges = np.array([lookup.contact_start_index[c.row], lookup.contact_end_index[c.row]], dtype=int)
         assert np.all(lookup.contact_mask[c.row][edges])
         varphi = c.toe.varphi_rad
-        x_a = float(lookup.anchor_reference_x[c.row])
-        y_a = float(lookup.anchor_reference_y[c.row])
+        x_a = float(lookup.contact_anchor_reference_x[c.row])
+        y_a = float(lookup.contact_anchor_reference_y[c.row])
         u_c, v_c = contact_displacement(
             lookup.x_bottom[edges], x_a, c.d_ax, c.d_ay, varphi, y_contact=y_b[edges], y_anchor=y_a
         )
@@ -572,7 +569,14 @@ def test_force_and_toe_residuals_within_tolerance(lookup) -> None:
 
 # 25. Unilateral checks use the solved alpha.
 def test_unilateral_checks_after_alpha(lookup) -> None:
-    from compliance_fem.contact.force_control import Tolerances
+    from compliance_fem.contact.force_control import EXACT_ALL, Tolerances, reconstruct_rows
+
+    def check(row, gamma, varphi):
+        rec = reconstruct_rows(
+            lookup, np.array([row]), np.asarray(gamma, dtype=float)[None, :], varphi, np.zeros(2), Tolerances(),
+            force_threshold=np.inf, full_fields=False, exact=EXACT_ALL,
+        )
+        return float(rec["max_free_penetration"][0]), float(rec["min_contact_reaction"][0])
 
     phi = 0.1
     cands = solve_passive_toe_candidates(
@@ -584,16 +588,13 @@ def test_unilateral_checks_after_alpha(lookup) -> None:
             continue
         varphi = c.toe.varphi_rad
         assert c.gamma[0] == c.alpha
-        uc = unilateral_check(lookup, c.row, c.gamma, varphi, Tolerances())
-        assert uc.max_free_penetration == pytest.approx(c.max_free_penetration, abs=1e-15)
+        pen, min_r = check(c.row, c.gamma, varphi)
+        assert pen == pytest.approx(c.max_free_penetration, abs=1e-15)
+        assert min_r == pytest.approx(c.min_contact_reaction, rel=1e-9, abs=1e-9)
         g0 = c.gamma.copy()
         g0[0] = 0.0
-        uc0 = unilateral_check(lookup, c.row, g0, varphi, Tolerances())
-        assert uc.min_contact_reaction == pytest.approx(c.min_contact_reaction, rel=1e-9, abs=1e-9)
-        n_diff += int(
-            abs(uc0.max_free_penetration - uc.max_free_penetration) > 1e-12
-            or abs(uc0.min_contact_reaction - uc.min_contact_reaction) > 1e-9 * abs(uc.min_contact_reaction)
-        )
+        pen0, min_r0 = check(c.row, g0, varphi)
+        n_diff += int(abs(pen0 - pen) > 1e-12 or abs(min_r0 - min_r) > 1e-9 * abs(min_r))
     assert n_diff > 0
 
 

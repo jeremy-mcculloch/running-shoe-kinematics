@@ -24,11 +24,11 @@ from compliance_fem.gait.passive_toe import pick_instant_best_passive, solve_pas
 from compliance_fem.contact.toe_spring import (
     ToeSpringConfig,
     rearfoot_toe_model,
-    relaxed_root_index,
     solve_toe_equilibrium,
     solve_toe_equilibrium_model,
     spring_dU_dalpha,
 )
+from reference import relaxed_root_index
 
 WIDTH = 0.1
 

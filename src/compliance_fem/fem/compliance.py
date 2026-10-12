@@ -34,6 +34,7 @@ from compliance_fem.fem.rigid_modes import (
     verify_constraint_on_modes,
     verify_rigid_modes,
 )
+from pathlib import Path
 
 COMPLIANCE_SCHEMA_VERSION = 5
 # SoleConfig settings saved in the NPZ under their field names.
@@ -516,7 +517,7 @@ def _boundary_mass_on_nodes(basis, facets: np.ndarray, nodes: np.ndarray) -> spa
     return M[idx][:, idx].tocsc()
 
 
-def compute_compliance(config: SoleConfig, mesh_data=None) -> ComplianceResult:
+def compute_compliance(config: SoleConfig, mesh_path: Path | None = None) -> ComplianceResult:
     """Mesh the two-foam sole with its partial curved plate and compute the nodal-force compliance blocks.
 
     Selectors come from mesh tags in heel-to-toe material order; the shared toe
@@ -526,15 +527,14 @@ def compute_compliance(config: SoleConfig, mesh_data=None) -> ComplianceResult:
     from compliance_fem.geometry.profile import REGION_LOWER, REGION_UPPER, geometry_metadata
     from compliance_fem.geometry.mesh import generate_mesh
 
-    if mesh_data is None:
-        mesh_data = generate_mesh(config)
+    mesh_data = generate_mesh(config, output_msh=mesh_path)
     mesh = mesh_data.mesh
     region_elements = {
         REGION_UPPER: mesh_data.region_elements(REGION_UPPER),
         REGION_LOWER: mesh_data.region_elements(REGION_LOWER),
     }
     K_foam, basis, _ = assemble_region_foam_stiffness(
-        mesh, region_elements, config.region_materials(), config.L, config.element_order
+        mesh, region_elements, config.region_materials(), config.shoe_length_m, config.element_order
     )
     top_nodes = np.asarray(mesh_data.top_selector_nodes, dtype=int)
     bottom_nodes = np.asarray(mesh_data.bottom_selector_nodes, dtype=int)
@@ -594,8 +594,8 @@ def compliance_npz_payload(result: ComplianceResult) -> dict:
         "M_bottom": result.M_bottom.toarray(),
         "x_top": result.x_top,
         "x_bottom": result.x_bottom,
-        "L": cfg.L,
-        "H": cfg.H,
+        "L": cfg.shoe_length_m,
+        "H": cfg.shoe_height_m,
         "rigid_mode_error": result.rigid_mode_error,
         "reciprocity_error": result.reciprocity_error,
         "symmetry_error_Cbb": result.reciprocity.Cbb,

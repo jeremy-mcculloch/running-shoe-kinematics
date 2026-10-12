@@ -13,7 +13,6 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from compliance_fem.contact.force_control import EXACT_ALL, Tolerances, reconstruct_rows
 from compliance_fem.contact.lookup import ContactLookupResult, contact_type_from_code
 from compliance_fem.contact.topology import ContactType
 
@@ -82,15 +81,6 @@ class WrenchCandidate:
         return float(self.diagnostics.get("violation_score", np.inf))
 
 
-@dataclass(frozen=True)
-class UnilateralCheck:
-    max_free_penetration: float
-    min_contact_reaction: float
-    admissible: bool
-    checked: bool
-    diagnostics: dict = field(default_factory=dict)
-
-
 def _candidate_geometry(lookup: ContactLookupResult, row: int) -> dict:
     return {
         "contact_type": contact_type_from_code(int(lookup.contact_type_codes[row])),
@@ -111,33 +101,3 @@ def diagnostics_from_reconstruction(rec: dict, k: int) -> dict:
     return out
 
 
-def unilateral_check(
-    lookup: ContactLookupResult,
-    row: int,
-    gamma: NDArray[np.float64],
-    varphi: float,
-    tol: Tolerances,
-    F_star_fixed: NDArray[np.float64] | None = None,
-) -> UnilateralCheck:
-    """All-node fixed-frame nonpenetration and compression-only checks for one interval.
-
-    Free nodes need ``g >= -tau_g``; contact nodes need ``R_n >= -tau_R`` (the
-    edge nodes and every interior node). Force reconstruction is not part of this
-    check; use ``force_residual`` separately.
-    """
-    gamma = np.asarray(gamma, dtype=float).reshape(1, 5)
-    if not np.all(np.isfinite(gamma)) or not bool(lookup.valid_mask[int(row)]):
-        return UnilateralCheck(float("nan"), float("nan"), False, False)
-    F = np.zeros(2) if F_star_fixed is None else np.asarray(F_star_fixed, dtype=float)
-    rec = reconstruct_rows(
-        lookup, np.array([int(row)]), gamma, float(varphi), F, tol,
-        force_threshold=np.inf, full_fields=False, exact=EXACT_ALL,
-    )
-    sc = rec["scales"]
-    min_gap = float(rec["min_free_gap"][0])
-    min_R = float(rec["min_contact_reaction"][0])
-    ok = bool(rec["finite"][0]) and min_gap >= -sc.tau_g_eff and min_R >= -sc.tau_R_eff
-    return UnilateralCheck(
-        float(rec["max_free_penetration"][0]), min_R, ok, True,
-        diagnostics_from_reconstruction(rec, 0),
-    )

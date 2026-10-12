@@ -84,7 +84,7 @@ The lookup solves \(\mathbf u=\mathbf C\mathbf F+\mathbf R\mathbf a\) with
 \(\mathbf R^\mathsf T\mathbf F=0\); the stored top nodal forces are the
 **load term of \(\mathbf K\mathbf u=\mathbf f\)** at the top DOFs, i.e. the
 force the foot applies **to** the shoe (foot-on-shoe). This was checked
-against direct FEM (`solve_direct_fem_contact(..., gamma=...)`, test 26):
+against direct FEM (`solve_direct_fem_contact(..., gamma=...)` in `tests/direct_fem.py`, test 26):
 \(\mathbf f_t=\mathbf K\mathbf u\) at the top DOFs matches the lookup
 \(\mathbf f_{t,y}\).
 
@@ -193,7 +193,8 @@ both analytic (`toe_spring.RearfootToeModel`). The reported `toe_q0_Nm`,
 `toe_q1_Nm` are \(Q(0)\) and \(Q'(0)\). The model is checked against direct
 superposition at the rotated chord angle and the analytic derivative against
 finite differences. The fixed-frame affine form \(q_0+q_1\alpha\)
-(`toe_affine_model`, `solve_toe_equilibrium`) is kept for synthetic checks.
+(`solve_toe_equilibrium`, with the reference `toe_affine_model` in `tests/reference.py`)
+is kept for synthetic checks.
 Ill-conditioned \(\mathbf K_d\) (condition > `cond_limit`) marks the record failed.
 
 ## Exact equilibrium equation

@@ -8,14 +8,6 @@ import numpy as np
 from numpy.typing import NDArray
 
 @dataclass(frozen=True)
-class LabSagittalPoint:
-    """Point in the laboratory/OpenSim ground sagittal plane (+x anterior, +y up)."""
-
-    x: NDArray[np.float64]
-    y: NDArray[np.float64]
-
-
-@dataclass(frozen=True)
 class FootFramePoint:
     """Point in the heel-attached foot frame (+x heel→toe along φ, +y foot-normal)."""
 
@@ -41,18 +33,6 @@ def lab_vector_to_foot(
     return c * vx + s * vy, -s * vx + c * vy
 
 
-def foot_vector_to_lab(
-    vx_foot: NDArray[np.float64] | float,
-    vy_foot: NDArray[np.float64] | float,
-    phi: NDArray[np.float64] | float,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Rotate a foot-frame vector into the lab frame: ``v_lab = Q(φ) v_foot``."""
-    c, s = rotation_Q(phi)
-    vx = np.asarray(vx_foot, dtype=np.float64)
-    vy = np.asarray(vy_foot, dtype=np.float64)
-    return c * vx - s * vy, s * vx + c * vy
-
-
 def cop_lab_to_foot(
     cop_lab_x: NDArray[np.float64] | float,
     cop_lab_y: NDArray[np.float64] | float,
@@ -70,21 +50,6 @@ def cop_lab_to_foot(
     return FootFramePoint(x=np.asarray(x_f, dtype=np.float64), y=np.asarray(y_f, dtype=np.float64))
 
 
-def cop_foot_to_lab(
-    cop_foot_x: NDArray[np.float64] | float,
-    cop_foot_y: NDArray[np.float64] | float,
-    heel_lab_x: NDArray[np.float64] | float,
-    heel_lab_y: NDArray[np.float64] | float,
-    phi: NDArray[np.float64] | float,
-) -> LabSagittalPoint:
-    """Inverse of :func:`cop_lab_to_foot`."""
-    dx, dy = foot_vector_to_lab(cop_foot_x, cop_foot_y, phi)
-    return LabSagittalPoint(
-        x=np.asarray(heel_lab_x, dtype=np.float64) + dx,
-        y=np.asarray(heel_lab_y, dtype=np.float64) + dy,
-    )
-
-
 def force_induced_moment_about_point(
     fx: NDArray[np.float64] | float,
     fy: NDArray[np.float64] | float,
@@ -97,26 +62,6 @@ def force_induced_moment_about_point(
     rx = np.asarray(point_x, dtype=np.float64) - np.asarray(origin_x, dtype=np.float64)
     ry = np.asarray(point_y, dtype=np.float64) - np.asarray(origin_y, dtype=np.float64)
     return rx * np.asarray(fy, dtype=np.float64) - ry * np.asarray(fx, dtype=np.float64)
-
-
-def translate_moment_between_points(
-    mz_o: NDArray[np.float64] | float,
-    fx: NDArray[np.float64] | float,
-    fy: NDArray[np.float64] | float,
-    *,
-    from_xy: tuple[float, float] | tuple[NDArray[np.float64], NDArray[np.float64]],
-    to_xy: tuple[float, float] | tuple[NDArray[np.float64], NDArray[np.float64]],
-) -> NDArray[np.float64]:
-    """``M_A = M_O - [(r_A - r_O) × F]_z``."""
-    ox, oy = from_xy
-    ax, ay = to_xy
-    dx = np.asarray(ax, dtype=np.float64) - np.asarray(ox, dtype=np.float64)
-    dy = np.asarray(ay, dtype=np.float64) - np.asarray(oy, dtype=np.float64)
-    return (
-        np.asarray(mz_o, dtype=np.float64)
-        - dx * np.asarray(fy, dtype=np.float64)
-        + dy * np.asarray(fx, dtype=np.float64)
-    )
 
 
 def model_cop_from_wrench(

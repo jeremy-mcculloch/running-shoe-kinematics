@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -10,16 +9,6 @@ from numpy.typing import NDArray
 
 PositionUnit = Literal["auto", "m", "mm"]
 MomentUnit = Literal["auto", "N-m", "N-mm"]
-
-
-@dataclass(frozen=True)
-class UnitResolution:
-    source_position_units: str
-    source_moment_units: str
-    position_scale: float  # multiply source → metres
-    moment_scale: float  # multiply source → N·m
-    detection_notes: tuple[str, ...] = ()
-    ambiguous: bool = False
 
 
 def _finite_abs_max(arr: NDArray[np.float64]) -> float:
@@ -101,26 +90,3 @@ def resolve_moment_units(
     )
 
 
-def resolve_units(
-    *,
-    position_mode: PositionUnit = "auto",
-    moment_mode: MomentUnit = "auto",
-    declared_position: str | None = None,
-    declared_moment: str | None = None,
-    sample_positions: NDArray[np.float64] | None = None,
-    sample_moments: NDArray[np.float64] | None = None,
-) -> UnitResolution:
-    pos_u, pos_s, pos_notes = resolve_position_units(
-        declared=declared_position, sample_positions=sample_positions, mode=position_mode
-    )
-    mom_u, mom_s, mom_notes = resolve_moment_units(
-        declared=declared_moment, sample_moments=sample_moments, mode=moment_mode
-    )
-    return UnitResolution(
-        source_position_units=pos_u,
-        source_moment_units=mom_u,
-        position_scale=pos_s,
-        moment_scale=mom_s,
-        detection_notes=tuple(pos_notes + mom_notes),
-        ambiguous=False,
-    )

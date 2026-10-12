@@ -94,17 +94,6 @@ def rotate_vector_to_fixed(vx_local: np.ndarray, vy_local: np.ndarray, varphi: f
     return c * vx - s * vy, s * vx + c * vy
 
 
-def fixed_frame_normal_component(dx_local: np.ndarray, dy_local: np.ndarray, varphi: float) -> np.ndarray:
-    """Ground-normal (fixed-frame y) component of a local vector.
-
-    Used for both the signed nonpenetration gap and the compression-only
-    normal reaction: ``sin(varphi) dx^T + cos(varphi) dy^T``.
-    """
-    c = float(np.cos(varphi))
-    s = float(np.sin(varphi))
-    return s * np.asarray(dx_local, dtype=float) + c * np.asarray(dy_local, dtype=float)
-
-
 def rotation_coefficients(varphi: float) -> tuple[float, float]:
     """Return (r_x, r_y) = (cos(varphi) - 1, -sin(varphi))."""
     return float(np.cos(varphi) - 1.0), float(-np.sin(varphi))
@@ -191,39 +180,6 @@ def contract_basis(basis: np.ndarray, gamma: np.ndarray, mode_axis: int = 0) -> 
             f"{N_AFFINE_COEFFICIENTS} (affine) or {N_BASIS_COEFFICIENTS} (linear)."
         )
     return np.tensordot(g, arr, axes=([0], [axis]))
-
-
-def contact_displacement(
-    x_contact: np.ndarray,
-    x_anchor: float,
-    d_ax: float,
-    d_ay: float,
-    varphi: float,
-    y_contact: np.ndarray | None = None,
-    y_anchor: float = 0.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Exact prescribed contact displacement in the rotating frame.
-
-    ``d_c^T(x) = d_a^T + (Q(varphi)^T - I)(x - x_a, 0) + (0, -(y - y_a))``:
-
-        u_c = d_ax + (cos(varphi) - 1)(x - x_anchor)
-        v_c = d_ay - sin(varphi)(x - x_anchor) - (y - y_anchor)
-
-    The last term is the curved-sole closure (zero for a flat sole); it is
-    independent of ``varphi`` and is not rotated. The expression is identical
-    for every interval, with no sign branching on the topology.
-
-    The apparent infinitesimal axial strain in the ``u_c`` term is an accepted
-    approximation of this project; it is not replaced by a small-angle form.
-    """
-    x = np.asarray(x_contact, dtype=float)
-    ds = x - float(x_anchor)
-    r_x, r_y = rotation_coefficients(varphi)
-    u = float(d_ax) + r_x * ds
-    v = float(d_ay) + r_y * ds
-    if y_contact is not None:
-        v = v - (np.asarray(y_contact, dtype=float) - float(y_anchor))
-    return u, v
 
 
 def transform_to_fixed_frame(

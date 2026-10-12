@@ -81,16 +81,6 @@ def plate_translational_dofs(
     return u_dofs, v_dofs
 
 
-def plate_normal_deflection(
-    u: np.ndarray,
-    v: np.ndarray,
-    n_p: np.ndarray,
-) -> np.ndarray:
-    """Return w_j = n_p · u_j at plate nodes."""
-    n_p = np.asarray(n_p, dtype=float).reshape(2)
-    return n_p[0] * np.asarray(u, dtype=float) + n_p[1] * np.asarray(v, dtype=float)
-
-
 def element_transformation(
     n_q: int,
     u_i: int,

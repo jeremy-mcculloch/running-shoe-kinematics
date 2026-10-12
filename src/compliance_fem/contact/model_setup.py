@@ -28,6 +28,7 @@ fingerprint of the build-relevant parameters in their metadata, so
 
 from __future__ import annotations
 
+from calendar import c
 import hashlib
 import json
 import math
@@ -40,7 +41,8 @@ from typing import Union, get_args, get_origin, get_type_hints
 
 import numpy as np
 
-from compliance_fem.contact.config import SoleConfig
+from compliance_fem import compute_compliance
+from compliance_fem.contact.sole_config import SoleConfig
 from compliance_fem.contact.toe_spring import ToeSpringConfig
 
 CONFIG_SCHEMA_VERSION = 2
@@ -120,7 +122,7 @@ class ModelSetup:
     @property
     def toe_length_m(self) -> float:
         """Toe length in metres; the softplus joint sits at ``x = L - toe_length``."""
-        return self.lookup.toe_length_m(self.sole.L)
+        return self.lookup.toe_length_m(self.sole.shoe_length_m)
 
     @property
     def softplus_kappa(self) -> float:
@@ -241,7 +243,7 @@ def model_setup_from_dict(data: dict, *, base_dir: Path | str | None = None, sou
     if not isinstance(data, dict):
         raise ConfigFileError("Configuration must be a JSON object.")
     base = None if base_dir is None else Path(base_dir).resolve()
-    section_classes = _config_sections()
+    section_classes = _config_sections() # Dictionary of section name -> settings dataclass for each config section in ModelSetup
 
     # Ensures all top level keys are allowed.
     top_keys = _EXTRA_TOP_KEYS | set(section_classes)
@@ -254,20 +256,20 @@ def model_setup_from_dict(data: dict, *, base_dir: Path | str | None = None, sou
             f"Unsupported config schema_version={version}; this code reads schema_version={CONFIG_SCHEMA_VERSION}."
         )
 
-    kwargs: dict[str, dict] = {}
+    parsed_data: dict[str, dict] = {} # Dictionary of section name -> parsed data for each config section in ModelSetup
     for name, cls in section_classes.items():
         hints = get_type_hints(cls)
         file_fields = [f.name for f in _file_fields(cls)] # List of config class fields
-        sec = _section(data, name, file_fields)
-        kwargs[name] = {
+        sec = _section(data, name, file_fields) # Tests for unknown / misspelled keys in the section
+        parsed_data[name] = {
             key: _parse_value(sec[key], hints[key], key, f"{name}.{key}", base) for key in file_fields if key in sec
         }
     for name, key in _REQUIRED:
-        if key not in kwargs[name]:
+        if key not in parsed_data[name]:
             raise ConfigFileError(f"{name}.{key} is required.")
 
     try:
-        sections = {name: cls(**kwargs[name]) for name, cls in section_classes.items()}
+        sections = {name: cls(**parsed_data[name]) for name, cls in section_classes.items()}
     except ConfigFileError:
         raise
     except (ValueError, FileNotFoundError) as exc:
@@ -415,24 +417,30 @@ def ensure_lookup_exists(
 
     setup = config if isinstance(config, ModelSetup) else load_model_setup(config)
     out = Path(output_dir) if output_dir is not None else (setup.output_dir or DEFAULT_LOOKUP_DIR)
-    fem_dir = out / "fem" if save_fem else None
     say = (lambda msg: None) if quiet else print
+
+    # Directory to save fem mesh
+    mesh_dir = None
+    if save_fem:
+        fem_dir = out / "fem" 
+        fem_dir.mkdir(parents=True, exist_ok=True)
+        mesh_dir = fem_dir / "mesh.msh"
 
     existing = None if force else matching_prebuilt_lookup(setup, out)
     if existing is not None:
         say(f"Contact lookup {existing} is up to date with {setup.source_path or 'the setup'}; pass force to rebuild.")
         if fem_dir is not None:
-            _save_fem_outputs(_compute_fem(setup, fem_dir), setup, fem_dir, say, plots=not skip_plots)
+            _save_fem_outputs(compute_compliance(setup.sole, mesh_path=mesh_dir), setup, fem_dir, say, plots=not skip_plots)
         return existing
 
-    fem = _compute_fem(setup, fem_dir)
+    compliance = compute_compliance(setup.sole, mesh_path=mesh_dir)
     t0 = time.perf_counter()
     lookup = generate_contact_lookup(
-        get_compliance_block_matrix(fem),
+        get_compliance_block_matrix(compliance),
         toe_length=setup.toe_length_m,
         kappa=setup.softplus_kappa,
         reciprocity_tol=setup.lookup.reciprocity_tol,
-        fem_result=fem,
+        fem_result=compliance,
         progress=None if quiet else (lambda done, total: _print_progress(done, total, t0)),
         store_fields=setup.lookup.store_nodal_fields,
     )
@@ -443,7 +451,7 @@ def ensure_lookup_exists(
         save_lookup_plots(lookup, out)
     _write_lookup_summary(lookup, setup, npz_path, out, say)
     if fem_dir is not None:
-        _save_fem_outputs(fem, setup, fem_dir, say, plots=not skip_plots)
+        _save_fem_outputs(compliance, setup, fem_dir, say, plots=not skip_plots)
     return npz_path
 
 
@@ -454,18 +462,7 @@ def _print_progress(done: int, total: int, t0: float) -> None:
     if done == total:
         sys.stdout.write("\n")
     sys.stdout.flush()
-
-
-def _compute_fem(setup: ModelSetup, fem_dir: Path | None):
-    """FEM compliance; with ``fem_dir`` the Gmsh mesh is also written there."""
-    from compliance_fem.fem.compliance import compute_compliance
-    from compliance_fem.geometry.mesh import generate_mesh
-
-    if fem_dir is None:
-        return compute_compliance(setup.sole)
-    fem_dir.mkdir(parents=True, exist_ok=True)
-    return compute_compliance(setup.sole, mesh_data=generate_mesh(setup.sole, output_msh=fem_dir / "mesh.msh"))
-
+    
 
 def _save_fem_outputs(fem, setup: ModelSetup, fem_dir: Path, say, *, plots: bool) -> None:
     """Compliance NPZ, ParaView mesh, compliance heatmaps and the FEM residual checks."""
