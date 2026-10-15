@@ -10,7 +10,12 @@ import streamlit as st
 from compliance_fem.contact.lookup import load_contact_lookup
 from compliance_fem.gait.download import write_data_readme
 from compliance_fem.gait.replay import replay_stance, save_replay_result
-from compliance_fem.gui.gait_plots import plotly_foot_animation_figure
+from compliance_fem.gui.gait_plots import (
+    animation_frame_stride,
+    plotly_foot_animation_figure,
+    stance_strain_energy,
+    strain_energy_stance_figure,
+)
 from compliance_fem.gait.wang_io import discover_trials
 from compliance_fem.contact.toe_spring import (
     TOE_MODEL_PASSIVE_SPRING,
@@ -232,7 +237,12 @@ def render_gait_replay_page() -> None:
                 toe_angle_max_deg=float(toe_max),
                 toe_low_force_threshold_N=float(toe_low),
             )
-            with st.spinner("Replaying stance…"):
+            bar = st.progress(0.0, text="Replaying stance…")
+
+            def _progress(done: int, total: int) -> None:
+                bar.progress(done / max(total, 1), text=f"Replaying stance… frame {done}/{total}")
+
+            try:
                 result = replay_stance(
                     lookup,
                     trc_path=trc_path,
@@ -243,7 +253,10 @@ def render_gait_replay_page() -> None:
                     toe_config=toe_cfg,
                     shoe_width_m=float(shoe_width),
                     visco_model=visco,
+                    progress=_progress,
                 )
+            finally:
+                bar.empty()
         except ValueError as exc:
             st.error(str(exc))
             return
@@ -273,7 +286,7 @@ def render_gait_replay_page() -> None:
     scale_mode = "true"
     manual_scale = 1.0
 
-    play_cols = st.columns([1.2, 1.2, 1.5])
+    play_cols = st.columns([1.2, 1.0, 1.5, 1.5])
     with play_cols[0]:
         play_fps = float(
             st.number_input(
@@ -288,10 +301,25 @@ def render_gait_replay_page() -> None:
         )
     with play_cols[1]:
         loop_play = st.checkbox("Loop", value=True, key="gait_play_loop")
+    with play_cols[3]:
+        energy_colors = st.checkbox(
+            "Strain energy colours",
+            value=True,
+            key="gait_energy_colors",
+            help=(
+                "Colour the foam mesh and plate by strain energy density (fixed scales over the "
+                "stance). Heavier figure: at most 75 animated frames, so long stances skip frames."
+            ),
+        )
+    lookup_cached = st.session_state.get("gait_replay_lookup")
+    stride = (
+        animation_frame_stride(lookup_cached, result, energy=energy_colors) if lookup_cached is not None else 1
+    )
     with play_cols[2]:
         if n_frames >= 2:
             dt_med = float(np.median(np.diff(t)))
-            realtime_fps = (1.0 / dt_med) if dt_med > 1e-12 else 10.0
+            # Each animated frame spans `stride` replay samples.
+            realtime_fps = (1.0 / (dt_med * stride)) if dt_med > 1e-12 else 10.0
             if st.button(
                 f"Realtime (~{realtime_fps:.0f} fps)",
                 key="gait_play_realtime",
@@ -322,6 +350,7 @@ def render_gait_replay_page() -> None:
             float(play_fps),
             bool(loop_play),
             str(lookup_path),
+            bool(energy_colors),
         )
         if (
             st.session_state.get("gait_anim_key") != anim_key
@@ -336,6 +365,7 @@ def render_gait_replay_page() -> None:
                         manual_scale=manual_scale,
                         fps=play_fps,
                         loop=loop_play,
+                        energy=energy_colors,
                     )
                     st.session_state["gait_anim_key"] = anim_key
                 except Exception as exc:  # noqa: BLE001
@@ -349,10 +379,26 @@ def render_gait_replay_page() -> None:
                 use_container_width=True,
                 key="gait_foot_animation",
             )
+            anim_stride = int((fig_anim.layout.meta or {}).get("frame_stride", 1))
+            if anim_stride > 1:
+                st.caption(f"Animating every {anim_stride}th replay frame (strain energy colours).")
             st.caption(
                 "Use the figure’s Play / Pause and slider for flicker-free playback "
                 "(animation runs in the browser; traces update in place so the prior "
                 "outline stays until the next frame is ready)."
+            )
+
+        energy_key = (id(result), str(lookup_path))
+        if st.session_state.get("gait_energy_key") != energy_key:
+            with st.spinner("Computing strain energy over stance…"):
+                st.session_state["gait_energy_series"] = stance_strain_energy(lookup, result)
+                st.session_state["gait_energy_key"] = energy_key
+        series = st.session_state["gait_energy_series"]
+        if np.any(np.isfinite(series["foam_J"])) or np.any(np.isfinite(series["plate_J"])):
+            st.plotly_chart(strain_energy_stance_figure(series), use_container_width=True, key="gait_energy_plot")
+            st.caption(
+                "Total elastic strain energy over the whole shoe width (lookup per-metre values × "
+                "shoe width). Foam: Σ W·A over the mesh; plate: ∫ ½EIκ² ds. The axes are independent."
             )
 
     @st.fragment

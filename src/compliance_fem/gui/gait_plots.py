@@ -77,6 +77,8 @@ def shape_for_frame(
     n_plot: int = 120,
     show_plate: bool | None = None,
     samples_per_element: int = 16,
+    plate_color_quantity: str = "none",
+    foam_energy: bool = False,
 ) -> ShapePlotData:
     """Fixed-frame deformed geometry for one replay frame.
 
@@ -95,6 +97,8 @@ def shape_for_frame(
         show_plate=bool(show_plate),
         show_undeformed_plate=False,
         samples_per_element=int(samples_per_element),
+        plate_color_quantity=plate_color_quantity,
+        foam_energy=foam_energy,
     )
 
 
@@ -178,6 +182,18 @@ def _anchor_trace(p: dict[str, Any]):
     )
 
 
+MAX_ENERGY_FRAMES = 75
+
+
+def animation_frame_stride(lookup: ContactLookupResult, result: GaitReplayResult, *, energy: bool = True,
+                           max_energy_frames: int = MAX_ENERGY_FRAMES) -> int:
+    """Replay frames per animation frame: >1 only when foam energy colouring is on and frames are many."""
+    n_valid = int(np.count_nonzero(np.asarray(result.record_index) >= 0))
+    if not (energy and getattr(lookup, "render_section", None)) or n_valid <= max_energy_frames:
+        return 1
+    return int(np.ceil(n_valid / max(int(max_energy_frames), 1)))
+
+
 def plotly_foot_animation_figure(
     lookup: ContactLookupResult,
     result: GaitReplayResult,
@@ -188,19 +204,36 @@ def plotly_foot_animation_figure(
     loop: bool = True,
     n_plot: int = 80,
     samples_per_element: int = 4,
+    energy: bool = True,
+    max_energy_frames: int = MAX_ENERGY_FRAMES,
 ):
     """Client-side animated shoe outline (no Streamlit redraw between frames).
 
     Frames only patch ``x``/``y`` on existing traces with ``redraw=False`` so the
     previous outline stays visible until the next frame is applied (no white flash).
+
+    With ``energy`` (and a lookup with a render section / plate response), the
+    foam mesh and the plate are coloured by strain energy density on colour
+    scales fixed over the whole stance. Each foam frame is ~0.2 MB, so only every
+    k-th replay frame is animated, at most ``max_energy_frames`` frames.
     """
     import plotly.graph_objects as go
 
+    from compliance_fem.plotting.energy_plotly import (
+        energy_display_max,
+        foam_energy_traces,
+        plate_energy_traces,
+    )
+
     n = int(result.times.size)
+    valid = [i for i in range(n) if int(result.record_index[i]) >= 0]
+    foam_on = bool(energy and getattr(lookup, "render_section", None))
+    plate_on = bool(energy and getattr(lookup, "has_plate_response", False))
+    stride = animation_frame_stride(lookup, result, energy=energy, max_energy_frames=max_energy_frames)
     payloads: list[dict[str, Any]] = []
-    for i in range(n):
-        if int(result.record_index[i]) < 0:
-            continue
+    shapes: list[ShapePlotData] = []
+    frame_index: list[int] = []
+    for i in valid[::stride]:
         try:
             shape = shape_for_frame(
                 lookup,
@@ -210,16 +243,40 @@ def plotly_foot_animation_figure(
                 manual_scale=manual_scale,
                 n_plot=n_plot,
                 samples_per_element=samples_per_element,
+                plate_color_quantity="strain_energy_density" if plate_on else "none",
+                foam_energy=foam_on,
             )
             payloads.append(_foot_xy_payload(shape))
+            shapes.append(shape)
+            frame_index.append(i)
         except (ValueError, AssertionError):
             continue
 
     if not payloads:
         raise ValueError("No valid frames for foot animation")
 
-    n_traces = 10
-    trace_ids = list(range(n_traces))
+    foam_on = foam_on and all(sh.foam_energy_density is not None for sh in shapes)
+    plate_on = plate_on and all(
+        sh.plate_color_quantity == "strain_energy_density" and sh.plate_color_values is not None for sh in shapes
+    )
+    foam_vmax = max(energy_display_max(sh.foam_energy_density) for sh in shapes) if foam_on else 1.0
+    plate_vmax = max(energy_display_max(sh.plate_color_values) for sh in shapes) if plate_on else 1.0
+
+    def _energy_traces(sh: ShapePlotData, *, colorbar: bool) -> tuple[list, list]:
+        foam, plate = [], []
+        if foam_on:
+            assert sh.foam_triangles is not None and sh.foam_energy_density is not None
+            assert sh.foam_x_def is not None and sh.foam_y_def is not None
+            foam = foam_energy_traces(
+                sh.foam_triangles, sh.foam_x_def, sh.foam_y_def, sh.foam_energy_density,
+                vmax=foam_vmax, show_colorbar=colorbar,
+            )
+        if plate_on:
+            px = sh.plate_x_def if sh.plate_x_def is not None else sh.x_plate_def
+            py = sh.plate_y_def if sh.plate_y_def is not None else sh.y_plate_def
+            assert px is not None and py is not None and sh.plate_color_values is not None
+            plate = plate_energy_traces(px, py, sh.plate_color_values, vmax=plate_vmax, show_colorbar=colorbar)
+        return foam, plate
 
     def _base_traces(p: dict[str, Any]) -> list:
         return [
@@ -293,6 +350,10 @@ def plotly_foot_animation_figure(
             _anchor_trace(p),
         ]
 
+    def _ordered(base: list, foam: list, plate: list) -> list:
+        """Foam bins under the outlines, plate energy over the plain plate line."""
+        return [base[0], base[1], *foam, *base[2:5], *plate, *base[5:]]
+
     def _xy_patch(p: dict[str, Any]) -> list:
         # Partial updates only — keeps prior pixels until the patch applies.
         return [
@@ -361,15 +422,37 @@ def plotly_foot_animation_figure(
     else:
         play_sequence = None  # None → play all frames once from current
 
+    base0 = _base_traces(payloads[0])
+    if foam_on:
+        base0[1].update(fillcolor="rgba(0,0,0,0)", showlegend=False)  # the energy mesh replaces the flat fill
+    if plate_on:
+        base0[4].update(showlegend=False)  # the energy plate carries the legend entry
+    foam0, plate0 = _energy_traces(shapes[0], colorbar=True)
+    # Colorbar traces (last of each energy list) are static; every other trace is patched.
+    foam_bars = foam0[-1:] if foam_on else []
+    plate_bars = plate0[-1:] if plate_on else []
+    data0 = _ordered(base0, foam0[: len(foam0) - len(foam_bars)], plate0[: len(plate0) - len(plate_bars)])
+    trace_ids = list(range(len(data0)))
+    data0 = data0 + foam_bars + plate_bars
+
+    def _frame_data(p: dict[str, Any], sh: ShapePlotData) -> list:
+        foam, plate = _energy_traces(sh, colorbar=False)
+        return _ordered(
+            _xy_patch(p),
+            [go.Scatter(x=t.x, y=t.y) for t in foam],
+            [go.Scatter(x=t.x, y=t.y) for t in plate],
+        )
+
     frames = [
         go.Frame(
-            data=_xy_patch(p),
+            data=_frame_data(p, sh),
             traces=trace_ids,
             name=str(k),
         )
-        for k, p in enumerate(payloads)
+        for k, (p, sh) in enumerate(zip(payloads, shapes))
     ]
-    fig = go.Figure(data=_base_traces(payloads[0]), frames=frames)
+    fig = go.Figure(data=data0, frames=frames)
+    fig.layout.meta = {"frame_stride": int(stride)}
     fig.update_layout(
         title=payloads[0]["title"],
         uirevision="gait-foot-animation",
@@ -443,11 +526,87 @@ def plotly_foot_animation_figure(
                                 "transition": {"duration": 0},
                             },
                         ],
-                        label=str(k),
+                        label=str(frame_index[k]),
                     )
                     for k in range(len(payloads))
                 ],
             )
         ],
+    )
+    return fig
+
+
+def stance_strain_energy(
+    lookup: ContactLookupResult,
+    result: GaitReplayResult,
+    *,
+    samples_per_element: int = 16,
+) -> dict[str, np.ndarray]:
+    """Total strain energy (J, whole shoe width) in the foam and in the plate per replay frame.
+
+    Foam: ``sum_e W_e A_e`` over the mesh (``element_strain_energy_density``).
+    Plate: ``int 1/2 EI kappa^2 ds`` over its Hermite samples (trapezoid). Both
+    are per metre width in the lookup and are multiplied by ``shoe_width_m``.
+    Frames without a selected record, or a lookup without the render section /
+    plate response, give NaN.
+    """
+    from compliance_fem.fem.plate_response import plate_state_for_selection
+    from compliance_fem.geometry.render import element_areas, element_strain_energy_density
+    from compliance_fem.plotting.shape_render import _render_displacements
+
+    n = int(result.times.size)
+    width = float(result.model_info.get("shoe_width_m", 1.0))
+    foam = np.full(n, np.nan)
+    plate = np.full(n, np.nan)
+    has_foam = bool(getattr(lookup, "render_section", None))
+    has_plate = bool(getattr(lookup, "has_plate_response", False))
+    areas = element_areas(lookup) if has_foam else None
+    for i in range(n):
+        if int(result.record_index[i]) < 0:
+            continue
+        sel = selection_proxy_for_frame(lookup, result, i)
+        if has_foam and areas is not None:
+            u, v = _render_displacements(lookup, sel)
+            foam[i] = width * float(element_strain_energy_density(lookup, u, v) @ areas)
+        if has_plate:
+            state = plate_state_for_selection(
+                lookup, sel, samples_per_element=samples_per_element,  # type: ignore[arg-type]
+                color_quantity="strain_energy_density",
+            )
+            if state is not None and state.color_values is not None:
+                plate[i] = width * float(np.trapezoid(state.color_values, state.sample_s))
+    return {"times": np.asarray(result.times, dtype=float), "foam_J": foam, "plate_J": plate}
+
+
+def strain_energy_stance_figure(series: dict[str, np.ndarray]):
+    """Foam (left axis) and plate (right axis) strain energy over the stance."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    from compliance_fem.plotting.energy_plotly import FOAM_ENERGY_COLORSCALE, PLATE_ENERGY_COLORSCALE
+
+    foam_color = FOAM_ENERGY_COLORSCALE[-1][1]
+    plate_color = PLATE_ENERGY_COLORSCALE[-2][1]
+    t = series["times"]
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Scatter(x=t, y=series["foam_J"], name="foam", line=dict(color=foam_color, width=2.5),
+                   hovertemplate="t=%{x:.4f} s<br>foam %{y:.4g} J<extra></extra>"),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(x=t, y=series["plate_J"], name="plate", line=dict(color=plate_color, width=2.5),
+                   hovertemplate="t=%{x:.4f} s<br>plate %{y:.4g} J<extra></extra>"),
+        secondary_y=True,
+    )
+    fig.update_xaxes(title_text="t (s)")
+    fig.update_yaxes(title_text="foam strain energy (J)", color=foam_color, rangemode="tozero", secondary_y=False)
+    fig.update_yaxes(title_text="plate strain energy (J)", color=plate_color, rangemode="tozero",
+                     showgrid=False, secondary_y=True)
+    fig.update_layout(
+        title="Strain energy stored over stance (separate axes)",
+        height=380,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(l=60, r=60, t=70, b=50),
     )
     return fig

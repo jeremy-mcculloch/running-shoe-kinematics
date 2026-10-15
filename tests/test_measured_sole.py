@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from matplotlib.path import Path as MplPath
 
 from compliance_fem.fem.compliance import (
     SOLE_SCALAR_FIELDS,
@@ -48,8 +49,6 @@ from compliance_fem.geometry.profile import (
     build_sole_geometry,
     distance_to_polyline,
     load_normalized_sole_csv,
-    point_in_polygon,
-    polyline_self_intersections,
 )
 from compliance_fem.geometry.mesh import MeshQualityError, generate_mesh
 from compliance_fem.fem.plate import assemble_plate_bending, plate_element_frames
@@ -83,8 +82,7 @@ def _write_rows(path: Path, rows: list[dict]) -> Path:
 def _subsampled_rows(step: int = 5) -> list[dict]:
     """Every ``step``-th sample (bottom kept dense near the toe, where the interface meets it)."""
     rows = _read_rows(CSV_PATH)
-    points = [r for r in rows if r["record_type"] == "point"]
-    out = list(points)
+    out = [r for r in rows if r["record_type"] == "plate"]
     by_curve: dict[str, list[dict]] = {}
     for r in rows:
         if r["record_type"] == "curve":
@@ -177,16 +175,18 @@ def test_bad_shoe_length_rejected(bad) -> None:
 @pytest.mark.parametrize("length_mm", [240.0, 270.0, 310.0])
 def test_toe_and_heel_mapping(meas_cfg, length_mm) -> None:
     g = build_sole_geometry(meas_cfg.normalized_geometry, length_mm)
-    assert g.landmarks["toe_tip"][0] == pytest.approx(length_mm / 1000.0, rel=1e-12)
-    np.testing.assert_allclose(g.landmarks["heel_bottom"], [0.0, 0.0], atol=1e-15)
+    assert g.toe_tip[0] == pytest.approx(length_mm / 1000.0, rel=1e-12)
+    np.testing.assert_allclose(g.heel_bottom, [0.0, 0.0], atol=1e-15)
 
 
 # 5-6. One common scale for both axes; aspect ratio preserved.
 def test_uniform_scale_and_aspect(meas_cfg, meas_geom) -> None:
     norm = meas_cfg.normalized_geometry
     s = SHOE_MM / 1000.0
-    for name, p in norm.landmarks.items():
-        np.testing.assert_allclose(meas_geom.landmarks[name], s * np.asarray(p), rtol=0, atol=1e-15)
+    # Every supplied sample appears, scaled by s, among the SI curve vertices.
+    for name, curve in (("top_surface", meas_geom.top), ("bottom_surface", meas_geom.bottom)):
+        for q in s * np.asarray(norm.curves[name]):
+            assert np.min(np.hypot(*(curve - q).T)) <= 1e-15
     top_n = np.asarray(norm.curves["top_surface"])
     ratio_n = np.ptp(top_n[:, 1]) / np.ptp(top_n[:, 0])
     ratio_p = np.ptp(meas_geom.top[:, 1]) / np.ptp(meas_geom.top[:, 0])
@@ -203,16 +203,16 @@ def test_metres_before_assembly(meas_mesh) -> None:
 # 8-9. No sign flip, no second reversal.
 def test_no_flip_no_reversal(meas_geom) -> None:
     g = meas_geom
-    np.testing.assert_array_equal(g.top[0], g.landmarks["heel_top"])
-    np.testing.assert_array_equal(g.top[-1], g.landmarks["toe_tip"])
-    np.testing.assert_array_equal(g.bottom[0], g.landmarks["heel_bottom"])
-    np.testing.assert_array_equal(g.bottom[-1], g.landmarks["toe_tip"])
+    np.testing.assert_array_equal(g.top[0], g.heel_top)
+    np.testing.assert_array_equal(g.top[-1], g.toe_tip)
+    np.testing.assert_array_equal(g.bottom[0], g.heel_bottom)
+    np.testing.assert_array_equal(g.bottom[-1], g.toe_tip)
     for curve in (g.top, g.bottom, g.interface):
         assert np.all(np.diff(curve[:, 0]) > 0.0)
     x = np.linspace(0.05, 0.9, 20) * L_M
     assert np.all(np.interp(x, g.top[:, 0], g.top[:, 1]) > np.interp(x, g.bottom[:, 0], g.bottom[:, 1]))
     assert g.total_area > 0.0
-    assert g.landmarks["toe_tip"][1] > 0.0
+    assert g.toe_tip[1] > 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -227,8 +227,7 @@ def test_parse_by_name_not_row(tmp_path) -> None:
     shuffled = [rows[i] for i in rng.permutation(len(rows))]
     a = load_normalized_sole_csv(CSV_PATH)
     b = load_normalized_sole_csv(_write_rows(tmp_path / "shuffled.csv", shuffled))
-    for name in a.landmarks:
-        np.testing.assert_array_equal(a.landmarks[name], b.landmarks[name])
+    assert a.plate_x == b.plate_x
     for name in a.curves:
         np.testing.assert_array_equal(a.curves[name], b.curves[name])
 
@@ -247,7 +246,7 @@ def test_curve_validation(tmp_path, defect) -> None:
     elif defect == "nonmonotone":
         top[10]["x_over_length"], top[11]["x_over_length"] = top[11]["x_over_length"], top[10]["x_over_length"]
     elif defect == "missing":
-        rows = [r for r in rows if r["name"] != "plate_toe_endpoint"]
+        rows = [r for r in rows if r["name"] != "toe_end"]
     with pytest.raises(GeometryFileError):
         load_normalized_sole_csv(_write_rows(tmp_path / f"{defect}.csv", rows))
 
@@ -258,14 +257,14 @@ def test_exterior_closes(meas_geom) -> None:
     np.testing.assert_array_equal(g.bottom[-1], g.top[-1])
     np.testing.assert_array_equal(g.top[0], g.heel_edge[0])
     np.testing.assert_array_equal(g.heel_edge[-1], g.bottom[0])
-    n_ext = len(g.bottom) + len(g.top) - 1 + len(g.heel_edge) - 2
-    assert len(g.exterior) == n_ext
+    loop = np.vstack([g.bottom, g.top[::-1][1:], g.heel_edge[1:-1]])
+    assert len({tuple(p) for p in loop}) == len(loop)  # closes without repeated vertices
 
 
 # 14. Heel edge is the straight heel_top -> heel_bottom segment.
 def test_heel_edge_straight(meas_geom) -> None:
     g = meas_geom
-    a, b = g.landmarks["heel_top"], g.landmarks["heel_bottom"]
+    a, b = g.heel_top, g.heel_bottom
     np.testing.assert_array_equal(g.heel_edge[0], a)
     np.testing.assert_array_equal(g.heel_edge[-1], b)
     d = b - a
@@ -277,30 +276,33 @@ def test_heel_edge_straight(meas_geom) -> None:
 # 15. Top and bottom share exactly one vertex, the toe.
 def test_single_toe_vertex(meas_geom) -> None:
     shared = {tuple(p) for p in meas_geom.top} & {tuple(p) for p in meas_geom.bottom}
-    assert shared == {tuple(meas_geom.landmarks["toe_tip"])}
+    assert shared == {tuple(meas_geom.toe_tip)}
 
 
-# 16. No self-intersection.
-def test_exterior_simple(meas_geom) -> None:
-    assert polyline_self_intersections(meas_geom.exterior, closed=True, eps=1e-14 * L_M**2) == []
+# 16. The exterior cannot fold over: a top surface dipping below the bottom is rejected.
+def test_top_below_bottom_rejected(meas_cfg) -> None:
+    norm = meas_cfg.normalized_geometry
+    curves = {k: np.array(v, dtype=float) for k, v in norm.curves.items()}
+    curves["top_surface"][50, 1] = -0.1
+    bad = dataclasses.replace(norm, curves=curves)
+    with pytest.raises(GeometryFileError, match="above bottom_surface"):
+        build_sole_geometry(bad, SHOE_MM)
 
 
-# 17-18. All three corners convex; names like corner_2_interior are not interpreted.
-def test_corners_convex_and_names_ignored(tmp_path) -> None:
+# 17-18. All three corners convex; old-format landmark point rows are rejected.
+def test_corners_convex_and_point_rows_rejected(meas_geom, tmp_path) -> None:
+    assert set(meas_geom.corner_angles_deg) == {"heel_bottom", "toe_tip", "heel_top"}
+    assert all(0.0 < ang < 180.0 for ang in meas_geom.corner_angles_deg.values())
     rows = _read_rows(CSV_PATH)
-    rows.append({"record_type": "point", "name": "corner_2_interior", "index": "", "x_over_length": "0.5", "y_over_length": "0.5"})
-    norm = load_normalized_sole_csv(_write_rows(tmp_path / "extra.csv", rows))
-    assert "corner_2_interior" in norm.ignored_names
-    g = build_sole_geometry(norm, SHOE_MM)
-    assert set(g.corner_angles_deg) == {"heel_bottom", "toe_tip", "heel_top"}
-    assert all(0.0 < ang < 180.0 for ang in g.corner_angles_deg.values())
-    ref = build_sole_geometry(load_normalized_sole_csv(CSV_PATH), SHOE_MM)
-    np.testing.assert_array_equal(g.exterior, ref.exterior)
+    rows.append({"record_type": "point", "name": "toe_tip", "index": "", "x_over_length": "1", "y_over_length": "0.19"})
+    with pytest.raises(GeometryFileError, match="no longer used"):
+        load_normalized_sole_csv(_write_rows(tmp_path / "old_format.csv", rows))
 
 
 # 19. Interface endpoints lie on the exterior.
 def test_interface_endpoints_on_exterior(meas_geom) -> None:
-    closed = np.vstack([meas_geom.exterior, meas_geom.exterior[:1]])
+    g = meas_geom
+    closed = np.vstack([g.bottom, g.top[::-1][1:], g.heel_edge[1:]])
     d = distance_to_polyline(closed, meas_geom.interface[[0, -1]])
     assert np.all(d <= 1e-12 * L_M)
 
@@ -354,11 +356,12 @@ def test_interface_nodes_shared(meas_mesh) -> None:
 # 24. Assignment follows geometry, not element numbering.
 def test_material_independent_of_numbering(meas_mesh) -> None:
     c = _centroids(meas_mesh.mesh)
-    in_upper = point_in_polygon(meas_mesh.geometry.region_polygons["upper_foam"], c)
+    upper = MplPath(meas_mesh.geometry.region_polygons["upper_foam"])
+    in_upper = upper.contains_points(c)
     np.testing.assert_array_equal(in_upper, meas_mesh.element_region == 0)
     perm = np.random.default_rng(0).permutation(c.shape[0])
     np.testing.assert_array_equal(
-        point_in_polygon(meas_mesh.geometry.region_polygons["upper_foam"], c[perm]),
+        upper.contains_points(c[perm]),
         (meas_mesh.element_region == 0)[perm],
     )
 
@@ -408,25 +411,22 @@ def test_unequal_node_counts(meas_fem, coarse_fem) -> None:
 # ---------------------------------------------------------------------------
 
 
-# 29-30. Plate endpoints are projected (not snapped) and inserted.
-def test_plate_endpoints_projected(meas_geom, meas_cfg) -> None:
+# 29-30. Plate endpoints sit on the interface at the configured x and are inserted.
+def test_plate_endpoints_inserted(meas_geom, meas_cfg) -> None:
     g = meas_geom
-    for label in ("plate_heel_endpoint", "plate_toe_endpoint"):
-        proj = g.landmarks[f"{label}_projected"]
-        assert g.projection_distances[label] <= 1e-5 * L_M
-        assert np.linalg.norm(proj - g.landmarks[label]) == pytest.approx(g.projection_distances[label], abs=1e-15)
-    np.testing.assert_array_equal(g.interface[g.plate_heel_index], g.landmarks["plate_heel_endpoint_projected"])
-    np.testing.assert_array_equal(g.interface[g.plate_toe_index], g.landmarks["plate_toe_endpoint_projected"])
     raw = np.asarray(meas_cfg.normalized_geometry.curves["foam_interface"]) * L_M
-    d_samples = np.min(np.hypot(*(raw - g.landmarks["plate_toe_endpoint_projected"]).T))
-    assert d_samples > 1e-6 * L_M  # inserted, not snapped onto an existing sample
+    for idx, x in zip((g.plate_heel_index, g.plate_toe_index), meas_cfg.normalized_geometry.plate_x):
+        end = g.interface[idx]
+        assert end[0] == pytest.approx(x * L_M, rel=1e-12)
+        assert end[1] == pytest.approx(np.interp(end[0], raw[:, 0], raw[:, 1]), abs=1e-12 * L_M)
+        assert np.min(np.hypot(*(raw - end).T)) > 1e-6 * L_M  # inserted, not snapped onto a sample
 
 
 # 31. Plate elements lie between the endpoints only.
 def test_plate_elements_within_span(meas_fem, meas_geom) -> None:
     p = meas_fem.basis.mesh.p[:, meas_fem.plate_node_ids]
-    np.testing.assert_allclose(p[:, 0], meas_geom.landmarks["plate_heel_endpoint_projected"], atol=1e-12 * L_M)
-    np.testing.assert_allclose(p[:, -1], meas_geom.landmarks["plate_toe_endpoint_projected"], atol=1e-12 * L_M)
+    np.testing.assert_allclose(p[:, 0], meas_geom.interface[meas_geom.plate_heel_index], atol=1e-12 * L_M)
+    np.testing.assert_allclose(p[:, -1], meas_geom.interface[meas_geom.plate_toe_index], atol=1e-12 * L_M)
     assert np.all(np.diff(p[0]) > 0.0)
     assert meas_fem.plate_element_ids.size == meas_fem.n_plate_nodes - 1
 
@@ -510,7 +510,7 @@ def test_natural_end_rotation(meas_fem) -> None:
 
 # 39. One physical toe node.
 def test_one_toe_node(meas_mesh) -> None:
-    toe = meas_mesh.geometry.landmarks["toe_tip"]
+    toe = meas_mesh.geometry.toe_tip
     d = np.hypot(*(meas_mesh.mesh.p - toe[:, None]))
     assert np.count_nonzero(d <= 1e-9 * L_M) == 1
     assert int(np.argmin(d)) == meas_mesh.toe_node_id
@@ -725,7 +725,7 @@ def test_lookup_serialization(saved_lookup, coarse_lookup) -> None:
     assert lk.schema_version == LOOKUP_SCHEMA_VERSION
     gm, ref = lk.geometry_metadata, coarse_lookup.geometry_metadata
     assert gm["shoe_length_mm"] == SHOE_MM
-    for key in ("normalized_landmarks", "physical_landmarks", "plate_start_reference_coordinate",
+    for key in ("plate_x_over_length", "physical_landmarks", "plate_start_reference_coordinate",
                 "plate_end_reference_coordinate", "top_surface_reference_coordinates",
                 "bottom_surface_reference_coordinates", "foam_interface_reference_coordinates"):
         np.testing.assert_allclose(np.asarray(_flat(gm[key])), np.asarray(_flat(ref[key])), rtol=0, atol=0)
@@ -760,7 +760,7 @@ def test_gui_scaling_uniform(meas_cfg) -> None:
     g1 = build_sole_geometry(meas_cfg.normalized_geometry, 250.0)
     g2 = build_sole_geometry(meas_cfg.normalized_geometry, 300.0)
     k = 300.0 / 250.0
-    for a, b in ((g1.top, g2.top), (g1.bottom, g2.bottom), (g1.interface, g2.interface), (g1.exterior, g2.exterior)):
+    for a, b in ((g1.top, g2.top), (g1.bottom, g2.bottom), (g1.interface, g2.interface)):
         np.testing.assert_allclose(b, k * a, rtol=1e-12, atol=1e-15)
     for name in g1.region_polygons:
         np.testing.assert_allclose(g2.region_polygons[name], k * g1.region_polygons[name], rtol=1e-12, atol=1e-15)
@@ -830,7 +830,7 @@ def test_old_schema_messages(saved_lookup, tmp_path) -> None:
         np.savez_compressed(tmp_path / f"v{version}.npz", **old)
         with pytest.raises(ValueError, match=match):
             load_contact_lookup(tmp_path / f"v{version}.npz")
-    assert "schema_version=11" in REGENERATE_LOOKUP_MESSAGE
+    assert "schema_version=12" in REGENERATE_LOOKUP_MESSAGE
     broken = {k: v for k, v in data.items() if k != "render_influence_loads"}
     np.savez_compressed(tmp_path / "broken.npz", **broken)
     with pytest.raises(ValueError, match="missing geometry arrays"):

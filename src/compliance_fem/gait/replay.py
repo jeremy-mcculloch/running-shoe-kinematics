@@ -6,6 +6,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -338,6 +339,7 @@ def replay_stance(
     cop_fy_min: float = 20.0,
     synthetic: dict[str, Any] | None = None,
     selection_config: SelectionConfig | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> GaitReplayResult:
     """Replay one stance (no per-frame FEM).
 
@@ -347,6 +349,7 @@ def replay_stance(
     (``toe_spring``). The measured COP/Mz is not prescribed and is reported as
     a validation residual. Requires ``visco_model='elastic'`` unless
     ``toe_model='passive_spring_elastic_equivalent'`` is chosen explicitly.
+    ``progress(done, total)``, if given, is called after each frame's toe solve.
     """
     toe_cfg = resolve_toe_config(toe_model, toe_config)
     model = toe_cfg.toe_model
@@ -642,6 +645,8 @@ def replay_stance(
             prev_theta_deg = float(best.theta_deg)
         if best.row >= 0:
             prev_interval = best.interval
+        if progress is not None:
+            progress(i + 1, n)
     runtime_s = time.perf_counter() - t_loop
     model_info["runtime_total_s"] = float(runtime_s)
     model_info["runtime_per_sample_s"] = float(runtime_s / max(n, 1))

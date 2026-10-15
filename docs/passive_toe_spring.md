@@ -266,7 +266,20 @@ force residual is within tolerance. The search screens intervals near the
 previous frame's interval first (local, then expanded radii), then all
 intervals; the admissible candidates of the first stage that has any are
 re-solved exactly and passed to the Viterbi sequence selector, which drops
-inadmissible candidates whenever an admissible one exists. When no interval is
+inadmissible candidates whenever an admissible one exists.
+
+The toe-side contact edge passing a mesh node can leave no interval passing
+the strict gap tolerance: leaving the node free penetrates by micrometres,
+adding it to contact makes it tensile. The search therefore also accepts a
+free-node penetration up to `SelectionConfig.relaxed_gap_rel_tol` × \(h\)
+(default 1% of the node spacing). Strictly admissible pairs always win: the
+search stops at the first stage that has one, exactly as before. Only when no
+stage has one are the relaxed-admissible pairs used, ordered by stability,
+then by the penetration they need, then by the usual keys; they are labelled
+`global_interval_search` and their status carries `+relaxed_gap`. Setting
+`relaxed_gap_rel_tol = 0` restores the strict-only behaviour.
+
+When no interval is
 admissible at a frame (it happens for part of real stances; see below), the
 least-violating candidates are kept, the selected one is labelled
 `least_violating_fallback`, and its status carries `+unilateral_violation`

@@ -467,6 +467,82 @@ def _z_of_theta(theta: np.ndarray, F_fixed: np.ndarray, phi_rearfoot: float, geo
     return alpha, z, dz, dv
 
 
+def _singular_values_2x2(K: np.ndarray) -> np.ndarray:
+    """Closed-form singular values ``[s_max, s_min]`` of a stack of finite 2x2 matrices.
+
+    ``s_max^2`` is the larger eigenvalue of ``K K^T``; ``s_min = |det K| / s_max``
+    avoids the cancellation of the ``(p - r) / 2`` form. Matches LAPACK to ~1e-15
+    relative in ``s_max``, ~100x faster for large stacks.
+    """
+    a, b, c, d = K[:, 0, 0], K[:, 0, 1], K[:, 1, 0], K[:, 1, 1]
+    p = a * a + b * b + c * c + d * d
+    r = np.hypot(a * a + b * b - c * c - d * d, 2.0 * (a * c + b * d))
+    s_max = np.sqrt(0.5 * (p + r))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        s_min = np.where(s_max > 0.0, np.abs(a * d - b * c) / s_max, 0.0)
+    return np.stack([s_max, s_min], axis=-1)
+
+
+def _residual_at(
+    A: np.ndarray, theta: np.ndarray, F_fixed: np.ndarray, phi_rearfoot: float,
+    geometry: RearfootGeometry, k: float, th0: float,
+) -> np.ndarray:
+    """Per-pair g(theta) = A[:, :5] . z + A[:, 5] - dU/dalpha (``A[:, 6] == -1``)."""
+    alpha = np.tan(theta)
+    v = geometry.chord_rotation(phi_rearfoot, alpha)
+    c, s = np.cos(v), np.sin(v)
+    Fx, Fy = float(F_fixed[0]), float(F_fixed[1])
+    return (
+        A[:, 0] * (c * Fx + s * Fy)
+        + A[:, 1] * (-s * Fx + c * Fy)
+        + A[:, 2] * (c - 1.0)
+        - A[:, 3] * s
+        + A[:, 4] * alpha
+        + A[:, 5]
+        - spring_dU_dalpha(alpha, k, th0)
+    )
+
+
+def _refine_brackets(
+    A: np.ndarray, lo: np.ndarray, hi: np.ndarray, g_lo: np.ndarray, g_hi: np.ndarray,
+    F_fixed: np.ndarray, phi_rearfoot: float, geometry: RearfootGeometry,
+    k: float, th0: float, max_iterations: int,
+) -> np.ndarray:
+    """Vectorized Illinois regula falsi on brackets ``[lo, hi]`` with ``g_lo * g_hi <= 0``.
+
+    Exact zeros at ``lo`` are returned as is. Each bracket stops once it is
+    narrower than ``1e-15 + 4 eps |theta|`` (Brent's tolerance in the scalar
+    solver) or hits ``g == 0``; only unconverged brackets are re-evaluated.
+    """
+    lo, hi = lo.astype(float), hi.astype(float)
+    g_lo, g_hi = g_lo.astype(float), g_hi.astype(float)
+    root = lo.copy()
+    side = np.zeros(lo.size, dtype=np.int8)  # +1: hi replaced last, -1: lo replaced last
+    act = np.flatnonzero(g_lo != 0.0)
+    eps4 = 4.0 * np.finfo(float).eps
+    for _ in range(max_iterations):
+        if act.size == 0:
+            break
+        l, h, gl, gh = lo[act], hi[act], g_lo[act], g_hi[act]
+        x = (l * gh - h * gl) / (gh - gl)
+        outside = ~((x > l) & (x < h))
+        x[outside] = 0.5 * (l[outside] + h[outside])
+        gx = _residual_at(A[act], x, F_fixed, phi_rearfoot, geometry, k, th0)
+        root[act] = x
+        # Root in [l, x] when g changes sign there; replace hi, else replace lo.
+        to_left = (gl < 0.0) != (gx < 0.0)
+        s = side[act]
+        # Illinois: halve the retained endpoint's g when the same side moves twice.
+        g_lo[act] = np.where(to_left & (s == 1), 0.5 * gl, np.where(to_left, gl, gx))
+        g_hi[act] = np.where(~to_left & (s == -1), 0.5 * gh, np.where(to_left, gx, gh))
+        lo[act] = np.where(to_left, l, x)
+        hi[act] = np.where(to_left, x, h)
+        side[act] = np.where(to_left, 1, -1)
+        done = (gx == 0.0) | (hi[act] - lo[act] <= 1e-15 + eps4 * np.abs(x))
+        act = act[~done]
+    return root
+
+
 def screen_toe_roots(
     scalars_rows: np.ndarray,
     q_rows: np.ndarray,
@@ -478,7 +554,7 @@ def screen_toe_roots(
     *,
     rows: np.ndarray | None = None,
     cond_limit: float = 1.0e8,
-    bisection_iterations: int = 64,
+    max_iterations: int = 64,
 ) -> ToeRootScreen:
     """Find all toe roots for many records at once.
 
@@ -486,7 +562,8 @@ def screen_toe_roots(
     same affine reduction as :func:`rearfoot_toe_model` (batched 2x2 solves, no
     inverse). Because ``z`` depends only on ``alpha`` and the frame inputs, the
     residual on the theta scan grid for every record is one matrix product. Sign
-    changes are bracketed and refined by vectorized bisection in theta.
+    changes are bracketed and refined in theta by vectorized Illinois regula
+    falsi (:func:`_refine_brackets`).
     """
     S = np.asarray(scalars_rows, dtype=float)
     q = np.asarray(q_rows, dtype=float)
@@ -504,7 +581,7 @@ def screen_toe_roots(
     finite &= np.all(np.isfinite(q), axis=1)
     svals = np.full((n, 2), np.nan)
     if np.any(finite):
-        svals[finite] = np.linalg.svd(K[finite], compute_uv=False)
+        svals[finite] = _singular_values_2x2(K[finite])
     with np.errstate(divide="ignore", invalid="ignore"):
         cond = np.where(svals[:, 1] > 0.0, svals[:, 0] / svals[:, 1], np.inf)
     well = finite & np.isfinite(cond) & (cond <= float(cond_limit))
@@ -534,23 +611,19 @@ def screen_toe_roots(
     th0 = cfg.toe_neutral_angle_rad
     thetas = np.linspace(cfg.toe_angle_min_rad, cfg.toe_angle_max_rad, int(cfg.toe_root_scan_points))
     alpha, z, _, _ = _z_of_theta(thetas, F_fixed, phi_rearfoot, geometry)
-    G = coeff @ z + q_offset[:, None] - spring_dU_dalpha(alpha, k, th0)[None, :]
-    G[~well] = np.nan
-    sign_change = (G[:, :-1] * G[:, 1:] < 0.0) | (G[:, :-1] == 0.0)
-    pr, pc = np.nonzero(sign_change)
-    lo = thetas[pc].copy()
-    hi = thetas[pc + 1].copy()
-    g_lo = G[pr, pc].copy()
-    exact = g_lo == 0.0
-    for _ in range(int(bisection_iterations)):
-        mid = 0.5 * (lo + hi)
-        a_m, z_m, _, _ = _z_of_theta(mid, F_fixed, phi_rearfoot, geometry)
-        g_m = np.einsum("pk,kp->p", coeff[pr], z_m) + q_offset[pr] - spring_dU_dalpha(a_m, k, th0)
-        left = (g_lo * g_m <= 0.0) & ~exact
-        hi = np.where(left, mid, hi)
-        lo = np.where(left | exact, lo, mid)
-        g_lo = np.where(left | exact, g_lo, g_m)
-    root = np.where(exact, lo, 0.5 * (lo + hi))
+    # G = [coeff, q_offset, -1] @ [z; 1; dU/dalpha]: one product, only for well-conditioned rows.
+    well_idx = np.flatnonzero(well)
+    A = np.column_stack([coeff[well_idx], q_offset[well_idx], -np.ones(well_idx.size)])
+    G = A @ np.vstack([z, np.ones_like(alpha), spring_dU_dalpha(alpha, k, th0)])
+    # Bracket where G0 * G1 < 0 (opposite strict signs) or G0 == 0; NaN never brackets.
+    neg, pos = G < 0.0, G > 0.0
+    sign_change = (neg[:, :-1] & pos[:, 1:]) | (pos[:, :-1] & neg[:, 1:]) | (G[:, :-1] == 0.0)
+    pw, pc = np.divmod(np.flatnonzero(sign_change), thetas.size - 1)
+    pr = well_idx[pw]
+    root = _refine_brackets(
+        A[pw], thetas[pc], thetas[pc + 1], G[pw, pc], G[pw, pc + 1],
+        F_fixed, phi_rearfoot, geometry, k, th0, int(max_iterations),
+    )
     a_r, z_r, dz_r, dv_r = _z_of_theta(root, F_fixed, phi_rearfoot, geometry)
     Q_r = np.einsum("pk,kp->p", coeff[pr], z_r) + q_offset[pr]
     dQ = np.einsum("pk,kp->p", coeff[pr, :4], dz_r[:4]) * dv_r + coeff[pr, 4]
@@ -558,10 +631,16 @@ def screen_toe_roots(
     residual = Q_r - spring_dU_dalpha(a_r, k, th0)
     has_root = np.zeros(n, dtype=bool)
     has_root[pr] = True
-    absG = np.where(np.isfinite(G), np.abs(G), np.inf)
-    i_min = np.argmin(absG, axis=1)
-    diag_theta = thetas[i_min]
-    diag_res = G[np.arange(n), i_min]
+    # Minimum-|g| diagnostic only where it is used: well-conditioned rows without a root.
+    diag_theta = np.full(n, np.nan)
+    diag_res = np.full(n, np.nan)
+    no_root = np.flatnonzero(~has_root[well_idx])
+    if no_root.size:
+        G_nr = G[no_root]
+        absG = np.where(np.isfinite(G_nr), np.abs(G_nr), np.inf)
+        i_min = np.argmin(absG, axis=1)
+        diag_theta[well_idx[no_root]] = thetas[i_min]
+        diag_res[well_idx[no_root]] = G_nr[np.arange(no_root.size), i_min]
     return ToeRootScreen(
         rows=rows,
         coeff=coeff,

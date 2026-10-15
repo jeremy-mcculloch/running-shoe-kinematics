@@ -16,33 +16,43 @@ the original pixel-coordinate file. Columns:
 
 | column | meaning |
 |--------|---------|
-| `record_type` | `point` (landmark) or `curve` (one curve sample) |
-| `name` | landmark or curve name |
-| `index` | sample index for curves (empty for points) |
+| `record_type` | `curve` (one curve sample) or `plate` (one plate end) |
+| `name` | curve name, or `heel_end` / `toe_end` for plate rows |
+| `index` | sample index for curves (empty for plate rows) |
 | `x_over_length` | \(x/L\) |
-| `y_over_length` | \(y/L\) |
+| `y_over_length` | \(y/L\) (empty for plate rows) |
 
-Records are parsed **by name**, never by row position. Required landmarks:
-`toe_tip`, `heel_top`, `heel_bottom`, `foam_interface_toe_endpoint`,
-`foam_interface_heel_endpoint`, `plate_toe_endpoint`, `plate_heel_endpoint`.
-Required curves and their endpoints:
+Records are parsed **by name**, never by row position. The file holds three
+curves, each ordered heel to toe, and the plate extent:
 
-| curve | first sample | last sample |
-|-------|--------------|-------------|
-| `top_surface` | `heel_top` | `toe_tip` |
-| `bottom_surface` | `heel_bottom` | `toe_tip` |
-| `foam_interface` | `foam_interface_heel_endpoint` | `foam_interface_toe_endpoint` |
+```text
+record_type,name,index,x_over_length,y_over_length
+plate,heel_end,,0.0499860886,
+plate,toe_end,,0.9156159499,
+curve,top_surface,0,0.008099327,0.099702947
+...
+```
+
+There are no separate landmark rows; every named point comes from the curves:
+
+| point | definition |
+|-------|------------|
+| `heel_bottom` | first `bottom_surface` sample, must be the origin |
+| `toe_tip` | last `bottom_surface` sample, must have \(x/L=1\) and equal the last `top_surface` sample |
+| `heel_top` | first `top_surface` sample |
+| `foam_interface_heel_endpoint` / `_toe_endpoint` | first / last `foam_interface` sample |
+| `plate_heel_endpoint` / `_toe_endpoint` | the foam interface at the `plate` rows' \(x\) |
 
 Validation rejects (with a `GeometryFileError` naming the file, line and record):
-missing columns, landmarks or curves; unknown record types; duplicate landmarks;
-duplicate curve indices; non-consecutive indices (must be `0..n-1`); non-numeric
-or non-finite coordinates; curves that are not strictly increasing in \(x\)
-(duplicate or reversed samples); curve endpoints that disagree with their
-landmarks; `heel_bottom` not at the origin; `toe_tip` not at \(x/L=1\).
-Unrecognized names are ignored and reported in the diagnostics. Names such as
-`corner_2_interior` in the source are **not** interpreted: all three exterior
-corners (heel bottom, toe tip, heel top) are required to be convex and are
-checked geometrically.
+missing columns, curves or plate rows; unknown record types or names; landmark
+`point` rows (the old format); duplicate curve indices or plate rows;
+non-consecutive indices (must be `0..n-1`); non-numeric or non-finite
+coordinates; curves that are not strictly increasing in \(x\) (duplicate or
+reversed samples); the bottom not starting at the origin; top and bottom not
+ending at one toe tip with \(x/L=1\); plate ends outside the interface or out
+of order. Geometrically, the top must lie above the bottom, the interface
+strictly between them, and all three exterior corners (heel bottom, toe tip,
+heel top) must be convex.
 
 ## `shoe_length_mm` and SI conversion
 
@@ -72,12 +82,13 @@ heel_bottom --bottom_surface--> toe_tip --top_surface (reversed)--> heel_top --h
 - `HEEL_EDGE` is the straight segment `heel_top -> heel_bottom`.
 - `TOE_TIP` is a single sharp vertex where top and bottom meet; it is **not**
   rounded or filleted.
-- Positive signed area and the absence of self-intersections are checked.
+- Positive signed area is checked; with every curve strictly increasing in
+  \(x\), "top above bottom" rules out self-intersection.
 - The two foam-interface endpoints are projected onto the exterior (heel edge
   and bottom curve respectively) and inserted as vertices, so the supplied
-  exterior curves and the straight heel edge are kept exactly. The projection
-  distances are stored in `geometry_metadata["projection_distances_m"]`
-  (about 3 µm and 60 µm at 270 mm).
+  exterior curves and the straight heel edge are kept exactly. Each endpoint
+  must lie within `landmark_tolerance` of the exterior (it moves about 3 µm and
+  60 µm at 270 mm).
 
 Boundary tags: `TOP_SURFACE`, `BOTTOM_SURFACE`, `HEEL_EDGE`, `TOE_TIP`,
 `FOAM_INTERFACE`, `PLATE_SEGMENT`; region tags `upper_foam`, `lower_foam`.
@@ -98,10 +109,10 @@ stiffness is the sum of per-region plane-strain assemblies.
 
 ## Partial curved plate
 
-The plate lies on the foam interface between the projected
-`plate_heel_endpoint` and `plate_toe_endpoint`. Each endpoint is projected onto
-the interface polyline and inserted as a mesh vertex; it is never snapped to an
-existing sample (projection distances are below 0.2 µm at 270 mm). Plate nodes
+The plate lies on the foam interface between `plate_heel_endpoint` and
+`plate_toe_endpoint`, the interface points at the `plate` rows' \(x\). Each
+endpoint is inserted as a mesh vertex (an existing sample is reused only if it
+coincides within \(10^{-9}L\)). Plate nodes
 are the interface nodes between them, so the plate is an ordered polyline of
 \(n\) nodes and \(n-1\) elements (99 / 98 at the default 3 mm mesh).
 
@@ -172,13 +183,26 @@ because the top selector is no longer at constant height.
 
 ## Lookup schema and compatibility
 
-The contact lookup uses `schema_version = 11` and the compliance NPZ uses
+The contact lookup uses `schema_version = 12` and the compliance NPZ uses
 `compliance_schema_version = 5`. The lookup stores `rigid_alpha_basis` (per-record rigid amplitudes
 about \(x_r=L/2,\ y_r=0\)) plus a measured geometry section
 (mesh points, triangles, element regions, curve / loop node ids, render
 influence matrices, `geometry_metadata_json`, `normalized_geometry_json`).
 Files with any other schema version are rejected with a regenerate message,
-and a lookup with only part of the geometry section is rejected. Compliance
+and a lookup with only part of the geometry section is rejected.
+
+Since schema 12 the render influence covers **every mesh vertex** (not only the
+region loops), and the section also stores per-element plane-strain moduli
+`mesh_element_E` / `mesh_element_nu` (graded foams evaluated at the element
+centroid). The GUI uses them to draw the deformed mesh and colour each
+triangle by its strain energy density
+\(W=\tfrac{\lambda}{2}(\operatorname{tr}\varepsilon)^2+\mu\,\varepsilon:\varepsilon\)
+(J/m³, from the true displacement, P1 strain per triangle;
+`geometry.render.element_strain_energy_density`). The plate is coloured by
+its bending energy per unit length \(\tfrac12 EI\kappa^2\) (plate colour
+quantity `strain_energy_density`; the plate is inextensible, so there is no
+membrane term). Both colour scales are separate and cap at the 99th
+percentile; the gait animation fixes them over the stance. Compliance
 NPZs store the normalized geometry and every scalar `SoleConfig` setting under
 its field name (`EI_plate_Nm2_per_m`, `mesh_size_m`, ...) for reference; lookups
 are always regenerated from the config.

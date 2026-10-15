@@ -684,7 +684,7 @@ def test_viscoelastic_rejected_for_passive_spring(lookup) -> None:
 def test_serialization_preserves_q_basis(lookup, tmp_path: Path) -> None:
     save_contact_lookup(lookup, tmp_path)
     loaded = load_contact_lookup(tmp_path)
-    assert loaded.schema_version == LOOKUP_SCHEMA_VERSION == 11
+    assert loaded.schema_version == LOOKUP_SCHEMA_VERSION == 12
     assert loaded.toe_generalized_force_source == "stored"
     np.testing.assert_array_equal(loaded.Q_alpha_shoe_on_foot_basis, lookup.Q_alpha_shoe_on_foot_basis)
     data = dict(np.load(tmp_path / "contact_lookup.npz", allow_pickle=True))
@@ -704,7 +704,7 @@ def test_old_schema_rejected(lookup, tmp_path: Path) -> None:
         np.savez_compressed(tmp_path / f"v{version}.npz", **old)
         with pytest.raises(ValueError, match="Regenerate"):
             load_contact_lookup(tmp_path / f"v{version}.npz")
-    assert "schema_version=11" in REGENERATE_LOOKUP_MESSAGE
+    assert "schema_version=12" in REGENERATE_LOOKUP_MESSAGE
 
 
 # 35. GUI and exported results show the same solved theta.
@@ -727,7 +727,7 @@ def test_gui_and_export_show_same_theta(lookup, tmp_path: Path) -> None:
         assert key in header
     i = int(np.argmax(np.abs(r.theta_deg)))
     fig = toe_equilibrium_figure(r, i, ToeSpringConfig())
-    vline = [s for s in fig.layout.shapes if s.type == "line"][0]
+    vline = [s for s in fig.layout.shapes if s.type == "line"][0]  # pyright: ignore[reportAttributeAccessIssue]
     assert vline.x0 == pytest.approx(float(r.theta_deg[i]))
     # plotly leaves Figure.data untyped.
     roots_trace = [d for d in fig.data if d.name == "all roots"][0]  # pyright: ignore[reportAttributeAccessIssue]
@@ -746,3 +746,25 @@ def test_instant_best_prefers_converged_stable_and_continuity(lookup) -> None:
     assert best is not None and best.toe.converged and best.toe.toe_equilibrium_stable
     bad = dataclasses.replace(best, admissible=False)
     assert pick_instant_best_passive([bad, best]) is best
+
+
+# Relaxed gap tolerance: strict pairs always win; relaxed pairs only when none is strict.
+def test_relaxed_gap_only_when_no_strict_pair(lookup) -> None:
+    from compliance_fem.contact.force_control import SelectionConfig, mesh_spacing
+
+    h = mesh_spacing(lookup)
+    strict_cfg = SelectionConfig(relaxed_gap_rel_tol=0.0)
+    for Fy in (-1.0e3, -3.0e3, -6.0e3, -1.0e4):
+        for phi in (-0.15, -0.05, 0.0, 0.05, 0.15):
+            kw: dict[str, Any] = dict(
+                Fx_star=0.1 * abs(Fy), Fy_star=Fy, Mz_meas=0.0, phi_rad=phi, config=ToeSpringConfig(), width_m=0.1
+            )
+            strict = solve_passive_toe_candidates(lookup, selection_config=strict_cfg, **kw)
+            default = solve_passive_toe_candidates(lookup, **kw)
+            if any(c.admissible for c in strict):
+                assert [(c.row, c.theta_deg) for c in default] == [(c.row, c.theta_deg) for c in strict]
+                assert not any("+relaxed_gap" in c.status for c in default)
+            for c in default:
+                if "+relaxed_gap" in c.status:
+                    assert c.admissible
+                    assert c.max_free_penetration <= 0.01 * h * (1.0 + 1e-12)

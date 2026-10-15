@@ -1,11 +1,6 @@
 record_type,name,index,x_over_length,y_over_length
-point,toe_tip,,1,0.194539336
-point,heel_top,,0.008099327,0.099702947
-point,heel_bottom,,0,0
-point,foam_interface_toe_endpoint,,0.98307728,0.152968206
-point,foam_interface_heel_endpoint,,0.005409608,0.066727779
-point,plate_toe_endpoint,,0.915616152,0.131926201
-point,plate_heel_endpoint,,0.049986076,0.065430494
+plate,heel_end,,0.0499860886,
+plate,toe_end,,0.9156159499,
 curve,top_surface,0,0.008099327,0.099702947
 curve,top_surface,1,0.018018102,0.097059643
 curve,top_surface,2,0.027936876,0.094794616

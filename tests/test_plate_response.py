@@ -203,7 +203,7 @@ def test_every_basis_solution_satisfies_Bp_q(lookup, sole_config) -> None:
     """3. Every stored basis solution satisfies B_p q ≈ 0."""
     assert lookup.plate_bp_residual is not None
     residual = np.asarray(lookup.plate_bp_residual, dtype=float)
-    # Absolute residual; mesh-scaled floor from generation plate_bp_tol=1e-7.
+    # Relative to the record's displacement scale (>= 1 m here: unit contact-motion columns).
     assert float(np.max(np.abs(residual))) < 1e-7 + 1e-12 * _mesh_h(sole_config)
 
 
@@ -698,6 +698,7 @@ def test_plate_color_quantities_and_units(lookup) -> None:
         "bending_moment": "force·length",
         "shear_force": "force",
         "axial_constraint_force": "force",
+        "strain_energy_density": "energy/length",
     }
     assert COLOR_UNITS == expected
     for color, units in expected.items():

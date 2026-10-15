@@ -24,7 +24,7 @@ balances the physical toe spring is ``width_m * Q_lookup`` (N·m).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -201,12 +201,19 @@ def _stages(lookup: ContactLookupResult, previous, cfg: SelectionConfig) -> list
     return stages
 
 
+def _strict_admissible(rec: dict, tol: Tolerances) -> np.ndarray:
+    """Pairs of a relaxed-tolerance reconstruction that also pass the strict gap tolerance."""
+    tau_g_strict = float(tol.tau_g) + float(tol.gap_rel_tol) * float(rec["scales"].h)
+    return rec["admissible"] & (rec["max_free_penetration"] <= tau_g_strict)
+
+
 def _shortlist(
     lookup: ContactLookupResult, pairs: _Pairs, pool: np.ndarray, previous, cfg: SelectionConfig,
-    k: int, admissible: bool,
+    k: int, admissible: bool, *, by_penetration: bool = False,
 ) -> np.ndarray:
-    """Order-independent shortlist: admissible pairs by (stability, complementarity
-    [+ topology penalty], interval distance, row, theta); otherwise by violation score."""
+    """Order-independent shortlist: admissible pairs by (stability, [free-node
+    penetration,] complementarity [+ topology penalty], interval distance, row,
+    theta); otherwise by violation score."""
     rows = pairs.rows[pool]
     if admissible:
         dist = np.zeros(pool.size)
@@ -217,7 +224,10 @@ def _shortlist(
         comp = np.nan_to_num(pairs.rec["complementarity_score"][pool], nan=np.inf)
         primary = comp + cfg.topology_change_penalty * dist
         unstable = (~pairs.stable[pool]).astype(int)
-        order = np.lexsort((pairs.theta[pool], rows, dist, primary, unstable))
+        keys = [pairs.theta[pool], rows, dist, primary]
+        if by_penetration:
+            keys.append(pairs.rec["max_free_penetration"][pool])
+        order = np.lexsort((*keys, unstable))
     else:
         rec = pairs.rec
         ordered = refine_top_k(
@@ -260,6 +270,8 @@ def solve_passive_toe_candidates(
     """
     tol = tolerances or Tolerances()
     cfg = selection_config or SelectionConfig()
+    # Screen with the relaxed gap tolerance; strict pairs are recognized by their penetration.
+    tol_relaxed = replace(tol, gap_rel_tol=max(float(tol.gap_rel_tol), float(cfg.relaxed_gap_rel_tol)))
     width = float(width_m)
     if not np.isfinite(width) or width <= 0.0:
         raise ValueError(f"width_m must be positive, got {width_m!r}.")
@@ -279,14 +291,14 @@ def solve_passive_toe_candidates(
             pairs,
             _screen_pairs(
                 lookup, new_rows, S_all=S_all, q_all=q_all, F_fixed=F_fixed, phi_rad=float(phi_rad),
-                geometry=geometry, config=config, width=width, tol=tol, low_load=low_load,
+                geometry=geometry, config=config, width=width, tol=tol_relaxed, low_load=low_load,
                 cond_limit=cond_limit,
             ),
         )
         if pairs is None:
             continue
         in_stage = np.isin(pairs.rows, stage_rows)
-        adm = np.flatnonzero(in_stage & pairs.rec["admissible"] & pairs.has_root)
+        adm = np.flatnonzero(in_stage & _strict_admissible(pairs.rec, tol) & pairs.has_root)
         if adm.size:
             method = stage_method
             pool = adm
@@ -294,15 +306,24 @@ def solve_passive_toe_candidates(
     if pairs is None:
         return []
     admissible_found = method != SEARCH_FALLBACK
+    relaxed = False
+    if not admissible_found:
+        # Every stage was screened: use the relaxed-admissible pairs, least penetration first.
+        adm = np.flatnonzero(pairs.rec["admissible"] & pairs.has_root)
+        if adm.size:
+            method, pool, admissible_found, relaxed = SEARCH_GLOBAL, adm, True, True
     if not admissible_found:
         pool = np.flatnonzero(np.isfinite(pairs.rec["violation_score"]))
         if pool.size == 0:
             pool = np.arange(pairs.rows.size)
-    chosen = _shortlist(lookup, pairs, pool, previous_interval, cfg, max_candidates, admissible_found)
+    chosen = _shortlist(
+        lookup, pairs, pool, previous_interval, cfg, max_candidates, admissible_found, by_penetration=relaxed
+    )
     cands = _exact_candidates(
         lookup, pairs, chosen, S_all=S_all, q_all=q_all, F_fixed=F_fixed, phi_rad=float(phi_rad),
-        geometry=geometry, config=config, width=width, tol=tol, low_load=low_load,
-        cond_limit=cond_limit, Mz_meas=float(Mz_meas), method=method,
+        geometry=geometry, config=config, width=width, tol=tol_relaxed if relaxed else tol,
+        low_load=low_load, cond_limit=cond_limit, Mz_meas=float(Mz_meas), method=method,
+        relaxed=relaxed,
     )
     if admissible_found and any(c.admissible for c in cands):
         cands = [c for c in cands if c.admissible]
@@ -311,7 +332,7 @@ def solve_passive_toe_candidates(
 
 def _exact_candidates(
     lookup, pairs: _Pairs, chosen: np.ndarray, *, S_all, q_all, F_fixed, phi_rad, geometry,
-    config: ToeSpringConfig, width, tol, low_load, cond_limit, Mz_meas, method,
+    config: ToeSpringConfig, width, tol, low_load, cond_limit, Mz_meas, method, relaxed: bool = False,
 ) -> list[WrenchCandidate]:
     k = config.toe_stiffness_Nm_per_rad
     th0 = config.toe_neutral_angle_rad
@@ -386,6 +407,8 @@ def _exact_candidates(
         unilateral_ok = _unilateral_only(rec, i)
         admissible = bool(root.converged and rec["admissible"][i])
         cand_status = f"passive_spring:{status}"
+        if relaxed:
+            cand_status += "+relaxed_gap"
         if not root.converged:
             cand_status += "+diagnostic_min_residual"
         if not root.stable:

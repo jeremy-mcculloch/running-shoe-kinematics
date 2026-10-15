@@ -41,7 +41,14 @@ Records are rejected (never silently dropped) when the boundary matrix is
 numerically rank deficient (`rank_deficient_boundary_matrix`, decided from the
 LU reciprocal condition estimate and confirmed by an SVD), the solve fails, the
 solve / boundary-condition / equilibrium residual exceeds its tolerance, the
-response is non-finite, or the plate recovery residual is too large.
+response is non-finite, or the plate recovery residual is too large
+(`plate_recovery_residual_exceeds_tolerance`). The plate residuals — the
+inextensibility violation \(\|B_p q\|\) and the recovered top / contact
+displacement errors — are divided by the record's displacement scale
+\(S=\max_k(\|W_{t,k}\|,\|W_{c,k}\|,\|(u,v)_{\mathrm{plate},k}\|)\) and
+compared with `PLATE_RECOVERY_REL_TOL = 1e-4`. Their roundoff grows with mesh
+refinement (worst measured: 3e-6 at a 3 mm mesh, 1.5e-5 at 1 mm), while a
+genuinely wrong recovery gives O(1).
 `metadata["rejection_counts"]` and `n_intervals_valid` summarize them.
 
 ## Anchor and curved-sole closure
@@ -170,6 +177,10 @@ Tolerances are mesh- and magnitude-scaled (\(h\) = median bottom spacing,
 A record is admissible when it is finite, reproduces \(F^\star\), **every** free
 node has \(g_k\ge-\tau_{g,\mathrm{eff}}\) and **every** contact node — both edges
 and all interior nodes — has \(R_{n,k}\ge-\tau_{R,\mathrm{eff}}\).
+The passive-toe search additionally accepts, only when no record passes the
+strict check, free-node penetration up to
+\(\texttt{relaxed\_gap\_rel\_tol}\,h\) (default \(0.01\,h\)), flagged
+`+relaxed_gap`; see `passive_toe_spring.md`.
 
 The mesh uses linear elements, so the bottom gap is piecewise linear between
 nodes, its minimum over a free segment is attained at a node, and the nodal

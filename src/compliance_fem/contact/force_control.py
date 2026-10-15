@@ -150,6 +150,12 @@ class SelectionConfig:
     ``topology_change_penalty`` multiplies ``|i - i_prev| + |j - j_prev|`` and is
     added to the complementarity score of *admissible* candidates only, so it can
     never keep a penetrating or tensile candidate.
+
+    ``relaxed_gap_rel_tol`` (passive toe search only) is the largest free-node
+    penetration, as a fraction of the node spacing ``h``, that still counts as
+    admissible. Pairs that pass the strict ``Tolerances`` are always preferred;
+    relaxed pairs are used only when no strict pair exists, ordered by the
+    penetration they need, and are flagged ``+relaxed_gap``.
     """
 
     use_temporal_continuity: bool = True
@@ -157,10 +163,13 @@ class SelectionConfig:
     local_radius: int = 1
     expansion_radii: tuple[int, ...] = (2, 4, 8, 16)
     score_tie_window: float = 1e-9
+    relaxed_gap_rel_tol: float = 1.0e-2
 
     def __post_init__(self) -> None:
         if self.topology_change_penalty < 0.0:
             raise ValueError("topology_change_penalty must be non-negative.")
+        if self.relaxed_gap_rel_tol < 0.0:
+            raise ValueError("relaxed_gap_rel_tol must be non-negative.")
         if self.local_radius < 1:
             raise ValueError("local_radius must be >= 1.")
 

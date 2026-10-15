@@ -111,7 +111,7 @@ from compliance_fem.contact.toe_spring import (
 if TYPE_CHECKING:
     from compliance_fem.fem.compliance import ComplianceResult
 
-LOOKUP_SCHEMA_VERSION = 11
+LOOKUP_SCHEMA_VERSION = 12
 GROUND_GEOMETRY = "flat ground y = 0 with upward normal n_g = (0, 1)"
 CONTACT_LAW = (
     "perfect sticking on the active interval: every active node is prescribed the full "
@@ -169,6 +169,10 @@ REJECT_BC_RESIDUAL = "boundary_condition_residual_exceeds_tolerance"
 REJECT_EQUILIBRIUM = "equilibrium_residual_exceeds_tolerance"
 REJECT_NONFINITE = "nonfinite_response"
 REJECT_PLATE = "plate_recovery_residual_exceeds_tolerance"
+# Plate recovery residuals are relative to the record's displacement scale
+# (``plate_basis_from_influence``). Measured worst cases: 3e-6 at 3 mm mesh,
+# 1.5e-5 at 1 mm (roundoff grows with refinement); a wrong recovery is O(1).
+PLATE_RECOVERY_REL_TOL = 1e-4
 
 NODAL_FIELD_NAMES = ("bottom_u", "bottom_v", "reaction_x", "reaction_y", "top_force_x", "top_force_y")
 PLATE_FIELD_NAMES = (
@@ -1202,8 +1206,8 @@ def generate_contact_lookup(
     reciprocity_tol: float = 1e-6,
     fem_result: ComplianceResult | None = None,
     require_plate: bool = False,
-    plate_bc_tol: float = 1e-5,
-    plate_bp_tol: float = 1e-5,
+    plate_bc_tol: float = PLATE_RECOVERY_REL_TOL,
+    plate_bp_tol: float = PLATE_RECOVERY_REL_TOL,
     progress: Callable[[int, int], None] | None = None,
     store_fields: bool = False,
 ) -> ContactLookupResult:
@@ -1389,6 +1393,10 @@ def generate_contact_lookup(
             "n_plate_nodes": n_plate,
             "n_plate_elements": n_el,
             "plate_recovery": "precomputed influence matrices (one multi-RHS solve)",
+            "plate_recovery_residual_normalization": (
+                "relative to max over columns of (||W_t||, ||W_c||, ||(u,v)_plate||) per record"
+            ),
+            "plate_recovery_tolerances": {"bp": float(plate_bp_tol), "bc": float(plate_bc_tol)},
         }
 
     metadata = {

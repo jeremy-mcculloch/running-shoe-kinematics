@@ -30,6 +30,7 @@ except Exception:
     pass
 
 from compliance_fem.contact.sole_config import DEFAULT_LOWER_FOAM, DEFAULT_UPPER_FOAM, FOAM_MATERIALS
+from compliance_fem.plotting.energy_plotly import foam_energy_traces, plate_energy_traces
 from compliance_fem.contact.basis import kappa_from_min_bend_radius, min_bend_radius_mm_from_kappa
 from compliance_fem.contact.lookup import (
     LOOKUP_SCHEMA_VERSION,
@@ -214,6 +215,7 @@ PLATE_COLOR_OPTIONS = {
     "Bending moment": "bending_moment",
     "Shear force": "shear_force",
     "Axial constraint force": "axial_constraint_force",
+    "Strain energy density": "strain_energy_density",
 }
 
 PLATE_SUMMARY_LABELS = {
@@ -354,7 +356,14 @@ def _draw_regions(fig, shape, _line, show_reference_geometry: bool) -> None:
         for k, (name, (xr, yr)) in enumerate(shape.region_ref.items()):
             _line(xr, yr, name="reference geometry" if k == 0 else None, color="black",
                   width=1, dash="dash", legend=(k == 0))
+    if shape.foam_energy_density is not None and shape.foam_triangles is not None:
+        for trace in foam_energy_traces(
+            shape.foam_triangles, shape.foam_x_def, shape.foam_y_def, shape.foam_energy_density
+        ):
+            fig.add_trace(trace)
     for name, (xd, yd) in shape.region_def.items():
+        if shape.foam_energy_density is not None:
+            break
         material = shape.region_materials.get(name, "")
         fig.add_trace(
             go.Scatter(
@@ -431,7 +440,15 @@ def _draw_shape(
         py = shape.plate_y_def if shape.plate_y_def is not None else shape.y_plate_def
         if px is not None and py is not None:
             color_vals = shape.plate_color_values
-            if color_vals is not None and np.size(color_vals) == np.size(px) and np.size(px) > 1:
+            if (
+                shape.plate_color_quantity == "strain_energy_density"
+                and color_vals is not None
+                and np.size(color_vals) == np.size(px)
+                and np.size(px) > 1
+            ):
+                for trace in plate_energy_traces(px, py, color_vals):
+                    fig.add_trace(trace)
+            elif color_vals is not None and np.size(color_vals) == np.size(px) and np.size(px) > 1:
                 units = shape.plate_color_units or ""
                 cbar_title = f"plate ({units})" if units else "plate"
                 fig.add_trace(
@@ -1085,7 +1102,7 @@ def main() -> None:
                 plate_color_key = st.selectbox(
                     "Plate color by",
                     list(PLATE_COLOR_OPTIONS),
-                    index=0,
+                    index=list(PLATE_COLOR_OPTIONS).index("Strain energy density"),
                     key="gui_plate_color",
                 )
                 samples_per_element = st.slider(
@@ -1097,6 +1114,13 @@ def main() -> None:
                     key="gui_plate_samples",
                 )
         plate_color_quantity = PLATE_COLOR_OPTIONS[plate_color_key]
+        foam_energy = st.checkbox(
+            "Color foam by strain energy density",
+            value=bool(getattr(lookup, "render_section", None)),
+            disabled=not bool(getattr(lookup, "render_section", None)),
+            key="gui_foam_energy",
+            help="Per-element plane-strain energy density from the stored render influence (measured sole only).",
+        )
 
         varphi, alpha, r_x, r_y = angles_to_coefficients(phi_deg, theta_deg, lookup.phi_ref)
         st.markdown(f"**φ_ref** = `{np.rad2deg(lookup.phi_ref):.6g}°`")
@@ -1230,6 +1254,7 @@ def main() -> None:
         show_plate_rotations=show_plate_rotations,
         plate_color_quantity=plate_color_quantity,
         samples_per_element=samples_per_element,
+        foam_energy=foam_energy,
     )
     shape_fig = _draw_shape(
         shape,

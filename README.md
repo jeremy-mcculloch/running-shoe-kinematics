@@ -144,7 +144,7 @@ T_{\mathrm{toe}}=\boldsymbol{\rho}^T\mathbf f_{t,y}-\boldsymbol{\eta}^T\mathbf f
 [\boldsymbol{\rho}]_j=\max\bigl(0,x_{t,j}-(L-\ell_{\mathrm{toe}})\bigr).
 \]
 
-`schema_version` is **11**. Files with any other schema version are
+`schema_version` is **12**. Files with any other schema version are
 **rejected** with a regenerate message.
 
 ## Internal plate response
@@ -313,7 +313,7 @@ Lookup outputs:
 - `contact_lookup.npz` — interval arrays (`contact_start/end_index`, `contact_start/end_x`,
   anchors, adjacent free ids, `contact_mask`, status, rejection reasons), six-column
   `scalar_lookup` `(n_records,6,6)`, `edge_responses`, `kf_matrix`,
-  `Q_alpha_shoe_on_foot_basis`, `phi_ref`, `rigid_alpha_basis`, `schema_version=11`,
+  `Q_alpha_shoe_on_foot_basis`, `phi_ref`, `rigid_alpha_basis`, `schema_version=12`,
   and the prepared compliance matrix `field_solver_compliance`. The per-node bases
   (bottom displacement / reaction, top force, plate) are recomputed on demand by
   `lookup.record_fields(rows)`, bitwise identical to stored ones; `lookup.store_nodal_fields: true`
@@ -321,7 +321,8 @@ Lookup outputs:
   [docs/interval_contact.md](docs/interval_contact.md#stored-scalars-on-demand-nodal-fields).
   Tables also store `plate_response` data (mesh connectivity,
   plate influence matrices or `plate_*_basis`, `has_plate_response=True`),
-  the stored mesh and render influence matrices
+  the stored mesh, per-element foam moduli and render influence matrices for every mesh
+  vertex (strain-energy colouring of the deformed foam; see docs/measured_sole.md)
 - `contact_lookup.csv` — one row per interval with scalars per column, status and residuals
 - `contact_lookup_metadata.json` — contact law, anchor definition, closure convention,
   frame and sign conventions, label counts, rejection counts, build time

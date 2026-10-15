@@ -127,7 +127,7 @@ def test_gui_angle_conversion(flat_lookup) -> None:
 
 def test_runtime_rejects_stale_lookup(flat_lookup) -> None:
     stale = dataclasses.replace(flat_lookup, schema_version=8)
-    with pytest.raises(ValueError, match="schema_version=11"):
+    with pytest.raises(ValueError, match="schema_version=12"):
         evaluate_candidates(stale, 0.0, -1.0e3, 0.0, 0.0)
 
 

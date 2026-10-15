@@ -313,13 +313,13 @@ def _round(x: float) -> float:
 def lookup_build_fingerprint(sole: SoleConfig, toe_length: float, kappa: float, reciprocity_tol: float) -> str:
     """SHA-256 of every parameter that changes the lookup contents.
 
-    The geometry enters through its normalized landmark/curve values, so the
+    The geometry enters through its normalized curve and plate-extent values, so the
     fingerprint does not depend on the CSV path or formatting. Runtime-only
     settings (toe spring, shoe width) are excluded.
     """
     geom = sole.normalized_geometry
     payload = {
-        "landmarks": {k: [_round(v[0]), _round(v[1])] for k, v in sorted(geom.landmarks.items())},
+        "plate_x": [_round(v) for v in geom.plate_x],
         "curves": {k: [[_round(p[0]), _round(p[1])] for p in np.asarray(v)] for k, v in sorted(geom.curves.items())},
         "shoe_length_mm": _round(sole.shoe_length_mm),
         "landmark_tolerance": _round(sole.landmark_tolerance),
@@ -419,7 +419,7 @@ def ensure_lookup_exists(
 
     setup = config if isinstance(config, ModelSetup) else load_model_setup(config)
     out = Path(output_dir) if output_dir is not None else (setup.output_dir or DEFAULT_LOOKUP_DIR)
-    say = (lambda msg: None) if quiet else print
+    print_if_verbose = (lambda msg: None) if quiet else print
 
     # Directory to save fem mesh
     mesh_dir = None
@@ -431,9 +431,9 @@ def ensure_lookup_exists(
 
     existing = None if force else matching_prebuilt_lookup(setup, out)
     if existing is not None:
-        say(f"Contact lookup {existing} is up to date with {setup.source_path or 'the setup'}; pass force to rebuild.")
+        print_if_verbose(f"Contact lookup {existing} is up to date with {setup.source_path or 'the setup'}; pass force to rebuild.")
         if fem_dir is not None:
-            _save_fem_outputs(compute_compliance(setup.sole, mesh_path=mesh_dir), setup, fem_dir, say, plots=not skip_plots)
+            _save_fem_outputs(compute_compliance(setup.sole, mesh_path=mesh_dir), setup, fem_dir, print_if_verbose, plots=not skip_plots)
         return existing
 
     compliance = compute_compliance(setup.sole, mesh_path=mesh_dir)
@@ -452,9 +452,9 @@ def ensure_lookup_exists(
     save_model_setup(setup, npz_path.parent / "measured_sole_config.json")
     if not skip_plots:
         save_lookup_plots(lookup, out)
-    _write_lookup_summary(lookup, setup, npz_path, out, say)
+    _write_lookup_summary(lookup, setup, npz_path, out, print_if_verbose)
     if fem_dir is not None:
-        _save_fem_outputs(compliance, setup, fem_dir, say, plots=not skip_plots)
+        _save_fem_outputs(compliance, setup, fem_dir, print_if_verbose, plots=not skip_plots)
     return npz_path
 
 

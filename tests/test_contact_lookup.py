@@ -130,7 +130,7 @@ def test_metadata_records_conventions(rocker_lookup, tmp_path: Path) -> None:
     meta = json.loads((tmp_path / "contact_lookup_metadata.json").read_text(encoding="utf-8"))
     for key, value in interval_metadata().items():
         assert key in meta, key
-    assert meta["schema_version"] == LOOKUP_SCHEMA_VERSION == 11
+    assert meta["schema_version"] == LOOKUP_SCHEMA_VERSION == 12
     assert meta["contact_set_model"] == "single_contiguous_interval"
     assert meta["contact_anchor_definition"] == "interval_midpoint"
     assert meta["affine_columns"][0] == "curved_sole_closure"

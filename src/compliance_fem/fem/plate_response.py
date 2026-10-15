@@ -461,7 +461,14 @@ def plate_basis_from_influence(
     W_t: np.ndarray,
     W_c: np.ndarray,
 ) -> PlateBasisFields:
-    """Plate fields for one record from precomputed influence matrices (no solves)."""
+    """Plate fields for one record from precomputed influence matrices (no solves).
+
+    The residuals are relative to the record's displacement scale
+    ``S = max over columns of (||W_t||, ||W_c||, ||(u, v)_plate||)``, a normwise
+    backward-error measure: individual columns can have a zero prescribed
+    displacement (so a per-column ratio is undefined), and the roundoff in the
+    recovered field grows with mesh refinement while ``S`` does not.
+    """
     F_t = np.asarray(F_t, dtype=float)
     n_cols = F_t.shape[1]
     contact = np.asarray(contact_nodes, dtype=int)
@@ -481,14 +488,17 @@ def plate_basis_from_influence(
     top = influence.top @ loads + influence.rigid_top @ Al
     W_t = np.asarray(W_t, dtype=float)
     W_c = np.asarray(W_c, dtype=float)
-    top_res = np.linalg.norm(top - W_t, axis=0) / np.maximum(np.linalg.norm(W_t, axis=0), 1.0)
+    scale = max(
+        float(np.max(np.linalg.norm(W_t, axis=0), initial=0.0)),
+        float(np.max(np.linalg.norm(W_c, axis=0), initial=0.0)) if W_c.size else 0.0,
+        float(np.max(np.hypot(np.linalg.norm(u, axis=0), np.linalg.norm(v, axis=0)), initial=0.0)),
+    )
+    scale = scale if scale > 0.0 else 1.0
+    top_res = np.linalg.norm(top - W_t, axis=0) / scale
     if contact.size:
         bottom = influence.bottom @ loads + influence.rigid_bottom @ Al
         rows = np.concatenate([contact, contact + n_b])
-        denom = np.maximum.reduce(
-            [np.linalg.norm(W_c, axis=0), np.linalg.norm(W_t, axis=0), np.ones(n_cols)]
-        )
-        contact_res = np.linalg.norm(bottom[rows] - W_c, axis=0) / denom
+        contact_res = np.linalg.norm(bottom[rows] - W_c, axis=0) / scale
     else:
         contact_res = np.zeros(n_cols)
     return PlateBasisFields(
@@ -497,7 +507,7 @@ def plate_basis_from_influence(
         rotation_local=th.T.copy(),
         constraint_multiplier=lam.T.copy(),
         axial_force=axial_force_from_multiplier(lam.T),
-        bp_residual=np.linalg.norm(bp, axis=0),
+        bp_residual=np.linalg.norm(bp, axis=0) / scale,
         top_bc_residual=top_res,
         contact_bc_residual=contact_res,
     )
@@ -517,6 +527,7 @@ COLOR_UNITS = {
     "bending_moment": "force·length",
     "shear_force": "force",
     "axial_constraint_force": "force",
+    "strain_energy_density": "energy/length",
 }
 
 
@@ -708,6 +719,8 @@ def build_plate_runtime_state(
         "bending_moment": samples["bending_moment"],
         "shear_force": samples["shear_force"],
         "axial_constraint_force": samples["axial_force"],
+        # Inextensible plate: bending only, 1/2 M kappa = 1/2 EI kappa^2 per unit length.
+        "strain_energy_density": 0.5 * samples["bending_moment"] * samples["curvature"],
     }
     if color not in color_map:
         raise ValueError(f"Unknown plate color quantity '{color_quantity}'.")

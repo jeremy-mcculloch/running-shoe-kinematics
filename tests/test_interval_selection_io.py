@@ -45,7 +45,7 @@ def saved(rocker_lookup_full, tmp_path_factory):
 
 def test_interval_records_roundtrip_without_loss(rocker_lookup_full, saved) -> None:
     path, loaded = saved
-    assert loaded.schema_version == LOOKUP_SCHEMA_VERSION == 11
+    assert loaded.schema_version == LOOKUP_SCHEMA_VERSION == 12
     for name in ARRAY_FIELDS:
         np.testing.assert_array_equal(np.asarray(getattr(loaded, name)), np.asarray(getattr(rocker_lookup_full, name)), err_msg=name)
     for name in EDGE_RESPONSE_FIELDS:

@@ -94,6 +94,7 @@ class ShapePlotData:
     plate_y_def: np.ndarray | None = None
     plate_color_values: np.ndarray | None = None
     plate_color_units: str = ""
+    plate_color_quantity: str = "none"
     plate_summary: dict = field(default_factory=dict)
     plate_node_x: np.ndarray | None = None
     plate_node_y: np.ndarray | None = None
@@ -114,6 +115,11 @@ class ShapePlotData:
     interface_ref: tuple | None = None
     interface_def: tuple | None = None
     toe_marker_xy: tuple[float, float] | None = None
+    # Deformed foam mesh (fixed frame) and per-element strain energy density (J/m^3).
+    foam_triangles: np.ndarray | None = None  # (3, n_el) vertex ids
+    foam_x_def: np.ndarray | None = None  # (n_vertices,)
+    foam_y_def: np.ndarray | None = None
+    foam_energy_density: np.ndarray | None = None  # (n_el,)
 
     @property
     def contact_start_x(self) -> float:
@@ -216,8 +222,14 @@ def build_shape_plot_data(
     show_plate_rotations: bool = False,
     plate_color_quantity: str = "none",
     samples_per_element: int = 16,
+    foam_energy: bool = False,
 ) -> ShapePlotData:
-    """Construct fixed-frame deformed geometry for the selected interval record."""
+    """Construct fixed-frame deformed geometry for the selected interval record.
+
+    With ``foam_energy`` and a measured render section, the deformed foam mesh
+    and each element's strain energy density are included (true displacement;
+    the display scale only moves the drawn vertices).
+    """
     anchor_raw = getattr(selection, "anchor_x", None)
     d_ax_raw = getattr(selection, "d_ax", None)
     d_ay_raw = getattr(selection, "d_ay", None)
@@ -257,8 +269,10 @@ def build_shape_plot_data(
     render_disp = None
     if getattr(lookup, "render_section", None):
         render_disp = _render_displacements(lookup, selection)
+        # Scale from the region outlines, as before the render nodes covered the whole mesh.
+        k_out = _outline_index(lookup)
         scale, label = choose_display_scale(
-            lookup.H, render_disp[1], np.zeros(1), scale_mode, manual_scale, u=render_disp[0],
+            lookup.H, render_disp[1][k_out], np.zeros(1), scale_mode, manual_scale, u=render_disp[0][k_out],
             rotation_drift=float(np.hypot(np.cos(varphi) - 1.0, np.sin(varphi))) * lever,
         )
 
@@ -358,7 +372,7 @@ def build_shape_plot_data(
 
     render: dict = {}
     if render_disp is not None:
-        render = _render_fields(lookup, render_disp, _to_fixed)
+        render = _render_fields(lookup, render_disp, _to_fixed, foam_energy=foam_energy)
         x, y_top_ref, y_bottom_ref = render["x_top_ref"], render["y_top_ref"], render["y_bottom_ref"]
         x_top_def, y_top_def = render["x_top_def"], render["y_top_def"]
         x_bottom_def, y_bottom_def = render["x_bottom_def"], render["y_bottom_def"]
@@ -448,6 +462,7 @@ def build_shape_plot_data(
         plate_y_def=plate_y_hermite,
         plate_color_values=plate_color_values,
         plate_color_units=plate_color_units,
+        plate_color_quantity=str(plate_state.color_quantity) if has_plate and plate_state is not None else "none",
         plate_summary=plate_summary,
         plate_node_x=plate_node_x,
         plate_node_y=plate_node_y,
@@ -467,6 +482,10 @@ def build_shape_plot_data(
         interface_ref=render.get("interface_ref"),
         interface_def=render.get("interface_def"),
         toe_marker_xy=render.get("toe_marker_xy"),
+        foam_triangles=render.get("foam_triangles"),
+        foam_x_def=render.get("foam_x_def"),
+        foam_y_def=render.get("foam_y_def"),
+        foam_energy_density=render.get("foam_energy_density"),
     )
 
 
@@ -484,9 +503,18 @@ def _render_displacements(lookup, selection) -> tuple[np.ndarray, np.ndarray]:
     return render_node_displacements(lookup, int(selection.selected_row), affine_coefficients(gamma))
 
 
-def _render_fields(lookup, disp: tuple[np.ndarray, np.ndarray], to_fixed) -> dict:
-    """Fixed-frame curves and region loops of the measured sole (nodal, no interpolation)."""
+def _outline_index(lookup) -> np.ndarray:
+    """Positions of the two region-loop nodes inside ``render_node_ids``."""
     from compliance_fem.geometry.render import render_index
+
+    sec = lookup.render_section
+    ids = np.unique(np.concatenate([np.asarray(sec["upper_foam_loop"]), np.asarray(sec["lower_foam_loop"])]))
+    return render_index(lookup, ids.astype(int))
+
+
+def _render_fields(lookup, disp: tuple[np.ndarray, np.ndarray], to_fixed, *, foam_energy: bool = False) -> dict:
+    """Fixed-frame curves and region loops of the measured sole (nodal, no interpolation)."""
+    from compliance_fem.geometry.render import element_strain_energy_density, render_index
 
     sec = lookup.render_section
     u_r, v_r = disp
@@ -520,4 +548,9 @@ def _render_fields(lookup, disp: tuple[np.ndarray, np.ndarray], to_fixed) -> dic
         "lower_foam": str(meta.get("lower_foam_material", "")),
     }
     out["toe_marker_xy"] = (float(xtd[-1]), float(ytd[-1]))
+    if foam_energy:
+        out["foam_triangles"] = np.asarray(sec["mesh_triangles"], dtype=int)
+        k_all = render_index(lookup, np.arange(pts.shape[1]))
+        out["foam_x_def"], out["foam_y_def"] = to_fixed(pts[0], pts[1], u_r[k_all], v_r[k_all])
+        out["foam_energy_density"] = element_strain_energy_density(lookup, u_r[k_all], v_r[k_all])
     return out

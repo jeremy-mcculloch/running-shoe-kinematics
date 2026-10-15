@@ -37,7 +37,7 @@ Pipeline (each stage feeds the next):
 ## Invariants to preserve
 
 - **Public interface** (README "Public interface"): the CLIs, `compliance_fem.api` (`SoleModel`, `SoleState`), the listed `contact.model_setup` functions, `compliance_fem.viscoelasticity.create_material`, and the top-level `SoleConfig` / `compute_compliance` / `ComplianceResult`. Everything else is internal and may be changed freely.
-- Lookup `schema_version` is **11**. Files with any other version are rejected with a message to regenerate, and there is no fallback. Bump it when the stored layout changes.
+- Lookup `schema_version` is **12**. Files with any other version are rejected with a message to regenerate, and there is no fallback. Bump it when the stored layout changes.
 - Units: solvers use SI. The lookup is per metre of width; `SoleModel` divides loads by `shoe_width_m` and multiplies forces and moments back. The GUI shows mm / kN / Pa / N·mm².
 - Sign conventions: φ, φ_ref, and varphi are CCW-positive. Top `F` is foot-on-shoe (`F_top = -GRF`, so stance has `Fy < 0`). Positive gap means open. Positive `R_n` means compressive. The top-shape sign lives only in `corotation.SHAPE_MODE_SIGN`.
 - Rotation is exact at the boundary (true sin/cos), but strain is linear. This is a deliberate infinitesimal-strain approximation, not geometric nonlinearity.

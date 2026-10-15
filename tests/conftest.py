@@ -55,21 +55,12 @@ def synthetic_sole_geometry(
     xi = x[:-1]
     interface = np.full(n - 1, 0.5 * height)
     interface[-1] = bottom[-2]
-    landmarks = {
-        "toe_tip": (1.0, toe_y),
-        "heel_top": (0.0, height),
-        "heel_bottom": (0.0, 0.0),
-        "foam_interface_toe_endpoint": (float(xi[-1]), float(interface[-1])),
-        "foam_interface_heel_endpoint": (0.0, 0.5 * height),
-        "plate_toe_endpoint": (float(xi[-3]), 0.5 * height),
-        "plate_heel_endpoint": (float(xi[1]), 0.5 * height),
-    }
     curves = {
         "top_surface": np.column_stack([x, top]),
         "bottom_surface": np.column_stack([x, bottom]),
         "foam_interface": np.column_stack([xi, interface]),
     }
-    geom = NormalizedSoleGeometry(landmarks=landmarks, curves=curves, source_filename="synthetic")
+    geom = NormalizedSoleGeometry(curves=curves, plate_x=(float(xi[1]), float(xi[-3])), source_filename="synthetic")
     validate_normalized_geometry(geom)
     return geom
 
