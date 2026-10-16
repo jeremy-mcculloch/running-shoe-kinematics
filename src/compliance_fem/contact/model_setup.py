@@ -28,7 +28,6 @@ fingerprint of the build-relevant parameters in their metadata, so
 
 from __future__ import annotations
 
-from calendar import c
 import hashlib
 import json
 import math
@@ -49,7 +48,6 @@ from compliance_fem.contact.toe_spring import ToeSpringConfig
 CONFIG_SCHEMA_VERSION = 2
 DEFAULT_TOE_LENGTH_MM = 59.4
 DEFAULT_MIN_BEND_RADIUS_MM = 6.75
-DEFAULT_KAPPA = 160.0
 DEFAULT_RECIPROCITY_TOL = 1.0e-6
 DEFAULT_SHOE_WIDTH_M = 0.10
 SETUP_METADATA_KEY = "model_setup"
@@ -80,7 +78,6 @@ class LookupConfig:
     min_bend_radius_mm: float = DEFAULT_MIN_BEND_RADIUS_MM
     reciprocity_tol: float = DEFAULT_RECIPROCITY_TOL
     output_dir: str | None = None
-    store_nodal_fields: bool = False
 
     def __post_init__(self) -> None:
         if not (math.isfinite(self.toe_length_mm) and self.toe_length_mm > 0.0):
@@ -356,7 +353,7 @@ def lookup_matches_setup(lookup, setup: ModelSetup) -> bool | None:
 
 def stored_lookup_fingerprint(path: str | Path) -> str | None:
     """Read only the recorded build fingerprint of a saved lookup (no full load)."""
-    from compliance_fem.contact.lookup import resolve_contact_lookup_path
+    from compliance_fem.contact.contact_model import resolve_contact_lookup_path
 
     npz = resolve_contact_lookup_path(path)
     with np.load(npz, allow_pickle=True) as data:
@@ -367,27 +364,20 @@ def stored_lookup_fingerprint(path: str | Path) -> str | None:
     return None if value is None else str(value)
 
 
-def lookup_stores_nodal_fields(path: str | Path) -> bool:
-    """Whether a saved lookup keeps the per-node bases (no full load)."""
-    from compliance_fem.contact.lookup import resolve_contact_lookup_path
-
-    with np.load(resolve_contact_lookup_path(path), allow_pickle=True) as data:
-        return "bottom_u_basis" in data.files
-
-
 def matching_prebuilt_lookup(setup: ModelSetup, output_dir: str | Path | None = None) -> Path | None:
-    """The NPZ in ``output_dir`` (default ``lookup.output_dir``) if it exists, was built
-    from ``setup`` and stores the nodal fields when ``lookup.store_nodal_fields`` asks for them."""
-    from compliance_fem.contact.lookup import resolve_contact_lookup_path
+    """The NPZ in ``output_dir`` (default ``lookup.output_dir``) if it exists, is the current
+    schema and was built from ``setup``."""
+    from compliance_fem.contact.contact_model import LOOKUP_SCHEMA_VERSION, resolve_contact_lookup_path
 
     out = Path(output_dir) if output_dir is not None else setup.output_dir
     if out is None:
         return None
     try:
         npz = resolve_contact_lookup_path(out)
+        with np.load(npz, allow_pickle=True) as data:
+            if "schema_version" not in data.files or int(data["schema_version"]) != LOOKUP_SCHEMA_VERSION:
+                return None
         if stored_lookup_fingerprint(npz) != setup.fingerprint():
-            return None
-        if setup.lookup.store_nodal_fields and not lookup_stores_nodal_fields(npz):
             return None
         return npz
     except (FileNotFoundError, OSError, ValueError, KeyError):
@@ -409,13 +399,12 @@ def ensure_lookup_exists(
     ``outputs/contact_lookup``. A lookup there that was built from the same setup is
     reused unless ``force``. A build runs mesh -> FEM -> lookup, records the setup and
     its fingerprint in the lookup metadata, and writes ``contact_lookup.npz``,
-    ``measured_sole_config.json``, ``generation_summary.json`` and the diagnostic
-    plots. ``save_fem`` also writes the compliance NPZ, mesh, compliance heatmaps and
-    ``fem_summary.json`` to ``<output>/fem`` (even when the lookup is reused).
-    ``skip_plots`` leaves out the lookup diagnostic plots and compliance heatmaps.
+    ``measured_sole_config.json`` and ``generation_summary.json``. ``save_fem`` also
+    writes the compliance NPZ, mesh, compliance heatmaps and ``fem_summary.json`` to
+    ``<output>/fem`` (even when the lookup is reused); ``skip_plots`` leaves out the
+    compliance heatmaps.
     """
-    from compliance_fem.contact.lookup import get_compliance_block_matrix, generate_contact_lookup, save_contact_lookup
-    from compliance_fem.plotting.contact import save_lookup_plots
+    from compliance_fem.contact.contact_model import build_contact_model, save_contact_model
 
     setup = config if isinstance(config, ModelSetup) else load_model_setup(config)
     out = Path(output_dir) if output_dir is not None else (setup.output_dir or DEFAULT_LOOKUP_DIR)
@@ -437,35 +426,20 @@ def ensure_lookup_exists(
         return existing
 
     compliance = compute_compliance(setup.sole, mesh_path=mesh_dir)
-    t0 = time.perf_counter()
-    lookup = generate_contact_lookup(
-        get_compliance_block_matrix(compliance),
+    model = build_contact_model(
+        compliance,
         toe_length=setup.toe_length_m,
         kappa=setup.softplus_kappa,
         reciprocity_tol=setup.lookup.reciprocity_tol,
-        fem_result=compliance,
-        progress=None if quiet else (lambda done, total: _print_progress(done, total, t0)),
-        store_fields=setup.lookup.store_nodal_fields,
     )
-    attach_setup_metadata(lookup, setup)
-    npz_path = save_contact_lookup(lookup, out)
+    attach_setup_metadata(model, setup)
+    npz_path = save_contact_model(model, out)
     save_model_setup(setup, npz_path.parent / "measured_sole_config.json")
-    if not skip_plots:
-        save_lookup_plots(lookup, out)
-    _write_lookup_summary(lookup, setup, npz_path, out, print_if_verbose)
+    _write_model_summary(model, setup, npz_path, out, print_if_verbose)
     if fem_dir is not None:
         _save_fem_outputs(compliance, setup, fem_dir, print_if_verbose, plots=not skip_plots)
     return npz_path
 
-
-def _print_progress(done: int, total: int, t0: float) -> None:
-    elapsed = time.perf_counter() - t0
-    eta = elapsed / max(done, 1) * (total - done)
-    sys.stdout.write(f"\r  intervals {done}/{total}  elapsed {elapsed:7.1f} s  eta {eta:7.1f} s")
-    if done == total:
-        sys.stdout.write("\n")
-    sys.stdout.flush()
-    
 
 def _save_fem_outputs(fem, setup: ModelSetup, fem_dir: Path, say, *, plots: bool) -> None:
     """Compliance NPZ, ParaView mesh, compliance heatmaps and the FEM residual checks."""
@@ -495,57 +469,34 @@ def _save_fem_outputs(fem, setup: ModelSetup, fem_dir: Path, say, *, plots: bool
     say(f"FEM outputs written to {fem_dir}")
 
 
-def _nanmax(values) -> float:
-    arr = np.asarray(values, dtype=float)
-    return float(np.nanmax(arr)) if arr.size else float("nan")
-
-
-def _write_lookup_summary(lookup, setup: ModelSetup, npz_path: Path, out: Path, say) -> None:
-    from compliance_fem.contact.topology import ContactType
-
-    n_plate_nodes = (
-        int(lookup.plate_node_ids.size) if lookup.has_plate_response and lookup.plate_node_ids is not None else 0
-    )
-    valid = lookup.valid_mask
-    label_counts = {}
-    for kind in (ContactType.HEEL, ContactType.INTERIOR, ContactType.TOE, ContactType.FULL):
-        rows = lookup.rows_for(kind)
-        label_counts[kind.value] = {"theoretical": int(rows.size), "valid": int(np.count_nonzero(valid[rows]))}
-    n_b = int(lookup.n_bottom_nodes)
+def _write_model_summary(model, setup: ModelSetup, npz_path: Path, out: Path, say) -> None:
+    """``generation_summary.json`` for the shared-operator model."""
+    op = model.operator
     summary = {
-        "contact_set_model": "single_contiguous_interval",
-        "n_bottom_nodes": n_b,
-        "n_records_theoretical": n_b * (n_b + 1) // 2,
-        "n_records": int(lookup.n_records),
-        "n_valid_records": int(np.count_nonzero(valid)),
-        "label_counts": label_counts,
-        "rejection_counts": lookup.rejection_summary(),
-        "build_time_s": float(lookup.build_time_s),
+        "contact_set_model": "continuous_node_to_ground_complementarity",
+        "tangential_contact_law": model.metadata.get("tangential_contact_law"),
+        "n_bottom_nodes": int(op.n_bottom),
+        "n_top_nodes": int(op.n_top),
+        "G_symmetry_error": float(op.G_symmetry_error),
+        "G_min_eigenvalue": float(op.G_min_eigenvalue),
+        "G_max_eigenvalue": float(op.G_max_eigenvalue),
+        "clamp_condition": float(op.clamp_condition),
+        "build_time_s": float(model.build_time_s),
         "file_size_bytes": int(npz_path.stat().st_size),
-        "softplus_toe_length": lookup.softplus_toe_length,
-        "softplus_kappa": lookup.softplus_kappa,
-        "reciprocity_error": lookup.reciprocity_error,
-        "max_solve_residual": _nanmax(lookup.solve_residuals[valid]),
-        "has_plate_response": bool(lookup.has_plate_response),
-        "nodal_fields_stored": bool(lookup.nodal_fields_stored),
-        "n_plate_nodes": n_plate_nodes,
-        "EI_plate_Nm2_per_m": float(lookup.EI_plate_Nm2_per_m) if lookup.has_plate_response else None,
-        "schema_version": int(lookup.schema_version),
-        "geometry": lookup.geometry_metadata or None,
+        "softplus_toe_length": float(op.toe_length),
+        "softplus_kappa": float(op.kappa),
+        "has_plate_response": bool(model.has_plate_response),
+        "has_render_section": bool(model.render_section),
+        "schema_version": int(model.schema_version),
+        "geometry": model.geometry_metadata or None,
         "config_source": setup.source_path,
         "model_setup_fingerprint": setup.fingerprint(),
         "output": str(npz_path),
     }
     (out / "generation_summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
-
-    say(f"Contact lookup written to {out}")
-    counts = ", ".join(f"{k}={v['valid']}/{v['theoretical']}" for k, v in label_counts.items())
+    say(f"Contact model written to {out}")
     say(
-        f"N_b={n_b}  records valid/theoretical={summary['n_valid_records']}/{summary['n_records_theoretical']} "
-        f"({counts})  build={summary['build_time_s']:.1f} s  size={summary['file_size_bytes'] / 1e6:.1f} MB  "
-        f"max_solve_residual={summary['max_solve_residual']:.3e}  plate_response={summary['has_plate_response']}  "
-        f"nodal_fields={'stored' if lookup.nodal_fields_stored else 'on demand'}"
-        + (f"  n_plate={n_plate_nodes}" if lookup.has_plate_response else "")
+        f"N_b={op.n_bottom}  G sym err={op.G_symmetry_error:.1e}  eig(G) in [{op.G_min_eigenvalue:.3e}, "
+        f"{op.G_max_eigenvalue:.3e}]  build={model.build_time_s:.1f} s  size={summary['file_size_bytes'] / 1e6:.1f} MB  "
+        f"plate_response={model.has_plate_response}  render={bool(model.render_section)}"
     )
-    if summary["rejection_counts"]:
-        say(f"rejections: {summary['rejection_counts']}")

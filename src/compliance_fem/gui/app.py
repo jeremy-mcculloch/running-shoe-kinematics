@@ -1,13 +1,8 @@
-"""Streamlit GUI for force-controlled single-interval contact evaluation."""
+"""Streamlit GUI: force-controlled continuous unilateral contact of the measured sole."""
 
 from __future__ import annotations
 
-# Force a non-interactive backend before pyplot is imported. The MacOSX
-# backend is not safe inside Streamlit's script runner and can segfault.
-import matplotlib
-
-matplotlib.use("Agg")
-
+import io
 import json
 import os
 import subprocess
@@ -16,7 +11,6 @@ import tempfile
 import time
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
@@ -29,32 +23,19 @@ try:
 except Exception:
     pass
 
-from compliance_fem.contact.sole_config import DEFAULT_LOWER_FOAM, DEFAULT_UPPER_FOAM, FOAM_MATERIALS
-from compliance_fem.plotting.energy_plotly import foam_energy_traces, plate_energy_traces
 from compliance_fem.contact.basis import kappa_from_min_bend_radius, min_bend_radius_mm_from_kappa
-from compliance_fem.contact.lookup import (
+from compliance_fem.contact.contact_model import (
     LOOKUP_SCHEMA_VERSION,
-    load_contact_lookup,
-    save_contact_lookup,
+    ContactModel,
+    load_contact_model,
+    save_contact_model,
+    selection_proxy,
 )
-from compliance_fem.contact.topology import (
-    CONTACT_MODE_LABELS,
-    ContactMode,
-    ContactType,
-    parse_contact_mode,
-    validate_interval,
-)
-from compliance_fem.contact.corotation import transform_to_fixed_frame
-from compliance_fem.contact.force_control import (
-    DISCONNECTED_CONTACT_WARNING,
-    NOT_AVAILABLE,
-    Tolerances,
-    angles_to_coefficients,
-    format_optional,
-    evaluate_from_angles,
-    export_evaluation_csv,
-    export_selected_result,
-)
+from compliance_fem.contact.continuous_contact import ContactSolution, ContactTolerances, solve_contact_state
+from compliance_fem.contact.continuous_toe import ToeFrameSolution, WarmStart, solve_toe_contact
+from compliance_fem.contact.out_of_plane import OutOfPlaneSettings, compute_out_of_plane_stiffness
+from compliance_fem.contact.sole_config import DEFAULT_LOWER_FOAM, DEFAULT_UPPER_FOAM, FOAM_FFLEAP, FOAM_MATERIALS
+from compliance_fem.contact.toe_spring import ToeSpringConfig
 from compliance_fem.gui.params import (
     ANGLES,
     DEFAULTS,
@@ -83,7 +64,12 @@ from compliance_fem.gui.params import (
     n_to_kn,
     pa_to_mpa,
 )
-from compliance_fem.plotting.shape_render import build_shape_plot_data
+from compliance_fem.plotting.energy_plotly import foam_energy_traces, plate_energy_traces
+from compliance_fem.plotting.shape_render import NODE_ACTIVE, NODE_INACTIVE, NODE_TRANSITION, build_shape_plot_data
+
+NOT_AVAILABLE = "N/A"
+TOE_PASSIVE = "Passive toe spring (θ solved)"
+TOE_PRESCRIBED = "Prescribed θ"
 
 
 EXPORT_DIR = Path("outputs/gui_contact_lookup")
@@ -231,52 +217,44 @@ PLATE_SUMMARY_LABELS = {
 }
 
 HELP_TEXT = """
-**phi** is the absolute fixed-frame angle of the current heel-to-toe chord
-(counterclockwise positive). The rigid rotation applied to the reference mesh is
-`varphi = phi - phi_ref`, where `phi_ref` is the reference chord angle stored in
-the lookup file.
+**phi** is the fixed-frame pitch, counterclockwise positive. With the passive toe
+spring it is the rearfoot (heel → MTP) angle and the chord rotation follows from
+the solved toe angle, `varphi(alpha) = phi − atan2(dy_mtp + alpha phi1_mtp, L − toe length)`.
+With a prescribed θ it is the heel-to-toe chord angle, `varphi = phi − phi_ref`.
 
-**theta** drives the single endpoint-fixed softplus shape mode through its
-amplitude `alpha = tan(theta)`. Positive theta tilts the toe segment up relative
-to the chord. The mode vanishes at both x=0 and x=L, so heel and toe heights are
-set by the frame, not by theta.
-
-Lookup tables are generated once, independently of phi. Finite rotation enters
-only through scalar combinations of five precomputed contact modes with
-`gamma = [tan(theta), d_ax, d_ay, cos(varphi) - 1, -sin(varphi)]`, where
-`(d_ax, d_ay)` is the anchor translation solved from `Fx`, `Fy`.
+**theta** drives the single endpoint-fixed softplus shape mode through
+`alpha = tan(theta)` (never `alpha = theta`). Positive theta tilts the toe segment
+up relative to the chord; heel and toe heights are set by the frame.
 
 Linearized strain is intentionally retained while boundary positions use the
 exact finite rotation. This is fast, but it is not objective for locally large
 rotations.
 """
 
-CONTACT_MODE_HELP = """
-Ground contact is one contiguous interval of bottom nodes `I_ij = {i, ..., j}`
-(`0 <= i <= j < N_b`). Every interval is precomputed: **heel-attached**
-(`i = 0`), **toe-attached** (`j = N_b - 1`), **full** (both), and **interior**
-(neither end touches, e.g. a rocker or concave sole). The label is derived from
-`(i, j)`; all intervals use the same equations.
+CONTACT_HELP = """
+Every bottom node is a potential contact node. The ground is flat (`y = 0`) and
+the contact set is the solution of one complementarity problem
 
-**Auto** checks every interval with fixed-frame normal gaps on the free nodes
-and normal reactions on all contact nodes. It searches near the previous
-interval first, then widens, then searches globally. Continuity only breaks
-ties among admissible intervals. **Specific** forces one `(i, j)`.
+`0 ≤ λ ⊥ g ≥ 0`,  `g = q + T_y 1 + H λ`,  `Σλ = −Fy*`,
 
-The basis modes are anchored at the interval midpoint `x_a = (x_i + x_j)/2`
-on the reference bottom profile. This anchor is a numerical decomposition point
-(open grey cross), not a contact edge; the contact edges are `x_i` and `x_j`.
+where `g` is the fixed-frame normal gap (positive open), `λ` the compressive
+normal nodal reaction and `T_y` the vertical frame translation. It is solved by
+a warm-started primal-dual active-set method from shared top-clamped boundary
+operators (no interval table, no FEM solve per evaluation).
 
-The implementation supports one contiguous contact interval. If the normal
-reactions become tensile inside an otherwise active interval, or if two
-separated sole regions simultaneously contact the ground with a free region
-between them, a multi-interval contact model is required.
+Tangential contact is **proportional shear**: each active node carries
+`τ = (Fx*/Fy*) λ`, so both prescribed force components are met exactly and
+entering / leaving nodes pass continuously through `g = λ = 0`.
+
+Disconnected contact patches are shown separately (never filled in between).
+The contact-edge marks are a derived display estimate inside the first free
+edge, never an extra constraint.
 """
 
 
 @st.cache_resource(show_spinner=False)
-def _build_lookup(params_json: str):
-    """Rebuild FEM + lookup in a subprocess, then load the NPZ into this process.
+def _build_model(params_json: str):
+    """Rebuild FEM + contact model in a subprocess, then load the NPZ into this process.
 
     ``params_json`` is the canonical model-parameter dict.
     Isolates Gmsh / SuperLU from Streamlit to avoid macOS native segfaults.
@@ -286,7 +264,7 @@ def _build_lookup(params_json: str):
     params = json.loads(params_json)
     prebuilt = params.get("prebuilt_lookup")
     if prebuilt and Path(prebuilt).is_file():
-        return load_contact_lookup(prebuilt)
+        return load_contact_model(prebuilt)
     key_payload = {"schema_version": LOOKUP_SCHEMA_VERSION, **params}
     key = hashlib.sha256(
         json.dumps(key_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -321,18 +299,18 @@ def _build_lookup(params_json: str):
         )
         if proc.returncode != 0:
             raise RuntimeError(
-                "Lookup rebuild subprocess failed "
+                "Contact-model rebuild subprocess failed "
                 f"(exit {proc.returncode}).\n"
                 f"stdout:\n{proc.stdout}\n"
                 f"stderr:\n{proc.stderr}"
             )
         if not npz_path.is_file():
             raise RuntimeError(
-                "Lookup worker exited 0 but did not write contact_lookup.npz.\n"
+                "Rebuild worker exited 0 but did not write contact_lookup.npz.\n"
                 f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
             )
 
-    return load_contact_lookup(npz_path)
+    return load_contact_model(npz_path)
 
 
 # Matplotlib tab10-ish palette so the Plotly figure matches the old pyplot look.
@@ -537,8 +515,7 @@ def _draw_shape(
             dash="dashdot",
         )
 
-    # Ground line, contact interval along the deformed (curved) bottom, free
-    # bottom segments, contact edges, and the numerical interval anchor.
+    # Ground line, active patches along the deformed bottom, node classes.
     x_pad = 0.05 * shape.L
     _line(
         [-x_pad, shape.L + x_pad],
@@ -547,69 +524,41 @@ def _draw_shape(
         color="#4d4d4d",
         width=1,
     )
-    i_c, j_c = shape.contact_start_index, shape.contact_end_index
-    span_lo, span_hi = shape.contact_span
-    _line(
-        shape.contact_curve_x,
-        shape.contact_curve_y,
-        name=f"{shape.contact_type} contact {{{i_c}..{j_c}}}, x in [{span_lo:.3g}, {span_hi:.3g}]",
-        color=_C3,
-        width=6,
-    )
-    for k, (fx_c, fy_c) in enumerate(shape.free_curves):
+    for k, ((cx, cy), p) in enumerate(zip(shape.contact_curves, shape.patches)):
         _line(
-            fx_c,
-            fy_c,
-            name="free bottom" if k == 0 else None,
-            color=_C2,
-            width=3,
-            dash="dash",
-            legend=(k == 0),
+            cx, cy,
+            name=f"contact patch {{{p.start}..{p.end}}}, x in [{p.start_x:.3g}, {p.end_x:.3g}]",
+            color=_C3, width=6,
         )
-    if shape.contact_node_x is not None and shape.contact_node_x.size:
-        fig.add_trace(
-            go.Scatter(
-                x=shape.contact_node_x, y=shape.contact_node_y, mode="markers",
-                name="contact nodes", marker=dict(symbol="circle", size=5, color=_C3),
-                hoverinfo="skip",
-            )
-        )
-    if shape.free_node_x is not None and shape.free_node_x.size:
-        fig.add_trace(
-            go.Scatter(
-                x=shape.free_node_x, y=shape.free_node_y, mode="markers",
-                name="free nodes", marker=dict(symbol="circle-open", size=5, color=_C2),
-                hoverinfo="skip",
-            )
-        )
-    for label, pt, sym in (
-        ("heel contact edge x_i", shape.heel_edge_xy, "triangle-right"),
-        ("toe contact edge x_j", shape.toe_edge_xy, "triangle-left"),
-    ):
-        if pt is not None:
+    styles = {
+        NODE_ACTIVE: ("active nodes", dict(symbol="circle", size=6, color=_C3)),
+        NODE_INACTIVE: ("inactive nodes", dict(symbol="circle-open", size=5, color=_C2)),
+        NODE_TRANSITION: ("transition nodes (g ≈ λ ≈ 0)", dict(symbol="diamond", size=8, color="#ff9f1c",
+                                                              line=dict(width=1, color="black"))),
+    }
+    for cls, (label, marker) in styles.items():
+        sel = shape.node_class == cls
+        if np.any(sel):
             fig.add_trace(
                 go.Scatter(
-                    x=[pt[0]], y=[pt[1]], mode="markers", name=label,
-                    marker=dict(symbol=sym, size=12, color=_C3, line=dict(width=1, color="black")),
-                    hoverinfo="skip",
+                    x=shape.bottom_node_x[sel], y=shape.bottom_node_y[sel], mode="markers", name=label,
+                    marker=marker, customdata=np.flatnonzero(sel),
+                    hovertemplate="node %{customdata}<extra>" + label + "</extra>",
                 )
             )
-    adj = [p for p in (shape.heel_adjacent_xy, shape.toe_adjacent_xy) if p is not None]
-    if adj:
+    if shape.edge_estimate_points:
         fig.add_trace(
             go.Scatter(
-                x=[p[0] for p in adj], y=[p[1] for p in adj], mode="markers",
-                name="adjacent free nodes", marker=dict(symbol="diamond-open", size=10, color=_C2),
+                x=[p[0] for p in shape.edge_estimate_points], y=[p[1] for p in shape.edge_estimate_points],
+                mode="markers", name="derived contact-edge estimate (display only)",
+                marker=dict(symbol="line-ns-open", size=14, color=_C3, line=dict(width=2)),
                 hoverinfo="skip",
             )
         )
-    # Open grey cross: the interval midpoint is a numerical anchor, not a contact edge.
     fig.add_trace(
         go.Scatter(
-            x=[shape.anchor_xy[0]],
-            y=[shape.anchor_xy[1]],
-            mode="markers",
-            name=f"neutral anchor x_a=(x_i+x_j)/2 (numerical; x_rot={shape.x_anchor_rot:.4g})",
+            x=[shape.anchor_xy[0]], y=[shape.anchor_xy[1]], mode="markers",
+            name="display pivot (reaction-weighted contact centroid)",
             marker=dict(symbol="x-thin-open", size=11, color="#7f7f7f", line=dict(width=2, color="#7f7f7f")),
             hoverinfo="skip",
         )
@@ -679,25 +628,189 @@ def _draw_shape(
 
 
 def _fmt_ms(seconds: float) -> str:
-    return f"{1000.0 * seconds:.1f} ms"
+    return f"{1000.0 * seconds:.2f} ms"
+
+
+def _profile_figure(shape) -> go.Figure:
+    """Gap and normal reaction over every bottom node (material x), active nodes highlighted."""
+    from plotly.subplots import make_subplots
+
+    x = shape.bottom_material_x
+    act = shape.active
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                        subplot_titles=("fixed-frame normal gap g (mm)", "compressive normal nodal reaction λ (N/m)"))
+    fig.add_trace(go.Scatter(x=x, y=shape.bottom_gap * 1e3, mode="lines+markers", name="gap",
+                             marker=dict(size=4, color=np.where(act, _C3, _C2)), line=dict(color="#888888")),
+                  row=1, col=1)
+    fig.add_trace(go.Bar(x=x, y=shape.bottom_normal_reaction, name="λ", marker_color=np.where(act, _C3, _C2)),
+                  row=2, col=1)
+    for p in shape.patches:
+        fig.add_vrect(x0=p.start_x, x1=p.end_x, fillcolor=_C3, opacity=0.08, line_width=0, row="all", col="all")
+    fig.update_xaxes(title_text="bottom node material x (m)", row=2, col=1)
+    fig.update_layout(height=420, showlegend=False, margin=dict(l=50, r=20, t=40, b=40), template="plotly_white")
+    return fig
+
+
+def _solve(model: ContactModel, *, toe_mode: str, Fx: float, Fy: float, phi_deg: float, theta_deg: float,
+           toe_cfg: ToeSpringConfig, width: float, tol: ContactTolerances) -> tuple[ContactSolution, ToeFrameSolution | None]:
+    """One evaluation, warm-started from the previous one in this session.
+
+    Returns the contact solution and, with the passive toe spring, the coupled toe frame.
+    """
+    op = model.operator
+    warm_key = f"gui_warm_{id(model)}_{toe_mode}"
+    warm: WarmStart | None = st.session_state.get(warm_key)
+    F = np.array([float(Fx), float(Fy)])
+    if toe_mode == TOE_PASSIVE:
+        low = float(np.hypot(Fx, Fy)) * width < float(toe_cfg.toe_low_force_threshold_N)
+        frame = solve_toe_contact(op, F, float(np.deg2rad(phi_deg)), toe_cfg, width, warm=warm, low_load=low,
+                                  tolerances=tol, cold_scan_points=int(toe_cfg.toe_root_scan_points))
+        st.session_state[warm_key] = frame.warm_start()
+        return frame.contact, frame
+    varphi = float(np.deg2rad(phi_deg)) - op.phi_ref
+    sol = solve_contact_state(op, varphi, float(np.tan(np.deg2rad(theta_deg))), F,
+                              warm_active=None if warm is None else warm.active, tolerances=tol)
+    st.session_state[warm_key] = WarmStart(theta_rad=float(np.deg2rad(theta_deg)), active=sol.active.copy())
+    return sol, None
+
+
+def _parse_width_profile(text: str) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """``x_mm, width_mm`` per line (heel -> toe) -> metres; converted to SI exactly once here."""
+    xs, bs = [], []
+    for line in text.strip().splitlines():
+        if not line.strip():
+            continue
+        parts = [p for p in line.replace(";", ",").replace("\t", ",").split(",") if p.strip()]
+        if len(parts) != 2:
+            raise ValueError(f"Each line needs 'x_mm, width_mm', got {line!r}.")
+        xs.append(float(parts[0]) / 1000.0)
+        bs.append(float(parts[1]) / 1000.0)
+    return tuple(xs), tuple(bs)
+
+
+def _out_of_plane_controls(shoe_width_m: float) -> tuple[OutOfPlaneSettings | None, str]:
+    """Sidebar inputs of the auxiliary 2.5D stiffness (modelling assumptions are labelled)."""
+    enabled = st.checkbox("Enable 2.5D stiffness calculation", value=True, key="gui_oop_enabled")
+    source = st.radio("Width profile source", ["Constant (shoe width above)", "Profile (x, width table)"],
+                      key="gui_oop_width_source")
+    profile_text = ""
+    if source.startswith("Profile"):
+        profile_text = st.text_area(
+            "Width profile (x mm, width mm per line, heel → toe)",
+            value="0, 70\n135, 95\n270, 80",
+            key="gui_oop_width_profile",
+            help="Assumption: normal stiffness uniform across each transverse strip of this width.",
+        )
+    ratio_mode = st.radio(
+        "Lateral-to-normal stiffness ratio η_t (assumption)",
+        ["Thin-layer G/M from foam ν", "User value"],
+        key="gui_oop_ratio_mode",
+        help="Elastic lateral shear / normal stiffness; not a friction coefficient.",
+    )
+    eta = None
+    if ratio_mode == "User value":
+        eta = float(st.number_input("η_t", value=0.44, min_value=0.0, step=0.01, format="%.3f", key="gui_oop_eta"))
+    yaw_ref = st.radio("Yaw reference", ["center_of_pressure", "shoe_reference"], key="gui_oop_yaw_ref")
+    fixed_x_mm = st.number_input(
+        "Fixed yaw-reference x (mm, material; also the no-load fallback)", value=135.0, step=1.0,
+        key="gui_oop_yaw_x",
+    )
+    cond = float(st.number_input("Condition-number warning threshold", value=1.0e10, format="%.2e",
+                                 key="gui_oop_cond"))
+    try:
+        x_prof, b_prof = _parse_width_profile(profile_text) if profile_text else (None, None)
+        return OutOfPlaneSettings(
+            enabled=bool(enabled), shoe_width_m=float(shoe_width_m), shoe_width_x=x_prof, shoe_width_values=b_prof,
+            lateral_to_normal_stiffness_ratio=eta, yaw_reference=str(yaw_ref),
+            fixed_yaw_reference_x=float(fixed_x_mm) / 1000.0, condition_number_warning=cond,
+        ), ""
+    except ValueError as exc:
+        return None, f"2.5D settings invalid: {exc}"
+
+
+def _out_of_plane_section(
+    model: ContactModel, sol: ContactSolution, settings: OutOfPlaneSettings | None, *,
+    poisson_ratio: float | None = None,
+) -> None:
+    """2.5D tangent stiffness of the displayed (converged) state; never changes the plotted sole.
+
+    ``poisson_ratio`` (contact foam, from the applied GUI materials) is used when the
+    model file does not record it.
+    """
+    st.subheader("2.5D out-of-plane tangent stiffness")
+    if settings is None:
+        st.caption("Unavailable: fix the 2.5D settings in the sidebar.")
+        return
+    nu = model.contact_foam_poisson_ratio if model.contact_foam_poisson_ratio is not None else poisson_ratio
+    oop = compute_out_of_plane_stiffness(model.operator, sol, settings, poisson_ratio=nu)
+    st.session_state["gui_oop_result"] = oop
+    if oop.status == "disabled":
+        st.caption("2.5D stiffness calculation disabled.")
+        return
+    cols = st.columns(3)
+    cols[0].metric("Lateral k_z (kN/m)", _fmt_value(oop.lateral_translation_stiffness / 1e3))
+    cols[1].metric("Roll k_roll (N·m/rad)", _fmt_value(oop.roll_stiffness))
+    cols[2].metric("Yaw k_yaw (N·m/rad)", _fmt_value(oop.yaw_stiffness))
+    w = oop.shoe_width_summary
+    width_txt = (
+        f"{1e3 * w['mean_m']:.1f} mm" if w.get("mode") == "constant"
+        else f"{1e3 * w.get('min_m', float('nan')):.1f}–{1e3 * w.get('max_m', float('nan')):.1f} mm (profile)"
+    )
+    cols = st.columns(4)
+    cols[0].metric("Active contact nodes", f"{oop.active_contact_node_count}")
+    cols[1].metric("Width used", width_txt if oop.active_contact_node_count else f"{1e3 * settings.shoe_width_m:.1f} mm")
+    cols[2].metric("η_t", _fmt_value(oop.lateral_to_normal_stiffness_ratio))
+    cols[3].metric("Yaw reference x (m)", _fmt_value(oop.yaw_reference_x))
+    msg = f"status: {oop.status}; η_t source: {oop.lateral_ratio_source}; yaw reference: {oop.yaw_reference_source}; " \
+          f"tangent cond {oop.condition_number:.3e}; time {_fmt_ms(oop.compute_time_s)}."
+    if oop.status not in ("ok", "no_contact"):
+        st.warning(msg)
+    else:
+        st.caption(msg)
+    for wmsg in oop.warnings:
+        st.caption(f"⚠ {wmsg}")
+    st.caption(
+        "Linearized about the converged sagittal state with the active set frozen (2.5D transverse-strip "
+        "approximation, not a 3D FEM). Values may jump when the active set changes. They do not affect the "
+        "sagittal solve or the plotted sole."
+    )
+
+
+def _fmt_value(v: float) -> str:
+    return NOT_AVAILABLE if not np.isfinite(v) else f"{v:.4g}"
+
+
+def _state_npz(model: ContactModel, sol: ContactSolution, theta_rad: float) -> bytes:
+    """Download payload of one contact state (per metre width, SI)."""
+    buf = io.BytesIO()
+    d = sol.diagnostics
+    np.savez_compressed(
+        buf,
+        x_bottom=model.x_bottom, y_bottom=model.y_bottom, gap=sol.gap, normal_reaction=sol.lam,
+        tangential_reaction=sol.tau, active=sol.active, bottom_displacement_local=sol.d_b,
+        top_displacement_local=sol.d_t, top_force_local=sol.F_t, bottom_force_local=sol.f_b,
+        frame_translation=sol.T, varphi=sol.varphi, alpha=sol.alpha, F_star=sol.F_star,
+        theta_rad=float(theta_rad),
+        patches=np.asarray([(p.start, p.end) for p in d["patches"]], dtype=int).reshape(-1, 2),
+        diagnostics_json=json.dumps({k: v for k, v in d.items() if k != "patches"}, default=str),
+    )
+    return buf.getvalue()
 
 
 def main() -> None:
-    st.set_page_config(page_title="Contact topology lookup", layout="wide")
-    st.title("Force-controlled single-interval contact evaluation (co-rotating top frame)")
+    st.set_page_config(page_title="Continuous sole contact", layout="wide")
+    st.title("Force-controlled continuous unilateral contact (co-rotating top frame)")
     st.caption(
-        "Geometry and materials rebuild the measured-sole FEM compliance and contact lookup in a subprocess. "
-        "Fx, Fy in the sidebar are fixed-frame ground reaction forces: leftward/upward "
-        "positive (solver top resultants use the opposite signs). φ is the absolute "
-        "heel-to-toe chord angle and θ drives the single softplus shape mode through "
-        "α = tan(θ). The contact set is one contiguous interval of bottom nodes; selection "
-        "uses fixed-frame normal gaps on every free node and normal reactions on every "
-        "contact node (never R_t, T_toe, or x_cm)."
+        "Geometry and materials rebuild the measured-sole FEM compliance and the shared contact "
+        "operators in a subprocess. Fx, Fy in the sidebar are fixed-frame ground reaction forces "
+        "per metre width (leftward/upward positive; the solver's top loads use the opposite signs). "
+        "Every bottom node may touch the flat ground; the active set comes from one "
+        "complementarity solve (no contact intervals)."
     )
     with st.expander("What do φ and θ mean?", expanded=False):
         st.markdown(HELP_TEXT)
-    with st.expander("How is the contact topology chosen?", expanded=False):
-        st.markdown(CONTACT_MODE_HELP)
+    with st.expander("How is the contact set found?", expanded=False):
+        st.markdown(CONTACT_HELP)
 
     with st.sidebar:
         with st.expander("Geometry", expanded=False):
@@ -898,22 +1011,28 @@ def main() -> None:
         if _APPLIED_MODEL_KEY not in st.session_state:
             st.session_state[_APPLIED_MODEL_KEY] = draft_model
 
-        # Query controls must be rendered BEFORE Apply. Calling st.rerun() above
-        # these widgets deletes their backend state while the frontend still
-        # shows the old slider positions — exactly the "plot uses defaults"
-        # bug. Persist copies under non-widget keys as well.
-        with st.expander("Contact interval", expanded=False):
-            mode_label = st.radio(
-                "Contact mode",
-                list(CONTACT_MODE_LABELS.values()),
+        with st.expander("Toe model", expanded=True):
+            toe_mode = st.radio(
+                "Toe angle",
+                [TOE_PASSIVE, TOE_PRESCRIBED],
                 index=0,
-                key="gui_contact_mode",
-                help="Auto searches every stored interval; the others restrict or force it.",
+                key="gui_toe_mode",
+                help="Passive: θ from the exact toe-spring equilibrium; φ is then the rearfoot angle.",
             )
-            contact_mode = parse_contact_mode(mode_label)
-            specific_i = st.number_input("Specific interval start i", min_value=0, value=0, step=1, key="gui_specific_i")
-            specific_j = st.number_input("Specific interval end j", min_value=0, value=0, step=1, key="gui_specific_j")
-            st.caption("Start/end indices are used only in Specific mode (validated: 0 ≤ i ≤ j < N_b).")
+            toe_k = st.number_input("Toe stiffness k (N·m/rad)", value=25.0, min_value=0.0, key="gui_toe_k")
+            toe_theta0_deg = st.number_input("Neutral toe angle θ0 (°)", value=0.0, key="gui_toe_theta0")
+            shoe_width = st.number_input(
+                "Shoe width (m)", value=0.10, min_value=0.01, step=0.01, format="%.3f", key="gui_shoe_width",
+                help="Toe spring is per shoe; the plane-strain model is per metre width (Q_total = width × Q).",
+            )
+            toe_cfg = ToeSpringConfig(
+                toe_stiffness_Nm_per_rad=float(toe_k), toe_neutral_angle_rad=float(np.deg2rad(toe_theta0_deg))
+            )
+
+        with st.expander("2.5D out-of-plane stiffness", expanded=False):
+            oop_settings, oop_error = _out_of_plane_controls(float(shoe_width))
+            if oop_error:
+                st.error(oop_error)
 
         with st.expander("Loads & angles", expanded=False):
             phi_deg = st.slider(
@@ -990,42 +1109,31 @@ def main() -> None:
                 value=True,
                 key="gui_show_toe_joint_line",
             )
-            show_diagnostics = st.checkbox(
-                "Show diagnostic plots",
-                value=False,
-                key="gui_show_diagnostics",
-                help=(
-                    "Off by default: each rerun used to open ~19 Matplotlib figures, and "
-                    "Streamlit script cancellation left them unclosed until the process "
-                    "segfaulted. Enable only when you need the J(l) / gap / reaction charts."
-                ),
-            )
+            show_profiles = st.checkbox("Show gap / reaction profiles", value=True, key="gui_show_profiles")
 
         with st.expander("Solver tolerances", expanded=False):
-            tau_g = st.number_input(
-                "Contact gap tolerance",
-                value=0.0,
-                format="%.2e",
-                key="gui_tau_g",
+            gap_rel_tol = st.number_input(
+                "Gap tolerance (× node spacing)", value=1.0e-9, format="%.2e", key="gui_gap_rel_tol"
             )
-            tau_R = st.number_input(
-                "Contact reaction tolerance",
-                value=0.0,
-                format="%.2e",
-                key="gui_tau_R",
+            reaction_rel_tol = st.number_input(
+                "Reaction tolerance (× |F*|)", value=1.0e-9, format="%.2e", key="gui_reaction_rel_tol"
             )
-            kf_cond_warn = st.number_input(
-                "Force-solve conditioning warning threshold",
-                value=float(ANGLES.kf_cond_warn),
-                format="%.2e",
-                key="gui_kf_cond_warn",
+            max_as_iter = st.number_input(
+                "Maximum active-set iterations", value=200, min_value=1, step=10, key="gui_max_as_iter"
+            )
+            cond_warn = st.number_input(
+                "Condition-number warning", value=1.0e10, format="%.2e", key="gui_cond_warn"
+            )
+            tol = ContactTolerances(
+                gap_rel_tol=float(gap_rel_tol), reaction_rel_tol=float(reaction_rel_tol),
+                maximum_active_set_iterations=int(max_as_iter), condition_number_warning=float(cond_warn),
             )
 
         st.header("Apply model")
         pending = st.session_state[_APPLIED_MODEL_KEY] != draft_model
         st.caption(
             "Geometry / materials / softplus / mesh / reciprocity rebuild the FEM + "
-            "lookup. Set loads & angles above first; "
+            "contact model. Set loads & angles above first; "
             "Apply does not reset them. Fx, Fy, φ, θ also update the plot without Apply."
         )
         if pending:
@@ -1037,7 +1145,7 @@ def main() -> None:
             type="primary",
             use_container_width=True,
             key="gui_apply_rebuild",
-            help="Run Gmsh + FEM + contact lookup once for the draft parameters above.",
+            help="Run Gmsh + FEM + contact model once for the draft parameters above.",
         ):
             # No st.rerun(): continue this run so query widgets stay rendered and
             # the rebuilt plot uses the current φ/θ/Fx/Fy.
@@ -1051,11 +1159,11 @@ def main() -> None:
 
     t_rebuild0 = time.perf_counter()
     with st.spinner(
-        "Building FEM compliance + contact lookup in a subprocess…"
+        "Building FEM compliance + contact model in a subprocess…"
         if not cache_hit
         else "Loading cached model…"
     ):
-        lookup = _build_lookup(json.dumps(applied_model, sort_keys=True))
+        model = _build_model(json.dumps(applied_model, sort_keys=True))
     t_rebuild = time.perf_counter() - t_rebuild0
     st.session_state["_lookup_key"] = model_key
     if cache_hit:
@@ -1070,8 +1178,8 @@ def main() -> None:
 
     with st.sidebar:
         with st.expander("Plate display", expanded=False):
-            has_plate_lookup = bool(getattr(lookup, "has_plate_response", False))
-            if not has_plate_lookup:
+            has_plate_model = bool(getattr(model, "has_plate_response", False))
+            if not has_plate_model:
                 st.caption(
                     "Plate response unavailable (N/A). The rebuild did not attach "
                     "plate_response — check FEM factorization / plate recovery."
@@ -1116,46 +1224,32 @@ def main() -> None:
         plate_color_quantity = PLATE_COLOR_OPTIONS[plate_color_key]
         foam_energy = st.checkbox(
             "Color foam by strain energy density",
-            value=bool(getattr(lookup, "render_section", None)),
-            disabled=not bool(getattr(lookup, "render_section", None)),
+            value=bool(getattr(model, "render_section", None)),
+            disabled=not bool(getattr(model, "render_section", None)),
             key="gui_foam_energy",
             help="Per-element plane-strain energy density from the stored render influence (measured sole only).",
         )
 
-        varphi, alpha, r_x, r_y = angles_to_coefficients(phi_deg, theta_deg, lookup.phi_ref)
-        st.markdown(f"**φ_ref** = `{np.rad2deg(lookup.phi_ref):.6g}°`")
-        st.markdown(f"**varphi** = φ − φ_ref = `{np.rad2deg(varphi):.6g}°`")
-        st.markdown(f"**α** = tan(θ) = `{alpha:.6g}`")
-        st.markdown(f"**cos(varphi) − 1** = `{r_x:.6g}`,  **−sin(varphi)** = `{r_y:.6g}`")
-        st.caption(
-            "γ = [α, d_ax, d_ay, cos(varphi)−1, −sin(varphi)] in saved basis order "
-            "(top_shape_alpha, contact_translation_x/y, contact_rotation_x/y); the "
-            "curved-sole closure column has a fixed coefficient of 1."
-        )
-
         st.subheader("Model summary (SI)")
+        op = model.operator
         st.write(
             {
-                "L": float(lookup.L),
+                "L": float(model.L),
                 "toe_length": softplus_toe_length,
                 "κ": softplus_kappa,
                 **{k: applied_model[k] for k in ("ffturbo_E_Pa", "ffturbo_nu", "ffleap_E_heel_Pa", "ffleap_E_toe_Pa", "ffleap_nu", "EI_plate_Nm2_per_m", "mesh_size_mm")},
-                "schema_version": lookup.schema_version,
-                "phi_ref_deg": float(np.rad2deg(lookup.phi_ref)),
-                "contact_set_model": "single_contiguous_interval",
-                "n_bottom_nodes": int(lookup.n_bottom_nodes),
-                "n_records": lookup.n_records,
-                "n_valid_records": int(np.count_nonzero(lookup.valid_mask)),
-                "n_heel": int(lookup.rows_for(ContactType.HEEL).size),
-                "n_interior": int(lookup.rows_for(ContactType.INTERIOR).size),
-                "n_toe": int(lookup.rows_for(ContactType.TOE).size),
-                "n_full": int(lookup.rows_for(ContactType.FULL).size),
-                "lookup_build_time_s": float(getattr(lookup, "build_time_s", float("nan")) or float("nan")),
-                "has_plate_response": bool(lookup.has_plate_response),
-                "LOOKUP_SCHEMA_VERSION": LOOKUP_SCHEMA_VERSION,
+                "schema_version": int(model.schema_version),
+                "phi_ref_deg": float(np.rad2deg(model.phi_ref)),
+                "contact_set_model": "continuous node-to-ground complementarity",
+                "tangential_contact_law": model.metadata.get("tangential_contact_law"),
+                "n_bottom_nodes": int(model.n_bottom_nodes),
+                "G symmetry error": float(op.G_symmetry_error),
+                "eig(G) min / max": [float(op.G_min_eigenvalue), float(op.G_max_eigenvalue)],
+                "build_time_s": float(model.build_time_s),
+                "has_plate_response": bool(model.has_plate_response),
             }
         )
-        gm = lookup.geometry_metadata
+        gm = model.geometry_metadata
         if gm:
             st.subheader("Measured geometry")
             st.write(
@@ -1169,83 +1263,49 @@ def main() -> None:
                     "region_areas_m2": gm.get("region_areas_m2"),
                     "mesh_quality": gm.get("mesh_quality"),
                     "shared_toe_policy": gm.get("shared_toe_policy"),
-                    "n_top_nodes": int(lookup.n_top_nodes),
-                    "n_bottom_nodes": int(lookup.n_bottom_nodes),
+                    "n_top_nodes": int(model.n_top_nodes),
+                    "n_bottom_nodes": int(model.n_bottom_nodes),
                 }
             )
 
-    tolerances = Tolerances(tau_g=tau_g, tau_R=tau_R, kf_cond_warn=kf_cond_warn)
-
-    # Proximity to the previous selection is a final tie-breaker only; it exists
-    # so the rendered topology does not flicker between numerically
-    # indistinguishable candidates as the sliders move.
-    previous_interval = st.session_state.get("previous_contact_interval")
-    if previous_interval is not None and int(previous_interval[1]) >= int(lookup.n_bottom_nodes):
-        previous_interval = None
-
-    # Re-read query snapshot after the (possibly long) model rebuild so the plot
-    # always matches the sidebar widgets, not stale defaults.
+    # Re-read the query snapshot after the (possibly long) model rebuild so the
+    # plot always matches the sidebar widgets, not stale defaults.
     phi_deg = float(st.session_state["gui_query_phi_deg"])
     theta_deg = float(st.session_state["gui_query_theta_deg"])
     Fx = float(st.session_state["gui_query_Fx"])
     Fy = float(st.session_state["gui_query_Fy"])
 
-    specific = None
-    if contact_mode is ContactMode.SPECIFIC:
-        specific = (int(specific_i), int(specific_j))
-        try:
-            validate_interval(specific[0], specific[1], int(lookup.n_bottom_nodes))
-        except ValueError as exc:
-            st.error(f"Invalid specific interval: {exc}")
-            st.stop()
-
     t0 = time.perf_counter()
-    selection = evaluate_from_angles(
-        lookup,
-        Fx,
-        Fy,
-        phi_deg,
-        theta_deg,
-        tolerances=tolerances,
-        mode=contact_mode,
-        previous_interval=previous_interval,
-        specific_interval=specific,
-    )
+    sol, frame = _solve(model, toe_mode=toe_mode, Fx=Fx, Fy=Fy, phi_deg=phi_deg, theta_deg=theta_deg,
+                        toe_cfg=toe_cfg, width=float(shoe_width), tol=tol)
     t_calc = time.perf_counter() - t0
-
-    if selection.selected_row is None:
-        st.error(selection.message)
-        st.info(
-            f"Calculation time: {_fmt_ms(t_calc)}; model rebuild: {_fmt_ms(t_rebuild)}"
-        )
-        st.stop()
-    # A record is selected, so its interval quantities are set.
-    interval = selection.interval
-    span = selection.contact_span()
-    contact_type = selection.contact_type
-    anchor_x, anchor_y = selection.anchor_x, selection.anchor_y
-    assert interval is not None and span is not None and contact_type is not None
-    assert anchor_x is not None and anchor_y is not None
-    st.session_state["previous_contact_interval"] = interval
-
-    if selection.approximate:
-        st.warning(selection.message)
+    d = sol.diagnostics
+    if not sol.converged:
+        st.error(f"Contact solve did not converge ({d['lcp_status']}); the state shown is the last iterate.")
+    elif frame is not None and not frame.converged:
+        st.warning(f"Toe equilibrium: {frame.status} (residual {frame.toe_equilibrium_residual_Nm:.3e} N·m).")
     else:
-        st.success(selection.message)
-
-    if selection.kf_illconditioned:
-        st.warning(
-            f"Translation-to-force matrix K_F is ill-conditioned "
-            f"(cond={selection.kf_cond:.3e}). No regularization was applied."
+        st.success(
+            f"{d['n_active']} active node(s) in {d['n_patches']} patch(es); "
+            f"{d['active_set_iterations']} active-set iteration(s)"
+            + (f", {frame.toe_iterations} toe evaluations" if frame is not None else "")
+            + "."
         )
-
-    na = NOT_AVAILABLE
-    span_lo, span_hi = span
+    if d["disconnected_contact"]:
+        st.warning(
+            "Multiple disconnected contact patches: valid geometry, mesh-scale oscillation, or a sign / "
+            "conditioning problem. Patches are shown separately."
+        )
+    if d["active_block_rcond"] > 0 and 1.0 / d["active_block_rcond"] > tol.condition_number_warning:
+        st.warning(f"Active-block condition estimate {1.0 / d['active_block_rcond']:.3e} exceeds the warning level.")
+    if abs(d["mu_eff"]) > tol.mu_eff_warning:
+        st.warning(f"Shear ratio |Fx/Fy| = {abs(d['mu_eff']):.3g} is large for proportional shear.")
 
     t1 = time.perf_counter()
+    state = selection_proxy(model, frame if frame is not None else sol, phi=float(np.deg2rad(phi_deg)))
     shape = build_shape_plot_data(
-        lookup,
-        selection,
+        model,
+        state,
         scale_mode=scale_mode,
         manual_scale=manual_scale,
         show_plate=show_plate,
@@ -1264,149 +1324,78 @@ def main() -> None:
     )
     t_shape = time.perf_counter() - t1
 
-    # Key outputs: top-right corner displacements (fixed frame, true scale),
-    # toe moment about (L − toe length, H_mtp), and heel moment about the top-left corner.
-    if (
-        selection.top_u is not None
-        and selection.top_v is not None
-        and selection.anchor_x is not None
-        and selection.d_ax is not None
-        and selection.d_ay is not None
-        and lookup.x_top is not None
-        and len(lookup.x_top) > 0
-    ):
-        x_ref = float(lookup.x_top[-1])
-        y_ref = (
-            float(lookup.y_top[-1])
-            if lookup.y_top is not None
-            else float(lookup.H)
-        )
-        x_def, y_def = transform_to_fixed_frame(
-            np.asarray([x_ref]),
-            np.asarray([y_ref]),
-            np.asarray([selection.top_u[-1]]),
-            np.asarray([selection.top_v[-1]]),
-            float(selection.anchor_x),
-            float(selection.d_ax),
-            float(selection.d_ay),
-            float(selection.varphi),
-            elastic_scale=1.0,
-            y_anchor=float(anchor_y),
-        )
-        u_tr = float(np.asarray(x_def).reshape(-1)[0] - x_ref)
-        v_tr = float(np.asarray(y_def).reshape(-1)[0] - y_ref)
-    else:
-        u_tr = v_tr = float("nan")
-    t_toe = float(selection.T_toe) if selection.T_toe is not None else float("nan")
-    row = selection.selected_row
-    ev = selection.evaluation
-    if (
-        row is not None
-        and ev.top_force_x is not None
-        and ev.top_force_y is not None
-        and lookup.x_top is not None
-        and len(lookup.x_top) > 0
-    ):
-        y_top = (
-            np.asarray(lookup.y_top, dtype=float)
-            if lookup.y_top is not None
-            else np.full(len(lookup.x_top), float(lookup.H))
-        )
-        # Heel moment: top nodal forces about the top-left corner (x=0 heel).
-        x_tl = float(lookup.x_top[0])
-        y_tl = float(y_top[0])
-        m_heel = float(
-            np.dot(lookup.x_top - x_tl, ev.top_force_y[row])
-            - np.dot(y_top - y_tl, ev.top_force_x[row])
-        )
-    else:
-        m_heel = float("nan")
-
-    key_cols = st.columns(4)
-    key_cols[0].metric("x toe displacement (mm)", f"{u_tr * 1.0e3:.6g}")
-    key_cols[1].metric("y toe displacement (mm)", f"{v_tr * 1.0e3:.6g}")
-    key_cols[2].metric("Toe moment", f"{t_toe:.6g}")
-    key_cols[3].metric("Heel moment", f"{m_heel:.6g}")
-    st.caption(
-        "Toe corner displacements in the fixed frame (true scale, mm); "
-        "Toe moment about (L − toe length, H_mtp); Heel moment = (x−x_tl)ᵀf_y − (y−y_tl)ᵀf_x "
-        "of top nodal forces about the top-left corner (x_tl, y_tl)."
-    )
+    na = NOT_AVAILABLE
+    theta_out = frame.theta_deg if frame is not None else float(theta_deg)
+    key_cols = st.columns(5)
+    key_cols[0].metric("Toe angle θ (°)", f"{theta_out:.4g}")
+    key_cols[1].metric("Active nodes", f"{d['n_active']}")
+    key_cols[2].metric("Contact patches", f"{d['n_patches']}")
+    key_cols[3].metric("COP x (fixed, m)", na if not np.isfinite(d["cop_fixed_x"]) else f"{d['cop_fixed_x']:.5g}")
+    key_cols[4].metric("Contact solve", _fmt_ms(sol.timings["contact_solve_s"]))
 
     t2 = time.perf_counter()
-    st.plotly_chart(
-        shape_fig,
-        use_container_width=True,
-        config={
-            "displayModeBar": True,
-            "scrollZoom": False,
-            "responsive": True,
-        },
-    )
+    st.plotly_chart(shape_fig, use_container_width=True,
+                    config={"displayModeBar": True, "scrollZoom": False, "responsive": True})
     st.caption(shape.caption)
+    if show_profiles:
+        st.plotly_chart(_profile_figure(shape), use_container_width=True)
     t_shape_render = time.perf_counter() - t2
 
-    _num = format_optional
+    with st.expander("Contact outputs", expanded=True):
+        patches = d["patches"]
+        st.write(
+            {
+                "active nodes": [int(i) for i in np.flatnonzero(sol.active)],
+                "patches (first..last node, material x)": [
+                    f"{{{p.start}..{p.end}}} x∈[{p.start_x:.5g}, {p.end_x:.5g}]" for p in patches
+                ],
+                "derived contact-edge estimate x (display only)": [
+                    [round(p.edge_estimate_start_x, 6), round(p.edge_estimate_end_x, 6)] for p in patches
+                ],
+            }
+        )
+        cols = st.columns(4)
+        cols[0].metric("min gap (m)", f"{d['min_gap']:.3e}")
+        cols[1].metric("min active λ (N/m)", f"{d['min_reaction']:.4g}")
+        cols[2].metric("max |g λ|", f"{d['max_complementarity']:.3e}")
+        cols[3].metric("Admissible (tolerances)", str(d["admissible"]))
+        cols = st.columns(4)
+        cols[0].metric("Σλ normal (N/m)", f"{float(sol.lam.sum()):.5g}")
+        cols[1].metric("Στ tangential (N/m)", f"{float(sol.tau.sum()):.5g}")
+        cols[2].metric("GRF moment about origin (N·m/m)", f"{d['grf_moment_fixed']:.5g}")
+        cols[3].metric("μ_eff = Fx*/Fy*", f"{d['mu_eff']:.4g}")
+        cols = st.columns(4)
+        cols[0].metric("Force reconstruction error", f"{d['force_residual']:.3e}")
+        cols[1].metric("Equilibrium force residual", f"{d['equilibrium_force_residual']:.3e}")
+        cols[2].metric("Equilibrium moment residual", f"{d['equilibrium_moment_residual']:.3e}")
+        cols[3].metric("Active-block rcond", f"{d['active_block_rcond']:.3e}")
+        cols = st.columns(4)
+        cols[0].metric("Top Mz (shoe frame, N·m/m)", f"{d['Mz_shoe']:.5g}")
+        cols[1].metric("Toe moment about MTP (N·m/m)", f"{d['T_toe']:.5g}")
+        cols[2].metric("Active-set iterations", f"{d['active_set_iterations']} ({d['active_set_rule']})")
+        cols[3].metric("Frame translation T_y (m)", f"{float(sol.T[1]):.5g}")
 
-    with st.expander("Detailed outputs", expanded=False):
-        cols = st.columns(4)
-        cols[0].metric("Topology label", selection.topology_label)
-        cols[1].metric("Interval (i, j)", f"({interval[0]}, {interval[1]})")
-        cols[2].metric("Contact x_i … x_j", f"[{span_lo:.4g}, {span_hi:.4g}]")
-        cols[3].metric("Neutral anchor x_a (numerical)", f"{selection.anchor_x:.6g}")
-        cols = st.columns(4)
-        cols[0].metric("Heel-edge R_n^F", _num(selection.heel_edge_normal_reaction))
-        cols[1].metric("Toe-edge R_n^F", _num(selection.toe_edge_normal_reaction))
-        cols[2].metric("Heel adjacent free gap", _num(selection.heel_adjacent_free_gap))
-        cols[3].metric("Toe adjacent free gap", _num(selection.toe_adjacent_free_gap))
-        cols = st.columns(4)
-        cols[0].metric(
-            "Min free gap (node)",
-            na if selection.min_free_gap_node < 0 else f"{selection.min_free_gap:.6g} (#{selection.min_free_gap_node})",
-        )
-        cols[1].metric("Max free penetration", _num(selection.max_free_penetration))
-        cols[2].metric(
-            "Min contact R_n^F (node)",
-            f"{selection.min_contact_reaction:.6g} (#{selection.min_contact_reaction_node})",
-        )
-        cols[3].metric("Max contact tension", _num(selection.max_contact_tension))
-        cols = st.columns(4)
-        cols[0].metric("Force reconstruction error", _num(selection.force_residual, ".3e"))
-        cols[1].metric("Force-control cond(K_F)", _num(selection.kf_cond, ".3e"))
-        cols[2].metric("Admissible", str(selection.exactly_admissible))
-        cols[3].metric("Candidate violation score", _num(selection.violation_score, ".3e"))
-        cols = st.columns(4)
-        cols[0].metric("Search method", selection.candidate_search_method)
-        cols[1].metric("Rotated anchor x_a,rot", f"{selection.x_anchor_rot:.6g}")
-        cols[2].metric("Anchor translation d_ax", f"{selection.d_ax:.6g}")
-        cols[3].metric("Anchor translation d_ay", f"{selection.d_ay:.6g}")
-        if selection.disconnected_contact_warning:
-            st.warning(DISCONNECTED_CONTACT_WARNING)
-        cols = st.columns(4)
-        cols[0].metric(
-            "Fx* / reconstructed GRF (fixed)",
-            f"{-selection.Fx_star:.4g} / {-selection.Fx:.4g}",
-        )
-        cols[1].metric(
-            "Fy* / reconstructed GRF (fixed)",
-            f"{-selection.Fy_star:.4g} / {-selection.Fy:.4g}",
-        )
-        cols[2].metric("x_cm (fixed frame)", f"{selection.x_cm:.6g}")
-        cols[3].metric("x_cm − x_a (fixed)", f"{selection.x_cm_rel:.6g}")
-        cols = st.columns(4)
-        cols[0].metric("Toe moment about (L − toe length, H_mtp)", f"{selection.T_toe:.6g}")
-        cols[1].metric("Complementarity score", _num(selection.complementarity_score, ".3e"))
-        cols[2].metric("# admissible intervals", str(selection.n_admissible))
-        cols[3].metric("Contact nodes", str(interval[1] - interval[0] + 1))
-        st.caption(
-            "Absent adjacent nodes (interval touching the heel or toe end) are shown as N/A. "
-            "x_cm uses the visualization gauge r_a^F = (x_a, 0); only x_cm − x_a is gauge "
-            "independent. Tangential reactions may take either sign because contact remains "
-            "perfectly sticking. The anchor x_a is a decomposition point, not a contact edge."
-        )
+    with st.expander("Toe spring", expanded=frame is not None):
+        if frame is not None:
+            cols = st.columns(4)
+            cols[0].metric("θ (°)", f"{frame.theta_deg:.5g}")
+            cols[1].metric("Spring moment (N·m)", f"{frame.toe_spring_moment_Nm:.5g}")
+            cols[2].metric("Equilibrium residual (N·m)", f"{frame.toe_equilibrium_residual_Nm:.3e}")
+            cols[3].metric("Toe evaluations", f"{frame.toe_iterations}")
+            st.caption(
+                f"status {frame.status}; roots θ = {[round(r, 4) for r in frame.roots_theta_deg]} °; "
+                f"stable = {frame.toe_equilibrium_stable}; Q_α = {frame.Q_alpha_shoe_on_foot:.5g} N·m; "
+                f"θ = arctan(α) exactly."
+            )
+        else:
+            st.caption("θ is prescribed (no toe-spring solve).")
+
+    lower = str(applied_model.get("lower_foam_material", ""))
+    lower_nu = applied_model.get("ffleap_nu" if lower == FOAM_FFLEAP else "ffturbo_nu")
+    _out_of_plane_section(model, sol, oop_settings, poisson_ratio=None if lower_nu is None else float(lower_nu))
 
     with st.expander("Plate results", expanded=False):
-        if not has_plate_lookup:
+        if not has_plate_model:
             st.caption("Plate response unavailable (N/A).")
         elif not show_plate or not shape.has_plate:
             st.caption("Plate display disabled or no plate state for this selection (N/A).")
@@ -1426,132 +1415,28 @@ def main() -> None:
                 f"color = {plate_color_key}; elastic scale s = {shape.scale:.4g}."
             )
 
-    # Diagnostics are opt-in: building ~19 figures on every slider tick leaked
-    # Matplotlib state when Streamlit cancelled mid-rerun, which led to segfaults.
-    plt.close("all")
-    t_diag_build = 0.0
-    t_diag_render = 0.0
-    if show_diagnostics:
-        t3 = time.perf_counter()
-        ev = selection.evaluation
-        figs = []
-        try:
-            n_b = int(lookup.n_bottom_nodes)
-            starts, ends = ev.contact_start_index, ev.contact_end_index
-            for values, title in (
-                (np.log10(np.maximum(ev.violation_score, 1e-30)), "log10 violation score V(i, j)"),
-                (ev.admissible.astype(float), "admissible intervals (1 = admissible)"),
-                (ev.min_free_gap, "minimum free gap g^F(i, j)"),
-                (ev.min_contact_reaction, "minimum contact R_n^F(i, j)"),
-            ):
-                grid = np.full((n_b, n_b), np.nan)
-                ok = ev.evaluated & np.isfinite(values)
-                grid[ends[ok], starts[ok]] = values[ok]
-                fig, ax = plt.subplots(figsize=(5, 4))
-                im = ax.imshow(grid, origin="lower", aspect="auto", interpolation="nearest")
-                ax.plot([interval[0]], [interval[1]], "rx", ms=10)
-                ax.set_xlabel("start index i")
-                ax.set_ylabel("end index j")
-                ax.set_title(title)
-                fig.colorbar(im, ax=ax)
-                fig.tight_layout()
-                figs.append(fig)
-
-            fig, ax = plt.subplots(figsize=(6, 3))
-            ax.plot(lookup.x_bottom, selection.full_bottom_gap, "-o", markersize=3)
-            for xe in (span_lo, span_hi):
-                ax.axvline(xe, color="C3", ls="--")
-            ax.axvline(anchor_x, color="0.5", ls=":")
-            ax.set_title(
-                f"Selected ({contact_type.value}) bottom fixed-frame normal gap"
-            )
-            ax.set_xlabel("x (material)")
-            ax.set_ylabel("g^F")
-            ax.grid(True, alpha=0.3)
-            figs.append(fig)
-            fig, ax = plt.subplots(figsize=(6, 3))
-            ax.plot(
-                lookup.x_bottom,
-                selection.full_bottom_reaction_normal,
-                "-o",
-                markersize=3,
-                label="R_n^F",
-            )
-            ax.plot(
-                lookup.x_bottom,
-                selection.full_bottom_reaction_tangential,
-                "-s",
-                markersize=3,
-                label="R_t^F",
-            )
-            for xe in (span_lo, span_hi):
-                ax.axvline(xe, color="C3", ls="--")
-            ax.set_title(
-                f"Selected ({contact_type.value}) bottom nodal reaction force "
-                "(not pressure)"
-            )
-            ax.set_xlabel("x (material)")
-            ax.set_ylabel("nodal reaction force")
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.3)
-            figs.append(fig)
-            t_diag_build = time.perf_counter() - t3
-
-            with st.expander("Diagnostic plots", expanded=True):
-                t4 = time.perf_counter()
-                for fig in figs:
-                    st.pyplot(fig)
-                t_diag_render = time.perf_counter() - t4
-                st.caption(
-                    f"Diagnostic build {_fmt_ms(t_diag_build)}, "
-                    f"render {_fmt_ms(t_diag_render)}"
-                )
-        finally:
-            for fig in figs:
-                plt.close(fig)
-            plt.close("all")
-    else:
-        st.caption("Diagnostic plots disabled (enable in the sidebar to build them).")
-
-    t_plot_total = t_shape + t_shape_render + t_diag_build
-    t_total = t_rebuild + t_calc + t_plot_total
-
+    t_total = t_calc + t_shape + t_shape_render
     with st.expander("Timing (this rerun)", expanded=False):
         tcols = st.columns(5)
-        tcols[0].metric("Model rebuild", _fmt_ms(t_rebuild))
-        tcols[1].metric("Calculation", _fmt_ms(t_calc))
-        tcols[2].metric("Shape build", _fmt_ms(t_shape))
-        tcols[3].metric("Shape plotly", _fmt_ms(t_shape_render))
-        tcols[4].metric("Diag. build", _fmt_ms(t_diag_build))
+        tcols[0].metric("Free response", _fmt_ms(sol.timings["free_response_s"]))
+        tcols[1].metric("Contact solve", _fmt_ms(sol.timings["contact_solve_s"]))
+        tcols[2].metric("Toe outer", _fmt_ms(frame.timings["toe_outer_s"]) if frame is not None else na)
+        tcols[3].metric("Reconstruction + plots", _fmt_ms(t_shape + t_shape_render))
+        tcols[4].metric("Total evaluation", _fmt_ms(t_total))
         st.caption(
-            f"Measured total (rebuild + calc + shape + diag build): {_fmt_ms(t_total)}. "
-            "Model rebuild = FEM compliance + contact lookup in a subprocess "
-            "(cached via st.cache_resource; isolates Gmsh from Streamlit). "
-            "Calculation = evaluate_from_angles (rotation, 2x2 solve, superposition). "
-            "Shape/diag build = figure construction (Plotly shape / Matplotlib diagnostics). "
-            "Shape plotly = Streamlit Plotly marshalling (orjson when installed). "
-            "Diagnostic figures are only built when enabled in the sidebar."
+            f"Calculation (all contact solves{' and toe iterations' if frame is not None else ''}): {_fmt_ms(t_calc)}. "
+            "The model rebuild runs once per model in a subprocess (cached)."
         )
 
     st.subheader("Export")
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    if st.button("Save contact lookup NPZ/CSV/JSON"):
-        npz_path = save_contact_lookup(lookup, EXPORT_DIR)
-        st.success(f"Wrote lookup to {npz_path}")
-    tmp_csv = EXPORT_DIR / "query_table.csv"
-    export_evaluation_csv(selection, tmp_csv)
+    if st.button("Save contact model NPZ"):
+        npz_path = save_contact_model(model, EXPORT_DIR)
+        st.success(f"Wrote contact model to {npz_path}")
     st.download_button(
-        "Download candidate table CSV",
-        data=tmp_csv.read_text(encoding="utf-8"),
-        file_name="candidate_evaluation.csv",
-        mime="text/csv",
-    )
-    tmp_npz = EXPORT_DIR / "selected_result.npz"
-    export_selected_result(selection, lookup, tmp_npz)
-    st.download_button(
-        "Download selected result NPZ",
-        data=tmp_npz.read_bytes(),
-        file_name="selected_result.npz",
+        "Download contact state NPZ",
+        data=_state_npz(model, sol, np.deg2rad(theta_out)),
+        file_name="contact_state.npz",
         mime="application/octet-stream",
     )
 

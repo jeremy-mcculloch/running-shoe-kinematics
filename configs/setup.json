@@ -12,7 +12,7 @@
     "ffleap_E_toe_Pa": 207000.0,
     "ffleap_nu": 0.113,
     "EI_plate_Nm2_per_m": 2.0,
-    "mesh_size_m": 0.001,
+    "mesh_size_m": 0.003,
     "toe_refinement": 0.4,
     "heel_corner_refinement": 0.5,
     "interface_refinement": 0.6,
@@ -26,8 +26,7 @@
     "toe_length_mm": 59.4,
     "min_bend_radius_mm": 6.75,
     "reciprocity_tol": 1e-06,
-    "output_dir": "../outputs/measured_sole_lookup",
-    "store_nodal_fields": false
+    "output_dir": "../outputs/measured_sole_lookup"
   },
   "toe_spring": {
     "toe_model": "passive_spring",

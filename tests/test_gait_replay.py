@@ -7,12 +7,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from compliance_fem.contact.topology import ContactType
 from compliance_fem.gait.phi_markers import estimate_phi, select_chord_markers
 from compliance_fem.gait.replay import replay_stance, save_replay_result
 from compliance_fem.gait.sagittal import lab_grf_to_model_top_wrench
 from compliance_fem.gait.stance import detect_stances
-from compliance_fem.gait.temporal import TemporalWeights, viterbi_select
 from compliance_fem.gait.wang_io import (
     discover_trials,
     parse_wang_trial_name,
@@ -175,50 +173,6 @@ def test_wang_marker_aliases_for_phi():
     assert np.all(np.isfinite(series.phi_rad))
 
 
-def test_viterbi_continuity_and_forefoot():
-    from compliance_fem.gait.candidate import WrenchCandidate
-
-    n_b = 13
-    spans = {ContactType.HEEL: (0, 4), ContactType.FULL: (0, n_b - 1), ContactType.TOE: (8, n_b - 1)}
-
-    def cand(ctype, theta, row=0, adm=True):
-        i, j = spans[ctype]
-        return WrenchCandidate(
-            row=row,
-            contact_type=ctype,
-            contact_start_index=i,
-            contact_end_index=j,
-            contact_start_x=float(i),
-            contact_end_x=float(j),
-            anchor_x=0.5 * (i + j),
-            d_ax=0.0,
-            d_ay=0.0,
-            alpha=np.tan(np.deg2rad(theta)),
-            theta_deg=theta,
-            Fx_pred=0.0,
-            Fy_pred=-100.0,
-            Mz_pred=0.0,
-            force_residual=0.1 if adm else 5.0,
-            moment_residual=0.1,
-            cop_residual=0.0,
-            cond=1.0,
-            max_free_penetration=0.0,
-            min_contact_reaction=1.0,
-            admissible=adm,
-            status="ok",
-            gamma=np.zeros(5),
-        )
-
-    frames = [
-        [cand(ContactType.TOE, 5.0), cand(ContactType.HEEL, 5.0, adm=False)],
-        [cand(ContactType.TOE, 6.0), cand(ContactType.FULL, 20.0)],
-        [cand(ContactType.TOE, 7.0), cand(ContactType.HEEL, 0.0)],
-    ]
-    path = viterbi_select(frames, weights=TemporalWeights(topology_jump=0.1))
-    assert all(c.contact_type is ContactType.TOE for c in path)
-    assert all(c.interval == spans[ContactType.TOE] for c in path)
-
-
 def test_visco_three_components_chronological():
     m = create_material(SLSConfig(g_inf=0.5, tau_r=0.2, n_components=3))
     t = np.linspace(0, 0.5, 20)
@@ -241,9 +195,8 @@ def test_elastic_identity_wrench():
     np.testing.assert_allclose(Fe, F)
 
 
-def test_shoe_width_scales_forces(flat_lookup):
+def test_shoe_width_scales_forces(flat_model):
     """Experimental totals / width -> plane-strain per-metre loads."""
-    lookup = flat_lookup
     t = np.array([0.0, 0.05, 0.1])
     syn = {
         "times": t,
@@ -252,15 +205,15 @@ def test_shoe_width_scales_forces(flat_lookup):
         "Mz": np.array([0.0, 2.0, 2.0]),
         "phi": np.zeros_like(t),
     }
-    r1 = replay_stance(lookup, synthetic=syn, shoe_width_m=1.0)
-    r01 = replay_stance(lookup, synthetic=syn, shoe_width_m=0.1)
+    r1 = replay_stance(flat_model, synthetic=syn, shoe_width_m=1.0)
+    r01 = replay_stance(flat_model, synthetic=syn, shoe_width_m=0.1)
     np.testing.assert_allclose(r01.elastic_Fx, r1.elastic_Fx / 0.1)
     np.testing.assert_allclose(r01.elastic_Fy, r1.elastic_Fy / 0.1)
     np.testing.assert_allclose(r01.elastic_Mz, r1.elastic_Mz / 0.1)
     assert r01.model_info["shoe_width_m"] == 0.1
 
 
-def test_end_to_end_synthetic_replay(flat_lookup, tmp_path: Path):
+def test_end_to_end_synthetic_replay(flat_model, tmp_path: Path):
     t = np.linspace(0.0, 0.2, 40)
     ramp = np.clip(t / 0.02, 0, 1)
     syn = {
@@ -270,12 +223,20 @@ def test_end_to_end_synthetic_replay(flat_lookup, tmp_path: Path):
         "Mz": 2.0 * ramp,
         "cop_x": np.zeros_like(t),
         "cop_y": np.zeros_like(t),
-        "phi": np.full_like(t, float(flat_lookup.phi_ref)),
+        "phi": np.full_like(t, float(flat_model.phi_ref)),
     }
-    result = replay_stance(flat_lookup, synthetic=syn, visco_model="elastic", shoe_width_m=1.0)
+    result = replay_stance(flat_model, synthetic=syn, visco_model="elastic", shoe_width_m=1.0)
     paths = save_replay_result(result, tmp_path)
     assert paths["csv"].exists()
     assert result.model_info["toe_angle_method"] == "passive-toe-spring-exact"
     assert np.all(result.contact_start_index[10:] >= 0)
     assert np.all(result.contact_end_index[10:] >= result.contact_start_index[10:])
     assert np.all(np.isfinite(result.theta_deg[10:]))
+    assert np.all(result.frame_valid[10:])
+    assert set(result.contact_type) <= {"none", "heel", "interior", "toe", "full"}
+    n_b = flat_model.n_bottom_nodes
+    assert result.gap.shape == result.normal_reaction.shape == result.active.shape == (t.size, n_b)
+    assert np.all(np.isfinite(result.normal_reaction[10:]))
+    assert paths["npz"].exists()
+    with np.load(paths["npz"], allow_pickle=True) as npz:
+        assert npz["gap"].shape == (t.size, n_b)

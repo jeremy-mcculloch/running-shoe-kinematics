@@ -1,11 +1,13 @@
-"""Internal plate response: primal recovery, Hermite postprocess, runtime fields.
+"""Internal plate response: influence matrices, Hermite postprocess, runtime fields.
 
 The plate is the Euler–Bernoulli / Hermite interface between the two foams.
-All expensive work happens during lookup generation by recovering the full
-primal FEM displacement for each contact-state basis response from the same
-augmented free-body operator used to build the compliance tables. Runtime
-only contracts the five stored plate basis fields with ``gamma`` and evaluates
-Hermite interpolants.
+At build time one multi-RHS solve of the factorized augmented free-body
+operator (the same one behind the compliance blocks) gives the plate nodal
+fields per unit boundary load and per unit rigid amplitude
+(:class:`PlateInfluence`). At runtime one continuous contact solution supplies
+``[F_t; f_b]`` and the rigid amplitudes, the plate fields are two small matrix
+products (``contact_model.plate_fields``) and the centreline is rebuilt with
+cubic Hermite interpolation.
 
 Sign conventions (must match ``plate.py``)
 ------------------------------------------
@@ -27,25 +29,12 @@ import numpy as np
 from scipy import sparse
 
 from compliance_fem.fem.boundaries import build_vector_selector
-from compliance_fem.contact.basis import N_AFFINE_COLUMNS
-from compliance_fem.contact.corotation import (
-    basis_coefficients,
-    contract_basis,
-    transform_to_fixed_frame,
-)
+from compliance_fem.contact.corotation import transform_to_fixed_frame
 from compliance_fem.fem.plate import plate_translational_dofs
 
 if TYPE_CHECKING:
     from compliance_fem.fem.compliance import ComplianceResult
-    from compliance_fem.contact.lookup import ContactLookupResult
-    from compliance_fem.contact.force_control import ContactSelection
 
-PLATE_MODEL = "Euler-Bernoulli"
-PLATE_AXIAL_MODEL = "exact_inextensibility_constraint"
-CONSTRAINT_ROW_NORMALIZATION = "unscaled_t_dot_delta_u"
-PLATE_ROTATION_SIGN = "theta = dw/ds with w = n_p · (u, v)"
-PLATE_NORMAL_SIGN = "n_p = (-t_y, t_x); flat plate n_p = (0, 1) upward"
-COORDINATE_FRAME = "corotated_local"
 DEFAULT_SAMPLES_PER_ELEMENT = 16
 
 @dataclass(frozen=True)
@@ -78,20 +67,6 @@ class PlateMeshInfo:
     @property
     def n_elements(self) -> int:
         return int(self.element_connectivity.shape[0])
-
-
-@dataclass
-class PlateBasisFields:
-    """Five-mode plate fields for one contact record (local rotating frame)."""
-
-    u_local: np.ndarray  # (5, n_nodes)
-    v_local: np.ndarray
-    rotation_local: np.ndarray
-    constraint_multiplier: np.ndarray  # (5, n_constraints)
-    axial_force: np.ndarray  # (5, n_elements)
-    bp_residual: np.ndarray  # (5,)
-    top_bc_residual: np.ndarray  # (5,)
-    contact_bc_residual: np.ndarray  # (5,)
 
 
 @dataclass
@@ -452,67 +427,6 @@ def build_plate_influence(
     )
 
 
-def plate_basis_from_influence(
-    influence: PlateInfluence,
-    F_t: np.ndarray,
-    F_c: np.ndarray,
-    contact_nodes: np.ndarray,
-    Alpha: np.ndarray,
-    W_t: np.ndarray,
-    W_c: np.ndarray,
-) -> PlateBasisFields:
-    """Plate fields for one record from precomputed influence matrices (no solves).
-
-    The residuals are relative to the record's displacement scale
-    ``S = max over columns of (||W_t||, ||W_c||, ||(u, v)_plate||)``, a normwise
-    backward-error measure: individual columns can have a zero prescribed
-    displacement (so a per-column ratio is undefined), and the roundoff in the
-    recovered field grows with mesh refinement while ``S`` does not.
-    """
-    F_t = np.asarray(F_t, dtype=float)
-    n_cols = F_t.shape[1]
-    contact = np.asarray(contact_nodes, dtype=int)
-    n_b = influence.n_bottom
-    F_bottom = np.zeros((2 * n_b, n_cols), dtype=float)
-    if contact.size:
-        n_c = int(contact.size)
-        F_bottom[contact] = F_c[:n_c]
-        F_bottom[contact + n_b] = F_c[n_c:]
-    loads = np.vstack([F_t, F_bottom])
-    Al = np.asarray(Alpha, dtype=float)
-    u = influence.u @ loads + influence.rigid_u @ Al
-    v = influence.v @ loads + influence.rigid_v @ Al
-    th = influence.theta @ loads + influence.rigid_theta @ Al
-    lam = influence.lam @ loads
-    bp = influence.bp @ loads + influence.rigid_bp @ Al
-    top = influence.top @ loads + influence.rigid_top @ Al
-    W_t = np.asarray(W_t, dtype=float)
-    W_c = np.asarray(W_c, dtype=float)
-    scale = max(
-        float(np.max(np.linalg.norm(W_t, axis=0), initial=0.0)),
-        float(np.max(np.linalg.norm(W_c, axis=0), initial=0.0)) if W_c.size else 0.0,
-        float(np.max(np.hypot(np.linalg.norm(u, axis=0), np.linalg.norm(v, axis=0)), initial=0.0)),
-    )
-    scale = scale if scale > 0.0 else 1.0
-    top_res = np.linalg.norm(top - W_t, axis=0) / scale
-    if contact.size:
-        bottom = influence.bottom @ loads + influence.rigid_bottom @ Al
-        rows = np.concatenate([contact, contact + n_b])
-        contact_res = np.linalg.norm(bottom[rows] - W_c, axis=0) / scale
-    else:
-        contact_res = np.zeros(n_cols)
-    return PlateBasisFields(
-        u_local=u.T.copy(),
-        v_local=v.T.copy(),
-        rotation_local=th.T.copy(),
-        constraint_multiplier=lam.T.copy(),
-        axial_force=axial_force_from_multiplier(lam.T),
-        bp_residual=np.linalg.norm(bp, axis=0) / scale,
-        top_bc_residual=top_res,
-        contact_bc_residual=contact_res,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Runtime superposition and Hermite rendering
 # ---------------------------------------------------------------------------
@@ -642,12 +556,11 @@ def sample_plate_centerline(
 
 def build_plate_runtime_state(
     mesh: PlateMeshInfo,
-    u_basis: np.ndarray,
-    v_basis: np.ndarray,
-    theta_basis: np.ndarray,
-    lambda_basis: np.ndarray,
-    axial_basis: np.ndarray,
-    gamma: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    th: np.ndarray,
+    lam: np.ndarray,
+    ax: np.ndarray,
     *,
     anchor_x: float,
     d_ax: float,
@@ -657,14 +570,17 @@ def build_plate_runtime_state(
     samples_per_element: int = DEFAULT_SAMPLES_PER_ELEMENT,
     color_quantity: str = "none",
     anchor_y: float = 0.0,
+    anchor: tuple[float, float] | None = None,
 ) -> PlateRuntimeState:
-    """Contract plate basis fields and build Hermite fixed-frame samples."""
-    gamma = np.asarray(gamma, dtype=float).reshape(-1)
-    u = contract_basis(u_basis, gamma, mode_axis=0)
-    v = contract_basis(v_basis, gamma, mode_axis=0)
-    th = contract_basis(theta_basis, gamma, mode_axis=0)
-    lam = contract_basis(lambda_basis, gamma, mode_axis=0)
-    ax = contract_basis(axial_basis, gamma, mode_axis=0)
+    """Build Hermite fixed-frame samples from local plate nodal fields.
+
+    ``u, v, th`` are nodal (local frame), ``lam`` / ``ax`` per element. The
+    fixed-frame placement is ``transform_to_fixed_frame`` about the material
+    point ``(anchor_x, anchor_y)`` with local displacement ``(d_ax, d_ay)`` and
+    true position ``anchor``; ``elastic_scale`` multiplies only the elastic part.
+    """
+    u, v, th = (np.asarray(a, dtype=float) for a in (u, v, th))
+    lam, ax = np.asarray(lam, dtype=float), np.asarray(ax, dtype=float)
     u_s, w = nodal_tangential_normal(u, v, mesh)
     axial_diff = float(np.max(np.abs(np.diff(u_s)))) if u_s.size > 1 else 0.0
     # Constraint residual from nodal tangential differences (kinematic form).
@@ -702,6 +618,7 @@ def build_plate_runtime_state(
         float(d_ax),
         float(d_ay),
         float(varphi),
+        anchor=anchor,
         elastic_scale=float(elastic_scale),
         y_anchor=float(anchor_y),
     )
@@ -775,22 +692,7 @@ def build_plate_runtime_state(
     )
 
 
-def empty_plate_basis(n_nodes: int, n_elements: int) -> PlateBasisFields:
-    """NaN plate basis for records when FEM recovery is unavailable."""
-    C = N_AFFINE_COLUMNS
-    return PlateBasisFields(
-        u_local=np.full((C, n_nodes), np.nan),
-        v_local=np.full((C, n_nodes), np.nan),
-        rotation_local=np.full((C, n_nodes), np.nan),
-        constraint_multiplier=np.full((C, n_elements), np.nan),
-        axial_force=np.full((C, n_elements), np.nan),
-        bp_residual=np.full(C, np.nan),
-        top_bc_residual=np.full(C, np.nan),
-        contact_bc_residual=np.full(C, np.nan),
-    )
-
-
-def plate_mesh_from_lookup(lookup: ContactLookupResult) -> PlateMeshInfo | None:
+def plate_mesh_from_lookup(lookup) -> PlateMeshInfo | None:
     """Reconstruct ``PlateMeshInfo`` from saved lookup arrays.
 
     Runtime Hermite sampling only needs geometry, ``EI_plate_Nm2_per_m``, and
@@ -842,51 +744,4 @@ def plate_mesh_from_lookup(lookup: ContactLookupResult) -> PlateMeshInfo | None:
         n_foam=n_foam,
         n_primal=n_primal,
         n_lambda=n_lambda,
-    )
-
-
-def plate_state_for_selection(
-    lookup: ContactLookupResult,
-    selection: ContactSelection,
-    *,
-    elastic_scale: float = 1.0,
-    samples_per_element: int = DEFAULT_SAMPLES_PER_ELEMENT,
-    color_quantity: str = "none",
-) -> PlateRuntimeState | None:
-    """Contract stored plate basis fields for the selected contact record."""
-    if not getattr(lookup, "has_plate_response", False):
-        return None
-    row = getattr(selection, "selected_row", None)
-    if row is None:
-        return None
-    if selection.d_ax is None or selection.d_ay is None or selection.anchor_x is None:
-        return None
-    mesh = plate_mesh_from_lookup(lookup)
-    if mesh is None:
-        return None
-    row = int(row)
-    try:
-        f = lookup.record_fields([row], plate=True)
-    except ValueError:
-        return None
-
-    gamma = basis_coefficients(
-        selection.alpha, selection.d_ax, selection.d_ay, selection.varphi
-    )
-    return build_plate_runtime_state(
-        mesh,
-        f["plate_u_local"][0],
-        f["plate_v_local"][0],
-        f["plate_rotation_local"][0],
-        f["plate_constraint_multiplier"][0],
-        f["plate_axial_force"][0],
-        gamma,
-        anchor_x=float(selection.anchor_x),
-        d_ax=float(selection.d_ax),
-        d_ay=float(selection.d_ay),
-        varphi=float(selection.varphi),
-        elastic_scale=float(elastic_scale),
-        samples_per_element=int(samples_per_element),
-        color_quantity=str(color_quantity),
-        anchor_y=float(getattr(selection, "anchor_y", 0.0) or 0.0),
     )

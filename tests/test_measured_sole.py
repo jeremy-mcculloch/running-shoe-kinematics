@@ -2,7 +2,7 @@
 
 Numbered comments follow the measured-sole specification (tests 1-67). The
 full-resolution 270 mm model is used for geometry / mesh / plate checks; a
-subsampled copy of the same CSV with a coarse mesh keeps the lookup tests fast.
+subsampled copy of the same CSV with a coarse mesh keeps the contact tests fast.
 """
 
 from __future__ import annotations
@@ -22,25 +22,18 @@ from compliance_fem.fem.compliance import (
     save_compliance_npz,
 )
 from compliance_fem.contact.sole_config import SoleConfig, validate_shoe_length_mm
-from compliance_fem.contact.basis import N_AFFINE_COLUMNS
-from direct_fem import (
-    run_standard_direct_comparisons,
-    solve_direct_fem_contact,
-    standard_validation_intervals,
-)
-from compliance_fem.contact.lookup import (
+from compliance_fem.contact.contact_model import (
     LOOKUP_SCHEMA_VERSION,
     REGENERATE_LOOKUP_MESSAGE,
-    SCALAR_FX,
-    SCALAR_FY,
-    SCALAR_MZ,
-    get_compliance_block_matrix,
-    generate_contact_lookup,
-    load_contact_lookup,
-    save_contact_lookup,
+    ContactModel,
+    build_contact_model,
+    load_contact_model,
+    save_contact_model,
+    selection_proxy,
 )
-from compliance_fem.contact.topology import ContactInterval, interval_row, n_intervals
-from compliance_fem.contact.force_control import evaluate_candidates, select_contact_candidate
+from compliance_fem.contact.continuous_contact import ContactSolution, solve_contact_state
+from compliance_fem.contact.continuous_toe import solve_toe_contact
+from compliance_fem.contact.toe_spring import ToeSpringConfig
 from compliance_fem.geometry.profile import (
     BOUNDARY_TAGS,
     FOAM_REGION_TAGS,
@@ -133,22 +126,25 @@ def coarse_fem(coarse_cfg):
     return compute_compliance(coarse_cfg)
 
 
+
+
 @pytest.fixture(scope="module")
-def coarse_lookup(coarse_fem):
+def coarse_model(coarse_fem) -> ContactModel:
     with pytest.warns(UserWarning):
-        return generate_contact_lookup(get_compliance_block_matrix(coarse_fem), toe_length=TOE_LENGTH_SOFT, kappa=KAPPA, fem_result=coarse_fem, store_fields=True)
+        return build_contact_model(coarse_fem, toe_length=TOE_LENGTH_SOFT, kappa=KAPPA)
 
 
 @pytest.fixture(scope="module")
-def saved_lookup(coarse_lookup, tmp_path_factory):
+def saved_model(coarse_model, tmp_path_factory):
     out = tmp_path_factory.mktemp("meas_lookup")
-    path = save_contact_lookup(coarse_lookup, out)
-    return path, load_contact_lookup(path)
+    path = save_contact_model(coarse_model, out)
+    return path, load_contact_model(path)
 
 
-def _selection(lookup, phi_deg=0.0, theta_deg=0.0, Fx=0.0, Fy=-1500.0):
-    ev = evaluate_candidates(lookup, Fx, Fy, phi_deg, theta_deg)
-    return ev, select_contact_candidate(ev)
+def _solve(model: ContactModel, phi_deg=0.0, theta_deg=0.0, Fx=0.0, Fy=-1500.0) -> ContactSolution:
+    """Contact state at absolute chord angle ``phi_deg`` and toe angle ``theta_deg`` (per-metre loads)."""
+    varphi = float(np.deg2rad(phi_deg)) - model.phi_ref
+    return solve_contact_state(model.operator, varphi, float(np.tan(np.deg2rad(theta_deg))), np.array([Fx, Fy]))
 
 
 # ---------------------------------------------------------------------------
@@ -528,28 +524,17 @@ def test_toe_selector_ownership(meas_fem, meas_mesh) -> None:
 
 
 # 43. Top resultants sum over the top selector only (toe not double-counted).
-def test_top_force_no_double_count(coarse_lookup, coarse_fem) -> None:
+def test_top_force_no_double_count(coarse_model, coarse_fem) -> None:
     n_t = coarse_fem.n_top_nodes
     assert n_t == len(coarse_fem.mesh_data.top_curve_nodes) - 1
-    rows = coarse_lookup.valid_rows[:50]
-    fx = coarse_lookup.top_force_x_basis[rows]
-    fy = coarse_lookup.top_force_y_basis[rows]
-    assert fx.shape[-1] == n_t
-    np.testing.assert_allclose(coarse_lookup.scalar_lookup[rows, :, SCALAR_FX], fx.sum(axis=-1), rtol=1e-12, atol=1e-9)
-    np.testing.assert_allclose(coarse_lookup.scalar_lookup[rows, :, SCALAR_FY], fy.sum(axis=-1), rtol=1e-12, atol=1e-9)
-    total = coarse_lookup.contact_force_total[rows][..., :2]
-    top_total = coarse_lookup.scalar_lookup[rows][..., [SCALAR_FX, SCALAR_FY]]
-    scale = np.abs(top_total).max()
-    np.testing.assert_allclose(top_total + total, 0.0, atol=1e-8 * scale)
-
-
-# 44. Candidates containing the toe are well posed.
-def test_toe_candidates_valid(coarse_lookup) -> None:
-    n_b = coarse_lookup.n_bottom_nodes
-    toe_rows = np.flatnonzero(coarse_lookup.contact_end_index == n_b - 1)
-    assert toe_rows.size == n_b
-    assert np.all(coarse_lookup.valid_mask[toe_rows])
-    assert np.all(np.isfinite(coarse_lookup.condition_estimates[toe_rows]))
+    assert coarse_model.n_top_nodes == n_t
+    sol = _solve(coarse_model, 4.0, 3.0, Fx=150.0)
+    assert sol.F_t.shape == (2 * n_t,)
+    d = sol.diagnostics
+    assert d["Fx_local"] == pytest.approx(float(sol.F_t[:n_t].sum()), rel=1e-12)
+    assert d["Fy_local"] == pytest.approx(float(sol.F_t[n_t:].sum()), rel=1e-12)
+    # Top resultant balances the bottom reactions.
+    assert d["equilibrium_force_residual"] <= 1e-8 * np.hypot(150.0, 1500.0)
 
 
 # ---------------------------------------------------------------------------
@@ -566,140 +551,46 @@ def test_block_shapes(coarse_fem) -> None:
     assert coarse_fem.reciprocity_error < 1e-8
 
 
-# 46-47. Resultants are nodal sums; Mz uses both components and actual coordinates.
-def test_moment_uses_both_components(coarse_lookup) -> None:
-    y_top = np.asarray(coarse_lookup.y_top)
-    assert np.ptp(y_top) > 0.01 * coarse_lookup.L
-    row = coarse_lookup.full_contact_row()
-    fx = coarse_lookup.top_force_x_basis[row]
-    fy = coarse_lookup.top_force_y_basis[row]
-    mz = coarse_lookup.x_top @ fy.T - y_top @ fx.T
-    np.testing.assert_allclose(coarse_lookup.scalar_lookup[row, :, SCALAR_MZ], mz, rtol=1e-12, atol=1e-12 * np.abs(mz).max())
+# 48. Curved bottom ordered heel to toe.
+def test_bottom_order(coarse_model) -> None:
+    assert np.all(np.diff(coarse_model.x_bottom) > 0.0)
+    assert np.ptp(coarse_model.y_top) > 0.01 * coarse_model.L
 
 
-# 48-49. Curved bottom ordered heel to toe; interval enumeration.
-def test_bottom_order_and_enumeration(coarse_lookup) -> None:
-    n_b = coarse_lookup.n_bottom_nodes
-    assert np.all(np.diff(coarse_lookup.x_bottom) > 0.0)
-    assert coarse_lookup.n_records == n_intervals(n_b) == n_b * (n_b + 1) // 2
-    starts, ends = coarse_lookup.contact_start_index, coarse_lookup.contact_end_index
-    assert np.all(starts <= ends)
-    assert len({(int(i), int(j)) for i, j in zip(starts, ends)}) == coarse_lookup.n_records
-
-
-# 50. The closure column places active nodes on the ground.
-def test_closure_places_contact_on_ground(coarse_lookup) -> None:
-    y_b = np.asarray(coarse_lookup.y_bottom)
-    assert y_b.min() < 0.0 < y_b.max()  # genuinely curved, partly below the heel datum
-    for row in coarse_lookup.valid_rows[::97]:
-        iv = coarse_lookup.interval(row)
-        c = iv.contact_node_ids
-        y_a = coarse_lookup.contact_anchor_reference_y[row]
-        np.testing.assert_allclose(
-            y_b[c] + coarse_lookup.bottom_v_basis[row, 0, c] - y_a, 0.0, atol=1e-12 * coarse_lookup.L
-        )
-
-
-def _fixed_frame_state(lookup, sel):
-    from compliance_fem.contact.corotation import affine_coefficients
-
-    row = sel.selected_row
-    varphi = float(sel.varphi)
-    gamma = np.array([sel.alpha, sel.d_ax, sel.d_ay, np.cos(varphi) - 1.0, -np.sin(varphi)])
-    coef = affine_coefficients(gamma)
-    u = coef @ lookup.bottom_u_basis[row]
-    v = coef @ lookup.bottom_v_basis[row]
-    rx = coef @ lookup.reaction_x_basis[row]
-    ry = coef @ lookup.reaction_y_basis[row]
-    c, s = np.cos(varphi), np.sin(varphi)
-    xa, ya = lookup.contact_anchor_reference_x[row], lookup.contact_anchor_reference_y[row]
-    gap = s * (lookup.x_bottom - xa + u - sel.d_ax) + c * (lookup.y_bottom - ya + v - sel.d_ay)
-    rn = s * rx + c * ry
-    return lookup.interval(row), gap, rn
-
-
-# 51-54. Full fixed-frame gaps on every free node; rotated reactions on every contact node.
+# 51-54, 66. Fixed-frame gaps on every node; contact shading follows the deformed bottom on the ground.
 @pytest.mark.parametrize("phi,theta", [(0.0, 0.0), (12.0, 5.0), (-14.0, 20.0)])
-def test_fixed_frame_gap_and_reaction(coarse_lookup, phi, theta) -> None:
-    _, sel = _selection(coarse_lookup, phi, theta)
-    iv, gap, rn = _fixed_frame_state(coarse_lookup, sel)
-    free, contact = iv.sets()
-    if free.size:
-        assert sel.min_free_gap == pytest.approx(gap[free].min(), abs=1e-12 * coarse_lookup.L)
-        assert sel.max_free_penetration == pytest.approx(max(0.0, -gap[free].min()), abs=1e-12 * coarse_lookup.L)
-    np.testing.assert_allclose(gap[contact], 0.0, atol=1e-10 * coarse_lookup.L)
-    assert sel.min_contact_reaction == pytest.approx(rn[contact].min(), rel=1e-9, abs=1e-9)
-    shape = build_shape_plot_data(coarse_lookup, sel)
-    assert shape.contact_curve_y is not None
-    np.testing.assert_allclose(shape.contact_curve_y, 0.0, atol=1e-9 * coarse_lookup.L)
-
-
-# 55. Lookup superposition agrees with direct FEM (heel, interior, toe, full).
-def test_lookup_matches_direct_fem(coarse_fem) -> None:
-    n_b = coarse_fem.n_bottom_nodes
-    specs = {
-        "heel": ContactInterval(0, n_b // 3, n_b),
-        "interior": ContactInterval(n_b // 4, (3 * n_b) // 4, n_b),
-        "toe": ContactInterval((2 * n_b) // 3, n_b - 1, n_b),
-        "full": ContactInterval(0, n_b - 1, n_b),
-    }
-    out = run_standard_direct_comparisons(coarse_fem, TOE_LENGTH_SOFT, KAPPA, intervals=specs)
-    for name, comps in out.items():
-        worst = max(c.max_rel_error for c in comps)
-        assert worst < 1e-6, (name, worst)
-        assert max(c.free_traction_rel for c in comps) < 1e-8
-
-
-def _rel(a, b) -> float:
-    return float(np.linalg.norm(np.asarray(a) - np.asarray(b)) / max(np.linalg.norm(a), np.linalg.norm(b), 1e-30))
-
-
-# 55b. Generated lookup records (not just the interval solver) agree with direct FEM and balance.
-def test_lookup_records_match_direct_fem(coarse_fem, coarse_lookup) -> None:
-    lk = coarse_lookup
-    xt, yt = np.asarray(coarse_fem.x_top), np.asarray(coarse_fem.y_top)
-    xb, yb = np.asarray(coarse_fem.x_bottom), np.asarray(coarse_fem.y_bottom)
-    L = float(coarse_fem.config.shoe_length_m)
-    for name, spec in standard_validation_intervals(xb, L).items():
-        row = interval_row(spec.start, spec.end, spec.n_bottom)
-        assert lk.valid_mask[row], name
-        free, contact = spec.sets()
-        f = {key: value[0] for key, value in lk.record_fields([row]).items()}
-        for k in range(N_AFFINE_COLUMNS):
-            fem = solve_direct_fem_contact(coarse_fem, spec, k, lk.softplus_toe_length, lk.softplus_kappa)
-            ft_x, ft_y = f["top_force_x"][k], f["top_force_y"][k]
-            rc_x, rc_y = f["reaction_x"][k, contact], f["reaction_y"][k, contact]
-            assert _rel(np.r_[ft_x, ft_y], fem.f_t) < 1e-6, (name, k)
-            assert _rel(np.r_[rc_x, rc_y], fem.r_c) < 1e-6, (name, k)
-            if free.size:
-                assert _rel(np.r_[f["bottom_u"][k, free], f["bottom_v"][k, free]], fem.g_f) < 1e-6, (name, k)
-            fx, fy = np.r_[ft_x, rc_x], np.r_[ft_y, rc_y]
-            x, y = np.r_[xt, xb[contact]], np.r_[yt, yb[contact]]
-            scale = max(float(np.sum(np.abs(np.r_[ft_x, ft_y]))), 1e-30)
-            assert np.hypot(fx.sum(), fy.sum()) / scale < 1e-8, (name, k)
-            assert abs(np.sum(x * fy - y * fx)) / (scale * L) < 1e-8, (name, k)
-            assert np.linalg.norm(fem.r_free) / max(np.linalg.norm(fem.f_t), 1e-30) < 1e-8, (name, k)
+def test_fixed_frame_gap_and_reaction(coarse_model, phi, theta) -> None:
+    sol = _solve(coarse_model, phi, theta)
+    L = coarse_model.L
+    act = sol.active
+    assert act.any()
+    np.testing.assert_allclose(sol.gap[act], 0.0, atol=1e-9 * L)
+    assert np.all(sol.gap[~act] >= -1e-9 * L)
+    assert np.all(sol.lam[act] >= -1e-9 * np.abs(sol.lam).max())
+    np.testing.assert_array_equal(sol.lam[~act], 0.0)
+    assert sol.diagnostics["min_gap"] == pytest.approx(float(sol.gap.min()), abs=1e-15)
+    sh = build_shape_plot_data(coarse_model, selection_proxy(coarse_model, sol))
+    assert sh.contact_curves and len(sh.contact_curves) == len(sh.patches)
+    for (cx, cy), p in zip(sh.contact_curves, sh.patches):
+        np.testing.assert_allclose(cy, 0.0, atol=1e-9 * L)
+        np.testing.assert_allclose(cx, sh.bottom_node_x[p.start : p.end + 1], atol=1e-12 * L)
+    np.testing.assert_allclose(sh.bottom_gap, sol.gap)
+    assert sh.has_render_mesh and set(sh.region_def) == set(FOAM_REGION_TAGS)
 
 
 # 56. Passive toe equilibrium with k = 25 N m/rad.
-def test_passive_toe_exact(coarse_lookup) -> None:
-    from compliance_fem.gait.passive_toe import solve_passive_toe_candidates
-    from compliance_fem.contact.toe_spring import ToeSpringConfig
-
+def test_passive_toe_exact(coarse_model) -> None:
     cfg = ToeSpringConfig()
     assert cfg.toe_stiffness_Nm_per_rad == 25.0
-    cands = solve_passive_toe_candidates(
-        coarse_lookup, Fx_star=150.0, Fy_star=-1500.0, Mz_meas=0.0, phi_rad=-0.05, config=cfg, width_m=0.1
-    )
-    converged = [c for c in cands if c.toe.converged]
-    assert converged
-    for c in converged:
-        assert c.toe.toe_equilibrium_relative_residual < 1e-9
-        assert c.force_residual <= 1e-9 * np.hypot(150.0, 1500.0)
+    F = np.array([150.0, -1500.0])
+    fr = solve_toe_contact(coarse_model.operator, F, -0.05, cfg, 0.1)
+    assert fr.converged
+    assert fr.toe_equilibrium_relative_residual < 1e-9
+    assert fr.contact.diagnostics["force_residual"] <= 1e-9 * np.hypot(*F)
 
 
 # 57. No runtime FEM solve when gait inputs change.
-def test_no_runtime_fem_solve(coarse_lookup, monkeypatch) -> None:
+def test_no_runtime_fem_solve(coarse_model, monkeypatch) -> None:
     import scipy.sparse.linalg as spla
 
     import compliance_fem.fem.compliance as comp
@@ -709,9 +600,9 @@ def test_no_runtime_fem_solve(coarse_lookup, monkeypatch) -> None:
 
     for mod, name in ((spla, "splu"), (spla, "spsolve"), (comp, "splu"), (comp, "compute_compliance")):
         monkeypatch.setattr(mod, name, _forbidden)
-    for phi, theta, fy in ((0.0, 0.0, -800.0), (8.0, 3.0, -1500.0), (-12.0, 15.0, -2500.0)):
-        _, sel = _selection(coarse_lookup, phi, theta, Fy=fy)
-        build_shape_plot_data(coarse_lookup, sel)
+    for phi, fy in ((0.0, -800.0), (0.14, -1500.0), (-0.2, -2500.0)):
+        fr = solve_toe_contact(coarse_model.operator, np.array([0.1 * abs(fy), fy]), phi, ToeSpringConfig(), 0.1)
+        build_shape_plot_data(coarse_model, selection_proxy(coarse_model, fr))
 
 
 # ---------------------------------------------------------------------------
@@ -720,10 +611,10 @@ def test_no_runtime_fem_solve(coarse_lookup, monkeypatch) -> None:
 
 
 # 58-61. Geometry metadata, shoe length, tags and the toe convention survive serialization.
-def test_lookup_serialization(saved_lookup, coarse_lookup) -> None:
-    _, lk = saved_lookup
+def test_lookup_serialization(saved_model, coarse_model) -> None:
+    _, lk = saved_model
     assert lk.schema_version == LOOKUP_SCHEMA_VERSION
-    gm, ref = lk.geometry_metadata, coarse_lookup.geometry_metadata
+    gm, ref = lk.geometry_metadata, coarse_model.geometry_metadata
     assert gm["shoe_length_mm"] == SHOE_MM
     for key in ("plate_x_over_length", "physical_landmarks", "plate_start_reference_coordinate",
                 "plate_end_reference_coordinate", "top_surface_reference_coordinates",
@@ -732,11 +623,12 @@ def test_lookup_serialization(saved_lookup, coarse_lookup) -> None:
     assert gm["foam_region_tags"] == list(FOAM_REGION_TAGS)
     assert gm["boundary_tags"] == list(BOUNDARY_TAGS)
     assert gm["shared_toe_policy"] == SHARED_TOE_POLICY
-    assert gm["shared_toe_node_id"] == int(coarse_lookup.render_section["bottom_curve_node_ids"][-1])
-    for key, arr in coarse_lookup.render_section.items():
+    assert gm["shared_toe_node_id"] == int(coarse_model.render_section["bottom_curve_node_ids"][-1])
+    for key, arr in coarse_model.render_section.items():
         np.testing.assert_array_equal(lk.render_section[key], arr)
-    np.testing.assert_array_equal(lk.plate_node_ids, coarse_lookup.plate_node_ids)
-    np.testing.assert_array_equal(lk.rigid_alpha_basis, coarse_lookup.rigid_alpha_basis)
+    np.testing.assert_array_equal(lk.plate_mesh.node_ids, coarse_model.plate_mesh.node_ids)
+    np.testing.assert_array_equal(lk.operator.G_bb, coarse_model.operator.G_bb)
+    np.testing.assert_array_equal(lk.operator.psi_top, coarse_model.operator.psi_top)
 
 
 def _flat(obj):
@@ -768,40 +660,39 @@ def test_gui_scaling_uniform(meas_cfg) -> None:
 
 
 # 64. GUI colours follow the material of each region.
-def test_gui_material_colors(coarse_lookup) -> None:
+def test_gui_material_colors(coarse_model) -> None:
     from compliance_fem.gui.app import MATERIAL_FILL_COLORS, _draw_shape
 
-    _, sel = _selection(coarse_lookup)
+    sol = _solve(coarse_model)
     for upper, lower in (("FFTurbo", "FFLeap"), ("FFLeap", "FFTurbo")):
         lk = dataclasses.replace(
-            coarse_lookup,
-            geometry_metadata={**coarse_lookup.geometry_metadata, "upper_foam_material": upper, "lower_foam_material": lower},
+            coarse_model,
+            geometry_metadata={**coarse_model.geometry_metadata, "upper_foam_material": upper, "lower_foam_material": lower},
         )
-        fig = _draw_shape(build_shape_plot_data(lk, sel))
+        fig = _draw_shape(build_shape_plot_data(lk, selection_proxy(lk, sol)))
         fills = {tr.name: tr.fillcolor for tr in fig.data if getattr(tr, "fill", None) == "toself"}  # pyright: ignore[reportAttributeAccessIssue]  (plotly leaves Figure.data untyped)
         assert fills[f"upper foam ({upper})"] == MATERIAL_FILL_COLORS[upper]
         assert fills[f"lower foam ({lower})"] == MATERIAL_FILL_COLORS[lower]
 
 
 # 38/65. The rendered plate is the partial span and stays attached to the interface.
-def test_gui_plate_partial_span(coarse_lookup) -> None:
-    _, sel = _selection(coarse_lookup, 6.0, 4.0)
-    sh = build_shape_plot_data(coarse_lookup, sel, show_plate_nodes=True)
-    gm = coarse_lookup.geometry_metadata
+def test_gui_plate_partial_span(coarse_model) -> None:
+    sol = _solve(coarse_model, 6.0, 4.0)
+    sh = build_shape_plot_data(coarse_model, selection_proxy(coarse_model, sol), show_plate_nodes=True)
+    gm = coarse_model.geometry_metadata
+    mesh = coarse_model.plate_mesh
     np.testing.assert_allclose(
-        [coarse_lookup.plate_reference_x[0], coarse_lookup.plate_reference_y[0]],
-        gm["plate_start_reference_coordinate"], atol=1e-12 * L_M,
+        [mesh.reference_x[0], mesh.reference_y[0]], gm["plate_start_reference_coordinate"], atol=1e-12 * L_M
     )
     np.testing.assert_allclose(
-        [coarse_lookup.plate_reference_x[-1], coarse_lookup.plate_reference_y[-1]],
-        gm["plate_end_reference_coordinate"], atol=1e-12 * L_M,
+        [mesh.reference_x[-1], mesh.reference_y[-1]], gm["plate_end_reference_coordinate"], atol=1e-12 * L_M
     )
     tol = 1e-9 * L_M
     assert sh.plate_x_def is not None and sh.plate_node_x is not None and sh.plate_node_y is not None
     assert sh.interface_def is not None
     assert sh.plate_x_def[0] == pytest.approx(sh.plate_node_x[0], abs=tol)
     assert sh.plate_x_def[-1] == pytest.approx(sh.plate_node_x[-1], abs=tol)
-    sec = coarse_lookup.render_section
+    sec = coarse_model.render_section
     iface = np.asarray(sec["interface_node_ids"])
     on_plate = np.isin(iface, sec["plate_curve_node_ids"])
     np.testing.assert_allclose(sh.interface_def[0][on_plate], sh.plate_node_x, atol=1e-7 * L_M)
@@ -809,29 +700,20 @@ def test_gui_plate_partial_span(coarse_lookup) -> None:
     assert not np.all(on_plate)
 
 
-# 66. Contact shading follows the deformed curved bottom.
-def test_gui_contact_follows_bottom(coarse_lookup) -> None:
-    _, sel = _selection(coarse_lookup, -8.0, 10.0)
-    sh = build_shape_plot_data(coarse_lookup, sel)
-    i, j = sel.interval
-    assert sh.contact_curve_x is not None and sh.contact_curve_y is not None
-    np.testing.assert_allclose(sh.contact_curve_x, sh.x_bottom_def[i : j + 1], atol=1e-9 * L_M)
-    np.testing.assert_allclose(sh.contact_curve_y, sh.y_bottom_def[i : j + 1], atol=1e-9 * L_M)
-    assert sh.has_render_mesh and set(sh.region_def) == set(FOAM_REGION_TAGS)
-
-
 # 67. Incompatible old schemas are identified clearly.
-def test_old_schema_messages(saved_lookup, tmp_path) -> None:
-    path, _ = saved_lookup
-    data = dict(np.load(path, allow_pickle=True))
-    for version, match in ((8, "schema_version=8"), (9, "schema_version=9")):
+def test_old_schema_messages(saved_model, tmp_path) -> None:
+    path, _ = saved_model
+    with np.load(path, allow_pickle=True) as npz:
+        data = dict(npz)
+    for version in (8, 9, 11, 12):
         old = dict(data)
         old["schema_version"] = np.asarray(version)
         np.savez_compressed(tmp_path / f"v{version}.npz", **old)
-        with pytest.raises(ValueError, match=match):
-            load_contact_lookup(tmp_path / f"v{version}.npz")
-    assert "schema_version=12" in REGENERATE_LOOKUP_MESSAGE
+        with pytest.raises(ValueError, match=f"schema_version={version}"):
+            load_contact_model(tmp_path / f"v{version}.npz")
+    assert f"schema_version={LOOKUP_SCHEMA_VERSION}" in REGENERATE_LOOKUP_MESSAGE
+    assert LOOKUP_SCHEMA_VERSION == 13
     broken = {k: v for k, v in data.items() if k != "render_influence_loads"}
     np.savez_compressed(tmp_path / "broken.npz", **broken)
-    with pytest.raises(ValueError, match="missing geometry arrays"):
-        load_contact_lookup(tmp_path / "broken.npz")
+    with pytest.raises(ValueError, match="Render section is missing"):
+        load_contact_model(tmp_path / "broken.npz")

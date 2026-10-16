@@ -1,4 +1,4 @@
-"""Streamlit page: Gait force replay (passive toe-spring θ)."""
+"""Streamlit page: gait force replay (continuous contact + passive toe-spring θ)."""
 
 from __future__ import annotations
 
@@ -7,11 +7,14 @@ from pathlib import Path
 import numpy as np
 import streamlit as st
 
-from compliance_fem.contact.lookup import load_contact_lookup
+from compliance_fem.contact.contact_model import ContactModel, load_contact_model
+from compliance_fem.contact.continuous_contact import solve_contact_state
 from compliance_fem.gait.download import write_data_readme
 from compliance_fem.gait.replay import replay_stance, save_replay_result
 from compliance_fem.gui.gait_plots import (
     animation_frame_stride,
+    out_of_plane_csv,
+    out_of_plane_stiffness_figure,
     plotly_foot_animation_figure,
     stance_strain_energy,
     strain_energy_stance_figure,
@@ -20,44 +23,37 @@ from compliance_fem.gait.wang_io import discover_trials
 from compliance_fem.contact.toe_spring import (
     TOE_MODEL_PASSIVE_SPRING,
     TOE_MODELS,
-    RearfootGeometry,
-    RearfootToeModel,
     ToeSpringConfig,
     spring_dU_dalpha,
 )
 
 
-def _frame_q_alpha_curve(result, i: int, alpha: np.ndarray) -> np.ndarray:
-    """Exact Q_alpha,shoe->foot(alpha) of the selected record (chord frame follows alpha)."""
-    coeff = np.asarray(result.toe_Q_coeff, dtype=float)
-    kin = result.model_info.get("toe_rearfoot_kinematics")
-    if coeff.shape[0] <= i or kin is None or not np.all(np.isfinite(coeff[i])):
-        return float(result.toe_q0_Nm[i]) + float(result.toe_q1_Nm[i]) * alpha
-    model = RearfootToeModel(
-        coeff=coeff[i],
-        D=np.full((2, 5), np.nan),
-        F_fixed=np.array([float(result.elastic_Fx[i]), float(result.elastic_Fy[i])]),
-        phi_rearfoot=float(result.phi[i]),
-        geometry=RearfootGeometry(
-            L=kin["L"], toe_length=kin["toe_length"], phi1_mtp=kin["phi1_mtp"], dy_mtp=kin["dy_mtp"]
-        ),
-        kd_cond=float("nan"),
-        kd_smin=float("nan"),
-        well_conditioned=True,
-    )
-    return np.asarray(model.generalized_force(alpha), dtype=float)
+def _frame_q_alpha_curve(model: ContactModel, result, i: int, theta: np.ndarray) -> np.ndarray:
+    """Exact Q_alpha,shoe->foot(theta) at frame ``i``: one contact solve per theta (chord follows alpha)."""
+    op = model.operator
+    width = float(result.model_info.get("shoe_width_m", 1.0))
+    F = np.array([float(result.elastic_Fx[i]), float(result.elastic_Fy[i])])
+    phi = float(result.phi[i]) if np.isfinite(result.phi[i]) else 0.0
+    out = np.full(theta.size, np.nan)
+    warm = result.frames[i].contact.active if result.frames else None
+    for k, th in enumerate(theta):
+        a = float(np.tan(th))
+        sol = solve_contact_state(op, float(op.rearfoot.chord_rotation(phi, a)), a, F, warm_active=warm)
+        warm = sol.active
+        out[k] = width * float(sol.diagnostics["Q_alpha_shoe_on_foot_per_m"])
+    return out
 
 
-def toe_equilibrium_figure(result, i: int, cfg: ToeSpringConfig):
-    """Shoe-on-foot Q_alpha(θ) and spring dU/dα(θ) for the selected record at frame i."""
+def toe_equilibrium_figure(model: ContactModel, result, i: int, cfg: ToeSpringConfig, n_theta: int = 61):
+    """Shoe-on-foot Q_alpha(θ) and spring dU/dα(θ) at frame i (exact contact solve per θ)."""
     import plotly.graph_objects as go
 
     k = float(result.toe_stiffness_Nm_per_rad)
     th0 = float(result.toe_neutral_angle_rad)
-    th = np.linspace(cfg.toe_angle_min_rad, cfg.toe_angle_max_rad, 601)
+    th = np.linspace(cfg.toe_angle_min_rad, cfg.toe_angle_max_rad, int(n_theta))
     a = np.tan(th)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=np.rad2deg(th), y=_frame_q_alpha_curve(result, i, a), name="Q_α shoe→foot(θ)"))
+    fig.add_trace(go.Scatter(x=np.rad2deg(th), y=_frame_q_alpha_curve(model, result, i, th), name="Q_α shoe→foot(θ)"))
     fig.add_trace(go.Scatter(x=np.rad2deg(th), y=spring_dU_dalpha(a, k, th0), name="spring dU/dα"))
     roots = result.toe_roots_deg[i] if result.toe_roots_deg.size else np.array([])
     roots = roots[np.isfinite(roots)]
@@ -72,7 +68,7 @@ def toe_equilibrium_figure(result, i: int, cfg: ToeSpringConfig):
     fig.add_vline(x=float(result.theta_deg[i]), line=dict(color="#d62728", dash="dash"),
                   annotation_text=f"θ={float(result.theta_deg[i]):.2f}°")
     fig.update_layout(
-        title="Toe equilibrium at this frame (selected record): roots where the curves cross",
+        title="Toe equilibrium at this frame: roots where the curves cross",
         xaxis_title="θ (deg)", yaxis_title="N·m (total, per α)", height=380,
     )
     return fig
@@ -89,7 +85,7 @@ def toe_stance_figure(result):
         subplot_titles=(
             "θ (deg)", "Q_α shoe→foot and spring −dU/dα (N·m)",
             "Q_θ shoe→foot and spring moment (N·m)", "|toe residual| (N·m)",
-            "Spring energy (J)", "Contact state / low load",
+            "Spring energy (J)", "Active nodes / patches / low load",
         ),
     )
     fig.add_trace(go.Scatter(x=t, y=result.theta_deg, name="θ"), row=1, col=1)
@@ -104,10 +100,14 @@ def toe_stance_figure(result):
     )
     fig.update_yaxes(type="log", row=2, col=2)
     fig.add_trace(go.Scatter(x=t, y=result.toe_spring_energy_J, name="U"), row=3, col=1)
-    type_map = {"heel": 0, "full": 1, "toe": 2}
+    cs = result.contact_scalars
     fig.add_trace(
-        go.Scatter(x=t, y=[type_map.get(c, -1) for c in result.contact_type], mode="lines+markers",
-                   name="contact (0 heel, 1 full, 2 toe)"),
+        go.Scatter(x=t, y=cs.get("n_active", np.zeros_like(t)), mode="lines", name="active nodes"),
+        row=3, col=2,
+    )
+    fig.add_trace(
+        go.Scatter(x=t, y=cs.get("n_patches", np.zeros_like(t)), mode="lines", name="contact patches",
+                   line=dict(dash="dash")),
         row=3, col=2,
     )
     fig.add_trace(
@@ -126,7 +126,7 @@ def render_gait_replay_page() -> None:
         "Q_α,shoe→foot(α) = k(arctan α − θ0)/(1+α²) exactly for every contact record "
         "(no small-angle approximation, no per-frame FEM); measured COP is not "
         "prescribed and serves as validation. Legacy θ rules are opt-in. Forces are "
-        "divided by shoe width (default 10 cm) for plane-strain per-metre lookup units; "
+        "divided by shoe width (default 10 cm) for plane-strain per-metre model units; "
         "the toe generalized force is multiplied back by the width. F_top = −F_GRF."
     )
 
@@ -171,7 +171,7 @@ def render_gait_replay_page() -> None:
 
     lookup_path = Path(
         st.text_input(
-            "Contact lookup path",
+            "Contact model path",
             value="outputs/measured_sole_lookup",
             key="gait_lookup",
             help="Directory containing contact_lookup.npz, or the .npz file itself.",
@@ -213,7 +213,7 @@ def render_gait_replay_page() -> None:
             min_value=0.01,
             step=0.01,
             format="%.3f",
-            help="Experimental Fx,Fy,Mz are divided by this width for the unit-thickness plane-strain lookup.",
+            help="Experimental Fx,Fy,Mz are divided by this width for the unit-thickness plane-strain model.",
         )
 
     if st.button("Run replay", type="primary"):
@@ -224,8 +224,8 @@ def render_gait_replay_page() -> None:
             st.error(f"MOT not found: {mot_path}")
             return
         try:
-            lookup = load_contact_lookup(lookup_path)
-        except FileNotFoundError as exc:
+            model = load_contact_model(lookup_path)
+        except (FileNotFoundError, ValueError) as exc:
             st.error(str(exc))
             return
         try:
@@ -244,7 +244,7 @@ def render_gait_replay_page() -> None:
 
             try:
                 result = replay_stance(
-                    lookup,
+                    model,
                     trc_path=trc_path,
                     mot_path=mot_path,
                     foot=foot,
@@ -262,7 +262,7 @@ def render_gait_replay_page() -> None:
             return
         st.session_state["gait_replay_result"] = result
         st.session_state["gait_toe_cfg"] = toe_cfg
-        st.session_state["gait_replay_lookup"] = lookup
+        st.session_state["gait_replay_model"] = model
         st.session_state.pop("gait_anim_fig", None)
         st.session_state.pop("gait_anim_key", None)
         out = Path("outputs/gait_replay_gui")
@@ -311,7 +311,7 @@ def render_gait_replay_page() -> None:
                 "stance). Heavier figure: at most 75 animated frames, so long stances skip frames."
             ),
         )
-    lookup_cached = st.session_state.get("gait_replay_lookup")
+    lookup_cached = st.session_state.get("gait_replay_model")
     stride = (
         animation_frame_stride(lookup_cached, result, energy=energy_colors) if lookup_cached is not None else 1
     )
@@ -331,18 +331,18 @@ def render_gait_replay_page() -> None:
                 )
                 st.rerun()
 
-    lookup = st.session_state.get("gait_replay_lookup")
-    if lookup is None:
+    model = st.session_state.get("gait_replay_model")
+    if model is None:
         try:
-            lookup = load_contact_lookup(lookup_path)
-            st.session_state["gait_replay_lookup"] = lookup
-        except FileNotFoundError:
+            model = load_contact_model(lookup_path)
+            st.session_state["gait_replay_model"] = model
+        except (FileNotFoundError, ValueError):
             st.error(
-                "Lookup not available for shape replay. Re-run with a valid contact lookup path."
+                "Contact model not available for shape replay. Re-run with a valid contact model path."
             )
-            lookup = None
+            model = None
 
-    if lookup is not None:
+    if model is not None:
         anim_key = (
             id(result),
             scale_mode,
@@ -359,7 +359,7 @@ def render_gait_replay_page() -> None:
             with st.spinner("Building smooth shoe animation (one-time)…"):
                 try:
                     st.session_state["gait_anim_fig"] = plotly_foot_animation_figure(
-                        lookup,
+                        model,
                         result,
                         scale_mode=scale_mode,
                         manual_scale=manual_scale,
@@ -391,15 +391,33 @@ def render_gait_replay_page() -> None:
         energy_key = (id(result), str(lookup_path))
         if st.session_state.get("gait_energy_key") != energy_key:
             with st.spinner("Computing strain energy over stance…"):
-                st.session_state["gait_energy_series"] = stance_strain_energy(lookup, result)
+                st.session_state["gait_energy_series"] = stance_strain_energy(model, result)
                 st.session_state["gait_energy_key"] = energy_key
         series = st.session_state["gait_energy_series"]
         if np.any(np.isfinite(series["foam_J"])) or np.any(np.isfinite(series["plate_J"])):
             st.plotly_chart(strain_energy_stance_figure(series), use_container_width=True, key="gait_energy_plot")
             st.caption(
-                "Total elastic strain energy over the whole shoe width (lookup per-metre values × "
+                "Total elastic strain energy over the whole shoe width (model per-metre values × "
                 "shoe width). Foam: Σ W·A over the mesh; plate: ∫ ½EIκ² ds. The axes are independent."
             )
+
+        st.subheader("2.5D stiffness")
+        if result.lateral_translation_stiffness.size != result.times.size:
+            st.caption("2.5D stiffness: N/A (not stored with this replay).")
+        else:
+            x_axis = st.radio("Horizontal axis", ["time", "stance"], horizontal=True, key="gait_oop_axis",
+                              help="Display only; the stored values are not recomputed.")
+            st.plotly_chart(out_of_plane_stiffness_figure(result, x_axis=x_axis), use_container_width=True,
+                            key="gait_oop_plot")
+            oop_meta = result.model_info.get("out_of_plane", {})
+            st.caption(
+                f"Width: {oop_meta.get('physical_shoe_width_source')} ({oop_meta.get('shoe_width')} m); "
+                f"η_t: {oop_meta.get('lateral_to_normal_stiffness_ratio') or 'thin-layer G/M from foam ν'}; "
+                f"yaw reference: {oop_meta.get('yaw_reference')}. Linearized about each converged frame with the "
+                "active set frozen; NaN frames are gaps; values may jump at active-set changes."
+            )
+            st.download_button("Download 2.5D stiffness CSV", data=out_of_plane_csv(result),
+                               file_name="out_of_plane_stiffness.csv", mime="text/csv", key="gait_oop_csv")
 
     @st.fragment
     def _inspect_and_diagnostics() -> None:
@@ -436,7 +454,16 @@ def render_gait_replay_page() -> None:
                 "Model-predicted COP x (m)": float(result.cop_model_x[i]) if result.cop_model_x.size else None,
                 "cop_valid": bool(result.cop_valid[i]) if result.cop_valid.size else None,
                 "force_residual": float(result.force_residual[i]),
-                "status": result.selection_status[i],
+                "status": result.status[i],
+                "active nodes / patches": f"{int(result.contact_scalars['n_active'][i])} / "
+                f"{result.patches[i]}",
+                "min gap (m)": float(result.contact_scalars["min_gap"][i]),
+                "min active λ (N/m)": float(result.contact_scalars["min_reaction"][i]),
+                "max |g λ|": float(result.contact_scalars["max_complementarity"][i]),
+                "μ_eff": float(result.contact_scalars["mu_eff"][i]),
+                "active-set iterations": int(result.contact_scalars["active_set_iterations"][i]),
+                "toe iterations": int(result.toe_iterations[i]),
+                "sample time (ms)": 1e3 * float(result.timings["total_s"][i]),
             }
         )
 
@@ -457,7 +484,6 @@ def render_gait_replay_page() -> None:
                     "toe_equilibrium_residual_Nm": float(result.toe_equilibrium_residual_Nm[i]),
                     "toe_equilibrium_relative_residual": float(result.toe_equilibrium_relative_residual[i]),
                     "toe_root_count": int(result.toe_root_count[i]),
-                    "toe_root_index": int(result.toe_root_index[i]),
                     "all roots θ (deg)": [
                         round(float(v), 4) for v in result.toe_roots_deg[i] if np.isfinite(v)
                     ]
@@ -471,7 +497,8 @@ def render_gait_replay_page() -> None:
                 }
             )
             cfg_view = st.session_state.get("gait_toe_cfg") or ToeSpringConfig()
-            st.plotly_chart(toe_equilibrium_figure(result, i, cfg_view), use_container_width=True)
+            if model is not None:
+                st.plotly_chart(toe_equilibrium_figure(model, result, i, cfg_view), use_container_width=True)
             st.plotly_chart(toe_stance_figure(result), use_container_width=True)
 
         if result.cop_lab_x.size == result.times.size:
@@ -614,7 +641,7 @@ def render_gait_replay_page() -> None:
                 go.Scatter(
                     x=t,
                     y=result.predicted_moment_about_model_anchor,
-                    name="M pred (lookup Mz about 0)",
+                    name="M pred (model Mz about 0)",
                 ),
                 row=2,
                 col=1,

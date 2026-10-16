@@ -3,13 +3,16 @@
 The toe coordinate is **solved, not prescribed**. Each gait frame's toe angle
 \(\theta\) is the exact quasistatic equilibrium between the shoe's generalized
 force on the distributed top-shape coordinate and a passive rotational spring.
-No FEM solve is performed per gait frame: the stored contact lookup is linear in
-the generalized coordinates, so every frame reduces to a scalar root find per
-contact record.
+No FEM solve is performed per gait frame: the shoe response comes from the
+shared contact operator ([continuous_contact.md](continuous_contact.md)), and
+every evaluation of the toe residual runs one converged contact solve at the
+trial angle.
 
-Implementation: `src/compliance_fem/contact/toe_spring.py` (spring, affine model, root
-solver), `src/compliance_fem/gait/passive_toe.py` (per-frame candidates), and
-`src/compliance_fem/gait/replay.py` (runtime integration).
+Implementation: `src/compliance_fem/contact/toe_spring.py` (spring law,
+`RearfootGeometry`, `rearfoot_toe_mode`, `compute_toe_moment`),
+`src/compliance_fem/contact/continuous_toe.py` (nested root solve
+`solve_toe_contact`), and `src/compliance_fem/gait/replay.py`,
+`src/compliance_fem/api.py`, `src/compliance_fem/gui/app.py` (callers).
 
 ## Why \(\theta\) is an output
 
@@ -30,15 +33,16 @@ a model output that can be checked against measurements.
 | `toe_damping_Nms_per_rad` \(c\) | 0 | N·m·s/rad (recorded only) |
 | `toe_angle_min_deg`, `toe_angle_max_deg` | −75, 75 | deg |
 | `toe_equilibrium_abs_tol_Nm`, `toe_equilibrium_rel_tol` | 1e-6, 1e-8 | N·m, – |
-| `toe_root_scan_points` | 721 | – |
+| `toe_root_scan_points` | 721 | – (cold-start scan) |
 | `toe_low_force_threshold_N` | 50 | N (experimental total) |
 
 **\(k=25\) N·m/rad** is the specified default passive toe-joint
 stiffness. It is a lumped whole-foot value in N·m/rad (not per metre width):
-\(Q_\alpha\) is converted to a total by multiplying the per-width lookup value
+\(Q_\alpha\) is converted to a total by multiplying the per-width model value
 by the shoe width before it is balanced against the spring. It is a user
-parameter (`--toe-stiffness`, GUI input); treat it as a modelling assumption to
-be identified, not a measured property of these subjects.
+parameter (`toe_spring.toe_stiffness_Nm_per_rad` in the JSON config, GUI
+input); treat it as a modelling assumption to be identified, not a measured
+property of these subjects.
 
 **Neutral angle \(\theta_0=0\).** The unloaded shoe top (the softplus shape at
 \(\alpha=0\), i.e. the stored reference geometry) is taken as the spring's
@@ -49,10 +53,10 @@ warning is issued if it is nonzero, and it never enters the solve.
 
 ## Coordinate: \(\alpha=\tan\theta\)
 
-The lookup coordinates are
-\(\gamma=[\alpha,d_x,d_y,r_x,r_y]^\mathsf T\) with the top-surface vertical
-displacement \(v_{\mathrm{top}}=\alpha\,\varphi_1(x)\) from mode 0 only (modes
-1–4 clamp the top). Here
+The top surface is glued to the foot: in the top-attached frame its
+displacement is prescribed as \(u_{\mathrm{top}}=0\),
+\(v_{\mathrm{top}}=\alpha\,\varphi_1(x)\) (`w_alpha` of the contact operator),
+so \(\alpha\) is the only top degree of freedom. Here
 
 \[
 \varphi_1(x)=s(x)-\bigl(1-\tfrac{x}{L}\bigr)s(0)-\tfrac{x}{L}s(L),
@@ -80,28 +84,30 @@ Spring moment in \(\theta\): \(M_{\mathrm{spring}}=-k(\theta-\theta_0)\).
 
 ## Generalized force from virtual work
 
-The lookup solves \(\mathbf u=\mathbf C\mathbf F+\mathbf R\mathbf a\) with
-\(\mathbf R^\mathsf T\mathbf F=0\); the stored top nodal forces are the
-**load term of \(\mathbf K\mathbf u=\mathbf f\)** at the top DOFs, i.e. the
-force the foot applies **to** the shoe (foot-on-shoe). This was checked
-against direct FEM (`solve_direct_fem_contact(..., gamma=...)` in `tests/direct_fem.py`, test 26):
-\(\mathbf f_t=\mathbf K\mathbf u\) at the top DOFs matches the lookup
-\(\mathbf f_{t,y}\).
+The contact operator expresses the top-clamped response as
+\(\mathbf F_t=\alpha\,\mathbf f_\alpha+\mathbf P_{tb}\,\mathbf f_b\)
+([continuous_contact.md](continuous_contact.md)): \(\mathbf F_t\) is the
+external nodal load at the top DOFs, i.e. the **load term of
+\(\mathbf K\mathbf u=\mathbf f\)**, the force the foot applies **to** the shoe
+(foot-on-shoe). `tests/test_continuous_contact.py` checks these top forces and
+the bottom fields of solved states against an independent top-clamped direct
+FEM solve (`tests/direct_fem.py`).
 
 ### What is held fixed: the rearfoot, not the chord
 
-\(\varphi_1\) vanishes at the heel **and the toe tip**, so the lookup frame is
-the heel-to-toe chord frame, and a variation of \(\alpha\) at fixed chord
-rotates the rearfoot nose-down while pinning the toe tip. That is not the
+\(\varphi_1\) vanishes at the heel **and the toe tip**, so the top-attached
+frame is the heel-to-toe chord frame, and a variation of \(\alpha\) at fixed
+chord rotates the rearfoot nose-down while pinning the toe tip. That is not the
 foot's toe degree of freedom. The measured pitch \(\phi\) comes from the heel
 and metatarsal-head markers, i.e. it is the **rearfoot (heel → MTP) line**,
 which is what the kinematics prescribe. Bending the toe at a fixed rearfoot
 therefore:
 
-1. rotates the chord frame, exactly (within the lookup's displacement
-   kinematics):
+1. rotates the chord frame, exactly (within the model's displacement
+   kinematics; `RearfootGeometry.chord_rotation`):
    \[
-   \varphi(\alpha)=\phi-\operatorname{atan2}\bigl(y_{\mathrm{top}}(x_{\mathrm{mtp}})-y_{\mathrm{top}}(0)+\alpha\,\varphi_1(x_{\mathrm{mtp}}),\;x_{\mathrm{mtp}}\bigr),
+   \varphi(\alpha)=\phi-\operatorname{atan2}\bigl(\Delta y_{\mathrm{mtp}}+\alpha\,\varphi_1(x_{\mathrm{mtp}}),\;L-\ell_{\mathrm{toe}}\bigr),
+   \qquad \Delta y_{\mathrm{mtp}}=y_{\mathrm{top}}(x_{\mathrm{mtp}})-y_{\mathrm{top}}(0),
    \]
    so the model's deformed heel → MTP line always lies along the measured
    \(\phi\) (test `test_solved_configuration_keeps_measured_rearfoot_angle`);
@@ -111,7 +117,8 @@ therefore:
    \]
    which is \(\approx\max(0,x-x_{\mathrm{mtp}})\): a rotation of the toe segment about the
    MTP point. \(\psi-\varphi_1\) is linear in \(x\) (a rigid rotation about the
-   heel).
+   heel). \(\psi\) at the top nodes is stored as `psi_top` in the contact
+   operator (`toe_spring.rearfoot_toe_mode`).
 
 ### Generalized force
 
@@ -125,37 +132,37 @@ Q_\alpha^{\mathrm{shoe}\to\mathrm{foot}}
 =-\,\varphi_1^\mathsf T\mathbf f_{t,y}+\frac{\varphi_1(x_{\mathrm{mtp}})}{x_{\mathrm{mtp}}}\,M_v
 \quad[\text{N·m per metre width}],
 \qquad
-Q_\alpha^{\mathrm{total}}=w\,Q_\alpha^{\mathrm{lookup}}\quad[\text{N·m}],
+Q_\alpha^{\mathrm{total}}=w\,Q_\alpha^{\mathrm{model}}\quad[\text{N·m}],
 \]
 
 with \(M_v=\mathbf x_t^\mathsf T\mathbf f_{t,y}\) and \(w\) = `shoe_width_m`
-(default 0.10 m). The lookup stores the per-mode basis
-`Q_alpha_shoe_on_foot_basis` (shape `(n_records, 6)`, column 0 the
-curved-sole closure) so \(Q_\alpha=w\,\mathbf q_{\mathrm{basis}}\cdot[1,\gamma]\).
+(default 0.10 m). \(\mathbf f_{t,y}\) is the converged top force of the contact
+solve at \((\varphi(\alpha),\alpha)\), so \(Q_\alpha\) includes the contact
+response at that trial angle; the per-metre value is the diagnostic
+`Q_alpha_shoe_on_foot_per_m`.
 
 **Relation to the toe moment.** Because \(\psi\approx\max(0,x-x_{\mathrm{mtp}})\), the
-stored ramp moment `M_toe_vertical` \(=\rho^\mathsf T\mathbf f_{t,y}\) with
-\(\rho=\max(0,x-x_{\mathrm{mtp}})\) gives
+vertical ramp moment \(M_{\mathrm{toe,v}}=\rho^\mathsf T\mathbf f_{t,y}\) with
+\(\rho=\max(0,x-x_{\mathrm{mtp}})\) (`compute_toe_moment`) gives
 
 \[
-Q_\alpha^{\mathrm{shoe}\to\mathrm{foot}}\approx-M_{\mathrm{toe}},
+Q_\alpha^{\mathrm{shoe}\to\mathrm{foot}}\approx-M_{\mathrm{toe,v}},
 \qquad |Q_\alpha+M_{\mathrm{toe,v}}|\le\max|\psi-\rho|\;\textstyle\sum|f_{t,y}|,
 \]
 
-exact in the sharp-kink limit (test `test_negative_toe_moment_gives_positive_theta`).
-A **negative foot-on-shoe toe moment about the MTP point (load under the toes)
-gives a positive (dorsiflexing) \(\theta\)**. The chord-fixed quantity
-\(-\varphi_1^\mathsf T\mathbf f_{t,y}\) (used before this correction) equals
+exact in the sharp-kink limit. A **negative foot-on-shoe toe moment about the
+MTP point (load under the toes) gives a positive (dorsiflexing) \(\theta\)**.
+The chord-fixed quantity \(-\varphi_1^\mathsf T\mathbf f_{t,y}\) equals
 \(-\rho^\mathsf T\mathbf f+\tfrac{\ell_{\mathrm{toe}}}{L}M_v\approx F_y\,(L-\ell_{\mathrm{toe}})(1-x_c/L)\) and is
-negative for any compressive load wherever it acts, which produced the wrong
-(negative) toe angle.
+negative for any compressive load wherever it acts, which would produce the
+wrong (negative) toe angle; it is not used.
 
-**Stiffness sign (test 5).** At \(F^\star=0\) with the rearfoot at its
-reference angle, the shoe's strain energy along the solved configuration path
-is \(\tfrac12\mathbf u^\mathsf T\mathbf K\mathbf u=-\int_0^\alpha Q\approx\tfrac12(-Q'(0))\alpha^2>0\),
-checked against direct FEM, so \(Q'(0)<0\): the shoe resists toe bending. A
-plain sign flip of \(Q_\alpha\) would make this stiffness negative, which is
-why the fix is the rearfoot-fixed virtual displacement, not a flipped sign.
+**Stiffness sign.** At \(F^\star=0\) with the rearfoot at its reference angle,
+the shoe's strain energy along the solved configuration path is
+\(\tfrac12\mathbf u^\mathsf T\mathbf K\mathbf u=-\int_0^\alpha Q\approx\tfrac12(-Q'(0))\alpha^2>0\),
+so \(Q'(0)<0\): the shoe resists toe bending. A plain sign flip of
+\(Q_\alpha\) would make this stiffness negative, which is why the rearfoot-fixed
+virtual displacement is used rather than a flipped sign.
 
 **\(Q_\alpha\leftrightarrow Q_\theta\).** Since \(d\alpha/d\theta=1+\alpha^2\),
 
@@ -169,33 +176,7 @@ The equilibrium \(Q_\alpha=\partial U/\partial\alpha\) is equivalent to
 **Sign convention for \(\theta\).** \(\theta>0\) (\(\alpha>0\)) tilts the toe
 segment **up** relative to the rearfoot line (dorsiflexion), since
 \(\psi(L)\approx\ell_{\mathrm{toe}}>0\). Positive fixed-frame angles are counter-clockwise
-with +x heel → toe and +y up. Moments in the lookup are foot-on-shoe.
-
-## Reduction per interval record
-
-Every contact interval \(\mathcal I_{ij}\) of the lookup
-([interval_contact.md](interval_contact.md)) is reduced and solved on its own;
-roots are never shared or averaged between intervals. For a record, \(\mathbf z(\alpha)=[F^T_x,F^T_y,r_x,r_y,\alpha]\) with the
-local force \(\mathbf F^T=Q(\varphi)^\mathsf T\mathbf F^\star\) and
-\((r_x,r_y)=(\cos\varphi-1,-\sin\varphi)\) evaluated at \(\varphi(\alpha)\).
-The translations follow from the force balance
-\(\mathbf K_d\mathbf d=\mathbf F^T-\mathbf F_{\mathrm{closure}}-\mathbf F_r-\mathbf F_\alpha\alpha\)
-(the curved-sole closure enters with coefficient 1); \(\mathbf K_d\)
-is LU-factored once (no explicit inverse), giving \(\mathbf d=\mathbf D\mathbf z\) and
-
-\[
-Q_\alpha(\alpha)=\mathbf c\cdot\mathbf z(\alpha),
-\qquad
-Q_\alpha'(\alpha)=\mathbf c_{1:4}\cdot\frac{\partial\mathbf z}{\partial\varphi}\,\varphi'(\alpha)+c_5,
-\]
-
-both analytic (`toe_spring.RearfootToeModel`). The reported `toe_q0_Nm`,
-`toe_q1_Nm` are \(Q(0)\) and \(Q'(0)\). The model is checked against direct
-superposition at the rotated chord angle and the analytic derivative against
-finite differences. The fixed-frame affine form \(q_0+q_1\alpha\)
-(`solve_toe_equilibrium`, with the reference `toe_affine_model` in `tests/reference.py`)
-is kept for synthetic checks.
-Ill-conditioned \(\mathbf K_d\) (condition > `cond_limit`) marks the record failed.
+with +x heel → toe and +y up. Top forces and moments are foot-on-shoe.
 
 ## Exact equilibrium equation
 
@@ -205,30 +186,44 @@ Ill-conditioned \(\mathbf K_d\) (condition > `cond_limit`) marks the record fail
 \]
 
 Equivalently the total potential
-\(\Pi(\alpha)=U(\alpha)-\int_0^\alpha Q_\alpha\) is stationary (\(\Pi'=-g\));
-the integral is evaluated by 32-point Gauss–Legendre quadrature.
+\(\Pi(\alpha)=U(\alpha)-\int_0^\alpha Q_\alpha\) is stationary (\(\Pi'=-g\)).
+\(Q_\alpha(\alpha)\) is not an affine model: each evaluation of \(g\) at a trial
+\(\theta\) sets \(\alpha=\tan\theta\) and \(\varphi(\alpha)\), solves the
+unilateral contact problem to convergence at that pose (the active set
+warm-started from the nearest already-evaluated \(\theta\)), and reads
+\(Q_\alpha\) from the converged top forces. Because the contact solution is
+continuous in the pose (nodes enter and leave contact through
+\(g=\lambda=0\)), \(Q_\alpha\) and hence the root are continuous along a gait.
 
 ## Root solver and bounds
 
-`solve_toe_equilibrium_model` (vectorized over the scan; `solve_toe_equilibrium`
-is its affine special case):
+`continuous_toe.solve_toe_contact` solves \(g(\theta)=0\) in \(\theta\) on
+\([\theta_{\min},\theta_{\max}]\) (default \(\pm75^\circ\)) with **Brent**
+(`scipy.optimize.brentq`, `xtol` 1e-13):
 
-1. Uniform scan of \(\theta\) over \([\theta_{\min},\theta_{\max}]\) (default
-   \(\pm75^\circ\), 721 points); evaluate \(g(\tan\theta)\); reject non-finite
-   coefficients (`nonfinite_coefficients`).
-2. Exact zeros on the grid are roots; every sign change is refined with
-   **Brent** (`scipy.optimize.brentq`) in \(\theta\).
-3. Endpoint roots are accepted when \(|g|\) is within tolerance.
-4. Tangential (double) roots: local minima of \(|g|\) are refined with bounded
-   minimization and accepted only if within tolerance.
-5. De-duplicate (1e-10 rad), keep converged roots only, sort. Tolerance:
-   \(|g|\le\) `abs_tol` + `rel_tol`·max(\(|Q(0)|,|Q(\alpha)-Q(0)|,|\partial U/\partial\alpha|\)).
+1. **Continuation** (a previous \(\theta\) is available: the previous gait
+   sample, the previous `SoleModel.step`, or the GUI state). The bracket is
+   grown geometrically on both sides of the previous \(\theta\) (steps
+   0.25°, 0.5°, …, 64°, 150°, clipped to the bounds) until \(g\) changes sign;
+   the first bracket holds the nearest root, which is refined and taken
+   (status `continuation`). A warm sample typically needs 6–8 residual
+   evaluations (contact solves).
+2. **Cold start** (no previous \(\theta\), or no sign change found by
+   continuation). Uniform scan with `toe_root_scan_points` (default 721)
+   evaluations; every sign change is refined with Brent and exact zeros on the
+   grid are kept. With one root the status is `ok`; with several it is
+   `multiple_roots` and the root with the **lowest total potential** \(\Pi\)
+   is chosen (\(\Pi\) by trapezoidal integration over \(\alpha\)).
 
-If no root exists in bounds, the status is `no_root_in_bounds`; a diagnostic
-\(\min|g|\) point is saved but is **never** labelled an equilibrium
-(`converged=False`, status suffix `+diagnostic_min_residual`, candidate
-inadmissible). Because \(\partial U/\partial\alpha\) is bounded
-(\(\le k\max_\theta\theta\cos^2\theta\approx0.41k\approx10.3\) N·m at
+The tolerance is
+\(|g|\le\) `toe_equilibrium_abs_tol_Nm` + `toe_equilibrium_rel_tol`·max(\(|Q_\alpha|,|\partial U/\partial\alpha|\), abs tol);
+a frame is `converged` only when this holds and the contact solve at the root
+converged.
+
+If no root exists in bounds, the status is `no_root_in_bounds`; the grid point
+of minimum \(|g|\) is returned as a diagnostic but is **never** labelled an
+equilibrium (`converged=False`). Because \(\partial U/\partial\alpha\) is
+bounded (\(\le k\max_\theta\theta\cos^2\theta\approx0.41k\approx10.3\) N·m at
 \(\theta\approx37^\circ\)) while the shoe stiffens against bending
 (\(Q'<0\)), a root normally exists in \((-90^\circ,90^\circ)\); ±75° covers
 measured running loads. The saturation of
@@ -237,113 +232,81 @@ measured running loads. The saturation of
 
 ## Stability and multiple roots
 
-\(\Pi''(\alpha)=\partial^2U/\partial\alpha^2-Q_\alpha'(\alpha)\) (analytic). A
-root is **stable** when \(\Pi''>0\); saved as `toe_equilibrium_tangent`
-(\(\Pi''\)) and `toe_equilibrium_stable`. With \(Q'<0\), roots are stable
-unless \(|\theta|\) is large enough that \(\partial^2U/\partial\alpha^2<Q'\).
+\(\Pi''(\alpha)=\partial^2U/\partial\alpha^2-Q_\alpha'(\alpha)\), evaluated by a
+central difference of \(g\) in \(\alpha\) at the root. A root is **stable**
+when \(\Pi''>0\); saved as `toe_equilibrium_tangent` (\(\Pi''\)) and
+`toe_equilibrium_stable`. With \(Q'<0\), roots are stable unless \(|\theta|\)
+is large enough that \(\partial^2U/\partial\alpha^2<Q'\).
 
-All roots are stored (`toe_roots_deg`, `toe_root_count`). Each root becomes its
-own candidate. Preference order (`order_toe_roots`): continuity with the
-previous frame's \(\theta\), then lower potential \(\Pi\), then contact
-violation, then force residual. The temporal (Viterbi) selector adds costs for
-toe residual (`toe_residual` = 10·min(rel. residual, 1)), unstable roots
-(`toe_unstable` = 20), root rank (`toe_root_rank` = 0.05), and inadmissibility.
+The roots found are stored (`toe_roots_deg`, `toe_root_count`). Continuation
+returns only the root on the connected branch, so `toe_root_count = 1` for
+warm samples; all roots in bounds are only enumerated by a cold scan. There is
+no candidate list and no sequence selector: the replay follows one continuous
+branch, and the previous \(\theta\) and active set warm-start the next sample.
 
 ## Low load
 
-When \(\|F\|<\) `toe_low_force_threshold_N` (experimental total), only the
-**relaxed root** (the root closest to \(\theta_0\)) is kept per record, status
-`+low_load`. Zero load gives \(q_0=0\) and \(\theta=0\) exactly. There is no
-formula fallback.
+When \(\|F\|<\) `toe_low_force_threshold_N` (experimental total), the root
+search starts from \(\theta_0\) instead of the previous \(\theta\), i.e. it
+follows the branch connected to the neutral angle (a cold scan, if needed,
+takes the root closest to \(\theta_0\)); the status carries `+low_load`. With \(\theta_0=0\), zero
+load gives \(g(0)=0\) and \(\theta=0\) exactly. There is no formula
+fallback.
 
-## Contact interval
+## Contact state
 
-For every root the all-node fixed-frame unilateral check (every free node's
-ground gap, every contact node's normal reaction, edges and interior alike) is
-re-evaluated **after** \(\alpha\) is solved for that interval. A candidate is
-admissible only if the root converged, the unilateral check passes, and the
-force residual is within tolerance. The search screens intervals near the
-previous frame's interval first (local, then expanded radii), then all
-intervals; the admissible candidates of the first stage that has any are
-re-solved exactly and passed to the Viterbi sequence selector, which drops
-inadmissible candidates whenever an admissible one exists.
-
-The toe-side contact edge passing a mesh node can leave no interval passing
-the strict gap tolerance: leaving the node free penetrates by micrometres,
-adding it to contact makes it tensile. The search therefore also accepts a
-free-node penetration up to `SelectionConfig.relaxed_gap_rel_tol` × \(h\)
-(default 1% of the node spacing). Strictly admissible pairs always win: the
-search stops at the first stage that has one, exactly as before. Only when no
-stage has one are the relaxed-admissible pairs used, ordered by stability,
-then by the penetration they need, then by the usual keys; they are labelled
-`global_interval_search` and their status carries `+relaxed_gap`. Setting
-`relaxed_gap_rel_tol = 0` restores the strict-only behaviour.
-
-When no interval is
-admissible at a frame (it happens for part of real stances; see below), the
-least-violating candidates are kept, the selected one is labelled
-`least_violating_fallback`, and its status carries `+unilateral_violation`
-(plus `+interior_tension` when interior contact nodes are tensile, i.e. a
-multi-interval contact state is indicated); the counts are in
-`model_info.toe_summary`.
+The contact state returned with the toe angle is the converged contact solve at
+\((\varphi(\alpha^\star),\alpha^\star)\): every bottom node satisfies
+\(0\le\lambda\perp g\ge0\) (within the scale-aware tolerances), and the
+prescribed \(F_x,F_y\) are met exactly by proportional shear. The contact set
+may be empty, one patch or several disconnected patches; nothing is chosen
+from a table and there is no fallback state. See
+[continuous_contact.md](continuous_contact.md) for the formulation,
+diagnostics and patch reporting.
 
 ## Viscoelasticity: elastic only
 
 The spring balances an **elastic** shoe response. `toe_model=passive_spring`
 with any `visco_model` other than `elastic` raises an error. The explicit
 opt-in `passive_spring_elastic_equivalent` solves the same equation against
-the viscoelastic mapper's elastic-equivalent wrench and records a warning; it
+the viscoelastic mapper's elastic-equivalent load and records a warning; it
 is an approximation because the toe coordinate itself would have a
 rate-dependent reaction. There is never an automatic fallback.
 
 A proper viscoelastic extension needs: (1) the relaxation history applied to
-\(Q_\alpha\) (not only to the resultant wrench), i.e. a stored
-\(Q_\alpha\) response per internal state; (2) an evolution equation for
-\(\alpha\) including the toe damping \(c\,\dot\theta\) and the viscous shoe
-term, making the solve an ODE/DAE per frame; (3) consistent state updates when
-the contact record changes.
+\(Q_\alpha\) (not only to the resultant load), i.e. a \(Q_\alpha\) response
+per internal state; (2) an evolution equation for \(\alpha\) including the toe
+damping \(c\,\dot\theta\) and the viscous shoe term, making the solve an
+ODE/DAE per frame; (3) consistent state updates when the contact set changes.
 
-## Lookup schema
+## Stored data
 
-The lookup (`LOOKUP_SCHEMA_VERSION = 10`) stores `Q_alpha_shoe_on_foot_basis`
-(`(n_records, 6)`, N·m per metre width per unit coefficient, column 0 the
-curved-sole closure) defined as the rearfoot-fixed
-\(-\psi^\mathsf T\mathbf f_{t,y}\) for every contact interval, plus metadata
-(`top_force_sign`, `toe_generalized_force`, units, source). The stored basis
-must match recomputation from the stored top forces (rel. 1e-9). Files with
-a different schema version are rejected and must be regenerated.
+The contact model file (`contact_lookup.npz`, `schema_version = 13`) stores
+no per-contact-set toe data. The toe solve uses the contact operator's
+`w_alpha` (top shape mode), `f_alpha`, `P_tb`, `psi_top`, the softplus toe
+length and `kappa`, and the rearfoot geometry scalars `rearfoot_phi1_mtp`,
+`rearfoot_dy_mtp`. Files with a different schema version are rejected and
+must be regenerated.
 
 ## Outputs
 
-Per frame: `theta_rad`, `theta_deg`, `alpha`, `Q_alpha_shoe_on_foot`,
+Per frame: `theta_rad`, `theta_deg`, `toe_alpha`, `Q_alpha_shoe_on_foot`,
 `Q_theta_shoe_on_foot`, `toe_spring_moment_Nm`,
 `toe_spring_generalized_force_alpha`, `toe_equilibrium_residual_Nm`,
 `toe_equilibrium_relative_residual`, `toe_equilibrium_tangent`,
-`toe_equilibrium_stable`, `toe_root_count`, `toe_root_index`,
-`toe_spring_energy_J`, `toe_solve_status`, `toe_low_load`, `toe_q0_Nm`,
-`toe_q1_Nm`, `toe_roots_deg` (NPZ), plus constant columns `toe_model`,
+`toe_equilibrium_stable`, `toe_root_count`, `toe_iterations` (residual
+evaluations, i.e. contact solves), `toe_spring_energy_J`, `toe_solve_status`,
+`toe_low_load`, `toe_roots_deg` (NPZ), plus constant columns `toe_model`,
 `toe_stiffness_Nm_per_rad`, `toe_neutral_angle_rad`,
 `toe_damping_Nms_per_rad`. The `varphi` column is the chord-frame rotation at
-the selected root (it differs from the measured rearfoot `phi` by the bent-toe
-chord offset). The NPZ also stores `toe_Q_coeff` (per-frame \(\mathbf c\)) so
-the GUI can redraw the exact \(Q_\alpha(\theta)\) curve. `model_info.json` includes
-`toe_config`, `toe_equation`, `toe_rearfoot_kinematics` (`L`, `toe_length`, `phi1_mtp` \(=\varphi_1(L-\ell_{\mathrm{toe}})\), `dy_mtp`)
-and `toe_summary`.
-
-## Example results (width 0.1 m, elastic)
-
-| Trial | Frames | \(\theta\) range | peak at | max \(|g|\) | low-load | max \(U\) | contacts | unilateral-violation frames |
-|---|---|---|---|---|---|---|---|---|
-| P4 pr1 01, left, stance 0 | 281 | −0.9° … 31.4° | 76 % stance | 1.6e-14 N·m | 60 | 3.75 J | heel 15, full 12, toe 254 | 19 (3 with interior tension) |
-| P1 pr1 01, right, stance 0 | 300 | 0° … 23.2° | 65 % stance | 1.8e-14 N·m | 65 | 2.05 J | full 72, toe 228 | 114 (46 with interior tension) |
-
-Every frame had exactly one root and all were stable. \(\theta>0\) wherever
-the foot-on-shoe toe moment is negative (100 % of loaded P1 frames, 99.5 % of
-P4). The chord frame differs from the measured rearfoot angle by up to 8°.
-In every
-unilateral-violation frame no interval of the lookup admits a violation-free
-solution at the measured wrench; the interior-tension frames indicate that a
-multi-interval contact model would be needed there.
+the solved root (it differs from the measured rearfoot `phi` by the bent-toe
+chord offset). The GUI redraws the \(Q_\alpha(\theta)\) and
+\(\partial U/\partial\alpha\) curves of a frame with one exact contact solve per
+plotted \(\theta\). `model_info.json` includes `toe_config`, `toe_equation`,
+`toe_generalized_force`, `toe_rearfoot_kinematics` (`L`, `toe_length`,
+`phi1_mtp` \(=\varphi_1(L-\ell_{\mathrm{toe}})\), `dy_mtp`) and `toe_summary`
+(θ range, maximum residuals, multiple-root / no-root / unstable / low-load
+frame counts, mean toe iterations, maximum spring energy).
 
 ## Limitations
 
@@ -351,15 +314,17 @@ multi-interval contact model would be needed there.
   softplus shape across the whole top surface; it is not a rigid rotation about
   an MTP axis, although with the rearfoot held fixed \(\psi\approx\max(0,x-x_{\mathrm{mtp}})\)
   makes it behave like one for a sharp softplus. The toe dorsiflexes with load
-  under the toes and peaks late in stance (65–76 %), which is the same sense
-  and timing as anatomical MTP dorsiflexion; magnitudes still depend on the
-  soft \(k\) relative to the shoe's generalized stiffness and on the width
-  scaling.
+  under the toes, the same sense as anatomical MTP dorsiflexion; magnitudes
+  depend on the soft \(k\) relative to the shoe's generalized stiffness and on
+  the width scaling.
 - For a soft softplus (small \(\kappa\)) \(\psi\) dips below the rearfoot line
   on \((0,L-\ell_{\mathrm{toe}})\), so loads under the rearfoot contribute slightly to
   \(Q_\alpha\) and \(Q_\alpha\approx-M_{\mathrm{toe}}\) is only approximate.
 - Quasistatic and elastic only; damping is ignored.
 - The bounded spring force means \(\theta\) grows quickly once
-  \(|Q_\alpha|\) approaches ~10 N·m (P4 reaches 9.98 N·m).
-- P4 pr1 01 must be run with `--foot left` (the right-foot default gives an
+  \(|Q_\alpha|\) approaches ~10 N·m.
+- Continuation follows the branch connected to the previous sample; a
+  different root that appears elsewhere in the bounds is not reported unless a
+  cold scan runs.
+- P4 pr1 01 must be run with foot `left` (the right-foot default gives an
   implausible \(\phi\) range for that trial).

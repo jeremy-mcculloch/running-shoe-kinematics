@@ -1,74 +1,26 @@
-"""Reconstruct fixed-frame shoe outlines from gait replay frames."""
+"""Fixed-frame shoe shapes, animation and energy series for gait replay frames."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 
-from compliance_fem.contact.lookup import ContactLookupResult, required_array
-from compliance_fem.contact.topology import ContactType
-from compliance_fem.contact.corotation import basis_coefficients, contract_basis
+from compliance_fem.contact.contact_model import ContactModel, selection_proxy
 from compliance_fem.gait.replay import GaitReplayResult
 from compliance_fem.plotting.shape_render import ShapePlotData, build_shape_plot_data
 
 
-def _contact_type_at(result: GaitReplayResult, i: int) -> ContactType:
-    raw = result.contact_type[i]
-    if isinstance(raw, ContactType):
-        return raw
-    return ContactType(str(raw).lower())
-
-
-def selection_proxy_for_frame(
-    lookup: ContactLookupResult,
-    result: GaitReplayResult,
-    frame: int,
-) -> Any:
-    """Build a minimal selection object for ``build_shape_plot_data``."""
+def selection_proxy_for_frame(model: ContactModel, result: GaitReplayResult, frame: int) -> Any:
+    """Renderer state of one solved replay frame (``contact_model.selection_proxy``)."""
     i = int(frame)
-    row = int(result.record_index[i])
-    if row < 0:
-        raise ValueError(f"No selected contact record at frame {i}")
-
-    alpha = float(result.alpha[i])
-    d_ax = float(result.d_ax[i])
-    d_ay = float(result.d_ay[i])
-    varphi = float(result.varphi[i])
-    gamma = basis_coefficients(alpha, d_ax, d_ay, varphi)
-
-    # Stored bottom bases already hold the exact contact kinematics (rigid modes
-    # about the anchor plus the curved-sole closure) on the contact nodes.
-    fields = lookup.record_fields([row])
-    u_bot = np.asarray(contract_basis(fields["bottom_u"][0], gamma, mode_axis=0), dtype=float)
-    v_bot = np.asarray(contract_basis(fields["bottom_v"][0], gamma, mode_axis=0), dtype=float)
-    anchor_x = float(required_array(lookup, "contact_anchor_reference_x")[row])
-    anchor_y = float(required_array(lookup, "contact_anchor_reference_y")[row])
-
-    return SimpleNamespace(
-        selected_row=row,
-        contact_type=_contact_type_at(result, i),
-        contact_start_index=int(lookup.contact_start_index[row]),
-        contact_end_index=int(lookup.contact_end_index[row]),
-        anchor_x=anchor_x,
-        anchor_y=anchor_y,
-        d_ax=d_ax,
-        d_ay=d_ay,
-        varphi=varphi,
-        alpha=alpha,
-        phi=float(result.phi[i]),
-        theta=float(np.deg2rad(result.theta_deg[i])),
-        Fx_star=float(result.elastic_Fx[i]),
-        Fy_star=float(result.elastic_Fy[i]),
-        full_bottom_u=u_bot,
-        full_bottom_v=v_bot,
-        x_anchor_rot=float(anchor_x + d_ax),
-    )
+    if not result.frames or not bool(result.frame_valid[i]):
+        raise ValueError(f"No solved contact state at frame {i}")
+    return selection_proxy(model, result.frames[i], phi=float(result.phi[i]))
 
 
 def shape_for_frame(
-    lookup: ContactLookupResult,
+    model: ContactModel,
     result: GaitReplayResult,
     frame: int,
     *,
@@ -80,17 +32,13 @@ def shape_for_frame(
     plate_color_quantity: str = "none",
     foam_energy: bool = False,
 ) -> ShapePlotData:
-    """Fixed-frame deformed geometry for one replay frame.
-
-    When ``show_plate`` is ``None``, the plate is drawn if the lookup stores
-    plate Hermite responses (same default as the main GUI).
-    """
-    selection = selection_proxy_for_frame(lookup, result, frame)
+    """Fixed-frame deformed geometry for one replay frame (plate drawn when the model has one)."""
+    state = selection_proxy_for_frame(model, result, frame)
     if show_plate is None:
-        show_plate = bool(getattr(lookup, "has_plate_response", False))
+        show_plate = bool(model.has_plate_response)
     return build_shape_plot_data(
-        lookup,
-        selection,  # type: ignore[arg-type]
+        model,
+        state,
         scale_mode=scale_mode,
         manual_scale=manual_scale,
         n_plot=n_plot,
@@ -125,9 +73,18 @@ def _foot_xy_payload(shape: ShapePlotData) -> dict[str, Any]:
         py = np.asarray(py, dtype=float)
 
     x_pad = 0.08 * float(shape.L)
-    edges = [p for p in (shape.heel_edge_xy, shape.toe_edge_xy) if p is not None]
-    edge_x = np.array([p[0] for p in edges] or [np.nan], dtype=float)
-    edge_y = np.array([p[1] for p in edges] or [np.nan], dtype=float)
+    # Every active patch in one NaN-separated trace (fixed trace count for animation);
+    # patch end nodes as edge markers. Gaps between patches are never filled.
+    cx: list[float] = []
+    cy: list[float] = []
+    ex: list[float] = []
+    ey: list[float] = []
+    for (px_c, py_c) in shape.contact_curves:
+        cx += [*np.asarray(px_c, dtype=float), np.nan]
+        cy += [*np.asarray(py_c, dtype=float), np.nan]
+        ex += [float(px_c[0]), float(px_c[-1])]
+        ey += [float(py_c[0]), float(py_c[-1])]
+    spans = ", ".join(f"{{{p.start}..{p.end}}}" for p in shape.patches) or "none"
     return {
         "reference_x": np.array([0.0, shape.L, shape.L, 0.0, 0.0], dtype=float),
         "reference_y": np.array([0.0, 0.0, shape.H, shape.H, 0.0], dtype=float),
@@ -143,19 +100,17 @@ def _foot_xy_payload(shape: ShapePlotData) -> dict[str, Any]:
         "chord_y": np.asarray(shape.chord_y, dtype=float),
         "ground_x": np.array([-x_pad, float(shape.L) + x_pad], dtype=float),
         "ground_y": np.array([shape.ground_y, shape.ground_y], dtype=float),
-        "contact_x": np.asarray(shape.contact_curve_x, dtype=float),
-        "contact_y": np.asarray(shape.contact_curve_y, dtype=float),
-        "contact_name": (
-            f"{shape.contact_type} contact {{{shape.contact_start_index}..{shape.contact_end_index}}}"
-        ),
-        "edge_x": edge_x,
-        "edge_y": edge_y,
+        "contact_x": np.asarray(cx or [np.nan], dtype=float),
+        "contact_y": np.asarray(cy or [np.nan], dtype=float),
+        "contact_name": f"{shape.contact_label} contact {spans}",
+        "edge_x": np.asarray(ex or [np.nan], dtype=float),
+        "edge_y": np.asarray(ey or [np.nan], dtype=float),
         "anchor_x": np.array([shape.anchor_xy[0]], dtype=float),
         "anchor_y": np.array([shape.anchor_xy[1]], dtype=float),
         "chord_name": f"chord φ={shape.phi_deg:.2f}°",
         "title": (
             f"φ={shape.phi_deg:.2f}°  θ={shape.theta_deg:.2f}°  "
-            f"({shape.contact_type}, {shape.scale_mode})"
+            f"({shape.contact_label}, {shape.scale_mode})"
         ),
         "L": float(shape.L),
         "H": float(shape.H),
@@ -166,7 +121,7 @@ def _edge_trace(p: dict[str, Any]):
     import plotly.graph_objects as go
 
     return go.Scatter(
-        x=p["edge_x"], y=p["edge_y"], mode="markers", name="contact edges (heel, toe)",
+        x=p["edge_x"], y=p["edge_y"], mode="markers", name="contact patch end nodes",
         marker=dict(symbol="line-ns-open", size=16, color="#2ca02c", line=dict(width=3)),
         hoverinfo="skip",
     )
@@ -176,7 +131,7 @@ def _anchor_trace(p: dict[str, Any]):
     import plotly.graph_objects as go
 
     return go.Scatter(
-        x=p["anchor_x"], y=p["anchor_y"], mode="markers", name="neutral anchor (numerical)",
+        x=p["anchor_x"], y=p["anchor_y"], mode="markers", name="display pivot (contact centroid)",
         marker=dict(symbol="x-thin-open", size=10, color="#7f7f7f", line=dict(width=2)),
         hoverinfo="skip",
     )
@@ -185,17 +140,17 @@ def _anchor_trace(p: dict[str, Any]):
 MAX_ENERGY_FRAMES = 75
 
 
-def animation_frame_stride(lookup: ContactLookupResult, result: GaitReplayResult, *, energy: bool = True,
+def animation_frame_stride(model: ContactModel, result: GaitReplayResult, *, energy: bool = True,
                            max_energy_frames: int = MAX_ENERGY_FRAMES) -> int:
     """Replay frames per animation frame: >1 only when foam energy colouring is on and frames are many."""
-    n_valid = int(np.count_nonzero(np.asarray(result.record_index) >= 0))
-    if not (energy and getattr(lookup, "render_section", None)) or n_valid <= max_energy_frames:
+    n_valid = int(np.count_nonzero(np.asarray(result.frame_valid)))
+    if not (energy and model.render_section) or n_valid <= max_energy_frames:
         return 1
     return int(np.ceil(n_valid / max(int(max_energy_frames), 1)))
 
 
 def plotly_foot_animation_figure(
-    lookup: ContactLookupResult,
+    model: ContactModel,
     result: GaitReplayResult,
     *,
     scale_mode: str = "true",
@@ -212,7 +167,7 @@ def plotly_foot_animation_figure(
     Frames only patch ``x``/``y`` on existing traces with ``redraw=False`` so the
     previous outline stays visible until the next frame is applied (no white flash).
 
-    With ``energy`` (and a lookup with a render section / plate response), the
+    With ``energy`` (and a model with a render section / plate response), the
     foam mesh and the plate are coloured by strain energy density on colour
     scales fixed over the whole stance. Each foam frame is ~0.2 MB, so only every
     k-th replay frame is animated, at most ``max_energy_frames`` frames.
@@ -226,17 +181,17 @@ def plotly_foot_animation_figure(
     )
 
     n = int(result.times.size)
-    valid = [i for i in range(n) if int(result.record_index[i]) >= 0]
-    foam_on = bool(energy and getattr(lookup, "render_section", None))
-    plate_on = bool(energy and getattr(lookup, "has_plate_response", False))
-    stride = animation_frame_stride(lookup, result, energy=energy, max_energy_frames=max_energy_frames)
+    valid = [i for i in range(n) if bool(result.frame_valid[i])]
+    foam_on = bool(energy and model.render_section)
+    plate_on = bool(energy and model.has_plate_response)
+    stride = animation_frame_stride(model, result, energy=energy, max_energy_frames=max_energy_frames)
     payloads: list[dict[str, Any]] = []
     shapes: list[ShapePlotData] = []
     frame_index: list[int] = []
     for i in valid[::stride]:
         try:
             shape = shape_for_frame(
-                lookup,
+                model,
                 result,
                 i,
                 scale_mode=scale_mode,
@@ -536,45 +491,35 @@ def plotly_foot_animation_figure(
     return fig
 
 
-def stance_strain_energy(
-    lookup: ContactLookupResult,
-    result: GaitReplayResult,
-    *,
-    samples_per_element: int = 16,
-) -> dict[str, np.ndarray]:
+def stance_strain_energy(model: ContactModel, result: GaitReplayResult, *, samples_per_element: int = 16) -> dict[str, np.ndarray]:
     """Total strain energy (J, whole shoe width) in the foam and in the plate per replay frame.
 
     Foam: ``sum_e W_e A_e`` over the mesh (``element_strain_energy_density``).
     Plate: ``int 1/2 EI kappa^2 ds`` over its Hermite samples (trapezoid). Both
-    are per metre width in the lookup and are multiplied by ``shoe_width_m``.
-    Frames without a selected record, or a lookup without the render section /
+    are per metre width in the model and are multiplied by ``shoe_width_m``.
+    Frames without a solved state, or a model without the render section /
     plate response, give NaN.
     """
-    from compliance_fem.fem.plate_response import plate_state_for_selection
+    from compliance_fem.contact.contact_model import plate_state_for_solution, render_vertex_displacements
     from compliance_fem.geometry.render import element_areas, element_strain_energy_density
-    from compliance_fem.plotting.shape_render import _render_displacements
 
     n = int(result.times.size)
     width = float(result.model_info.get("shoe_width_m", 1.0))
     foam = np.full(n, np.nan)
     plate = np.full(n, np.nan)
-    has_foam = bool(getattr(lookup, "render_section", None))
-    has_plate = bool(getattr(lookup, "has_plate_response", False))
-    areas = element_areas(lookup) if has_foam else None
-    for i in range(n):
-        if int(result.record_index[i]) < 0:
+    areas = element_areas(model) if model.render_section else None
+    for i in range(min(n, len(result.frames))):
+        if not bool(result.frame_valid[i]):
             continue
-        sel = selection_proxy_for_frame(lookup, result, i)
-        if has_foam and areas is not None:
-            u, v = _render_displacements(lookup, sel)
-            foam[i] = width * float(element_strain_energy_density(lookup, u, v) @ areas)
-        if has_plate:
-            state = plate_state_for_selection(
-                lookup, sel, samples_per_element=samples_per_element,  # type: ignore[arg-type]
-                color_quantity="strain_energy_density",
-            )
-            if state is not None and state.color_values is not None:
-                plate[i] = width * float(np.trapezoid(state.color_values, state.sample_s))
+        sol = result.frames[i].contact
+        if areas is not None:
+            u, v = render_vertex_displacements(model, sol)
+            foam[i] = width * float(element_strain_energy_density(model, u, v) @ areas)
+        state = plate_state_for_solution(
+            model, sol, samples_per_element=samples_per_element, color_quantity="strain_energy_density"
+        )
+        if state is not None and state.color_values is not None:
+            plate[i] = width * float(np.trapezoid(state.color_values, state.sample_s))
     return {"times": np.asarray(result.times, dtype=float), "foam_J": foam, "plate_J": plate}
 
 
@@ -610,3 +555,64 @@ def strain_energy_stance_figure(series: dict[str, np.ndarray]):
         margin=dict(l=60, r=60, t=70, b=50),
     )
     return fig
+
+
+OUT_OF_PLANE_PANELS = (
+    ("lateral_translation_stiffness", "k_z lateral translation (kN/m)", 1e-3),
+    ("roll_stiffness", "k_roll roll (N·m/rad)", 1.0),
+    ("yaw_stiffness", "k_yaw yaw (N·m/rad)", 1.0),
+)
+
+
+def out_of_plane_stiffness_figure(result: GaitReplayResult, *, x_axis: str = "time"):
+    """Three stacked panels of the stored 2.5D stiffness histories (NaN shown as gaps).
+
+    ``x_axis`` is ``"time"`` (s) or ``"stance"`` (stance-normalized percent). Values
+    are the ones stored per frame by the replay; nothing is recomputed here.
+    Samples with a non-``ok`` status are marked; frames near an active-set change
+    are marked separately.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    x = np.asarray(result.stance_percent if x_axis == "stance" else result.times, dtype=float)
+    xlabel = "stance (%)" if x_axis == "stance" else "t (s)"
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        subplot_titles=[t for _, t, _ in OUT_OF_PLANE_PANELS])
+    status = np.asarray(result.oop_stiffness_status if result.oop_stiffness_status else ["not_available"] * x.size)
+    flagged = ~np.isin(status, ["ok", "no_contact"])
+    near = np.asarray(result.oop_near_active_set_change, dtype=bool) if result.oop_near_active_set_change.size == x.size \
+        else np.zeros(x.size, dtype=bool)
+    for row, (name, _, scale) in enumerate(OUT_OF_PLANE_PANELS, start=1):
+        y = np.asarray(getattr(result, name), dtype=float)
+        if y.size != x.size:
+            y = np.full(x.size, np.nan)
+        y = y * scale
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=name, line=dict(width=2), connectgaps=False,
+                                 showlegend=False), row=row, col=1)
+        if np.any(flagged & np.isfinite(y)) or np.any(flagged):
+            yy = np.where(np.isfinite(y), y, 0.0)
+            fig.add_trace(go.Scatter(x=x[flagged], y=yy[flagged], mode="markers", name="invalid / ill-conditioned",
+                                     marker=dict(symbol="x", color="#d62728", size=7), showlegend=(row == 1),
+                                     text=status[flagged], hovertemplate="%{text}<extra></extra>"), row=row, col=1)
+        if np.any(near):
+            fig.add_trace(go.Scatter(x=x[near], y=y[near], mode="markers", name="near active-set change",
+                                     marker=dict(symbol="circle-open", color="#ff9f1c", size=5), showlegend=(row == 1)),
+                          row=row, col=1)
+    fig.update_xaxes(title_text=xlabel, row=3, col=1)
+    fig.update_layout(height=620, title="2.5D out-of-plane tangent stiffness (local, active set frozen)",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0),
+                      margin=dict(l=60, r=20, t=80, b=50))
+    return fig
+
+
+def out_of_plane_csv(result: GaitReplayResult) -> str:
+    """CSV of the 2.5D stiffness histories and diagnostics (units in the header)."""
+    oop = result.out_of_plane_column_dict()
+    oop.pop("gait_cycle_percent", None)
+    cols = {"time_s": result.times, "stance_percent": result.stance_percent, **oop}
+    keys = list(cols)
+    lines = [",".join(keys)]
+    for i in range(int(result.times.size)):
+        lines.append(",".join(str(cols[k][i]) if np.asarray(cols[k]).dtype == object else f"{float(cols[k][i]):.10g}" for k in keys))
+    return "\n".join(lines) + "\n"

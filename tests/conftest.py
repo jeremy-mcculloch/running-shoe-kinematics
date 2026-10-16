@@ -1,8 +1,6 @@
-"""Shared small-mesh fixtures for the interval-contact tests.
+"""Shared small-mesh fixtures: synthetic soles and their continuous contact models.
 
-``*_case`` and ``*_lookup_full`` keep the per-node bases in memory
-(``store_fields=True``); ``*_lookup`` is the default compact lookup whose nodal
-fields are recomputed on demand.
+``*_case`` is ``(ComplianceResult, ContactModel)``; ``*_model`` is the model only.
 
 The meshes are coarse synthetic measured soles (:func:`synthetic_sole_geometry`):
 a flat-topped sole that drops to a point toe, with every sample on one
@@ -19,7 +17,7 @@ import pytest
 
 from compliance_fem.fem.compliance import compute_compliance
 from compliance_fem.contact.sole_config import SoleConfig
-from compliance_fem.contact.lookup import get_compliance_block_matrix, generate_contact_lookup
+from compliance_fem.contact.contact_model import build_contact_model
 from compliance_fem.geometry.profile import NormalizedSoleGeometry, validate_normalized_geometry
 
 # L - toe_length = 9 L / 12 lies on the top-node grid (no off-grid ramp warning).
@@ -96,21 +94,8 @@ def small_config(
 
 def _build(config: SoleConfig):
     result = compute_compliance(config)
-    lookup = generate_contact_lookup(
-        get_compliance_block_matrix(result),
-        toe_length=SMALL_TOE_LENGTH,
-        kappa=SMALL_KAPPA,
-        fem_result=result,
-        store_fields=True,
-    )
-    return result, lookup
-
-
-def _compact(case):
-    result, _ = case
-    return generate_contact_lookup(
-        get_compliance_block_matrix(result), toe_length=SMALL_TOE_LENGTH, kappa=SMALL_KAPPA, fem_result=result
-    )
+    model = build_contact_model(result, toe_length=SMALL_TOE_LENGTH, kappa=SMALL_KAPPA)
+    return result, model
 
 
 @pytest.fixture(scope="session")
@@ -132,30 +117,15 @@ def asym_case():
 
 
 @pytest.fixture(scope="session")
-def flat_lookup_full(flat_case):
+def flat_model(flat_case):
     return flat_case[1]
 
 
 @pytest.fixture(scope="session")
-def rocker_lookup_full(rocker_case):
+def rocker_model(rocker_case):
     return rocker_case[1]
 
 
 @pytest.fixture(scope="session")
-def asym_lookup_full(asym_case):
+def asym_model(asym_case):
     return asym_case[1]
-
-
-@pytest.fixture(scope="session")
-def flat_lookup(flat_case):
-    return _compact(flat_case)
-
-
-@pytest.fixture(scope="session")
-def rocker_lookup(rocker_case):
-    return _compact(rocker_case)
-
-
-@pytest.fixture(scope="session")
-def asym_lookup(asym_case):
-    return _compact(asym_case)

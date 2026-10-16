@@ -13,7 +13,7 @@ import pytest
 from test_measured_sole import _subsampled_rows, _write_rows
 
 from compliance_fem.api import SoleModel
-from compliance_fem.contact.lookup import load_contact_lookup
+from compliance_fem.contact.contact_model import LOOKUP_SCHEMA_VERSION, load_contact_model
 from compliance_fem.gui.params import gui_params_from_setup, setup_from_gui
 from compliance_fem.contact.model_setup import (
     FINGERPRINT_METADATA_KEY,
@@ -21,7 +21,6 @@ from compliance_fem.contact.model_setup import (
     ConfigFileError,
     ensure_lookup_exists,
     load_model_setup,
-    lookup_stores_nodal_fields,
     matching_prebuilt_lookup,
     save_model_setup,
     model_setup_from_dict,
@@ -163,7 +162,7 @@ def built(coarse_config):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         npz = ensure_lookup_exists(setup, quiet=True, force=True, skip_plots=True)
-    return setup, load_contact_lookup(npz), npz
+    return setup, load_contact_model(npz), npz
 
 
 def test_build_records_setup(built) -> None:
@@ -174,9 +173,10 @@ def test_build_records_setup(built) -> None:
     assert lookup.softplus_kappa == setup.softplus_kappa
     assert stored_lookup_fingerprint(npz) == setup.fingerprint()
     assert load_model_setup(npz.parent / "measured_sole_config.json").fingerprint() == setup.fingerprint()
-    reloaded = load_contact_lookup(npz)
+    reloaded = load_contact_model(npz)
     assert reloaded.metadata[FINGERPRINT_METADATA_KEY] == setup.fingerprint()
     assert reloaded.metadata[SETUP_METADATA_KEY]["runtime"]["shoe_width_m"] == 0.09
+    assert reloaded.schema_version == LOOKUP_SCHEMA_VERSION
 
 
 def test_ensure_reuses_matching_lookup(built) -> None:
@@ -196,6 +196,8 @@ def test_sole_model_from_config(built, coarse_config, tmp_path) -> None:
     st = m.step(-20.0, -400.0, 2.0)
     assert st.valid
     np.testing.assert_allclose(st.top_force_N.sum(axis=1), [-20.0, -400.0], rtol=1e-8)
+    # Ground reaction (compressive-positive normal) balances the foot-on-shoe load.
+    np.testing.assert_allclose(st.bottom_reaction_N.sum(axis=1), [20.0, 400.0], rtol=1e-8)
 
     data = json.loads(coarse_config.read_text())
     data["sole"]["EI_plate_Nm2_per_m"] = 3.0
@@ -212,7 +214,7 @@ def test_from_config_warns_without_fingerprint(built, coarse_config) -> None:
     lookup.metadata.pop(FINGERPRINT_METADATA_KEY)
     try:
         with pytest.warns(UserWarning, match="fingerprint"):
-            SoleModel.from_config(coarse_config, lookup=lookup)
+            SoleModel.from_config(coarse_config, model=lookup)
     finally:
         lookup.metadata[FINGERPRINT_METADATA_KEY] = built[0].fingerprint()
 
@@ -223,7 +225,7 @@ def test_lookup_cli_with_config(coarse_config, tmp_path) -> None:
     out = tmp_path / "cli_lookup"
     data = json.loads(coarse_config.read_text())
     data["sole"]["geometry_csv"] = str(coarse_config.parent / data["sole"]["geometry_csv"])
-    data["lookup"] = {"output_dir": str(out), "min_bend_radius_mm": 9.0, "store_nodal_fields": True}
+    data["lookup"] = {"output_dir": str(out), "min_bend_radius_mm": 9.0}
     cfg = _write(tmp_path / "cli.json", data)
     with pytest.raises(SystemExit):
         main([str(cfg), "--kappa", "120"])
@@ -231,44 +233,18 @@ def test_lookup_cli_with_config(coarse_config, tmp_path) -> None:
         warnings.simplefilter("ignore", UserWarning)
         main([str(cfg), "--quiet", "--save-fem"])
     setup = load_model_setup(out / "measured_sole_config.json")
-    assert setup.softplus_kappa == 120.0 and setup.lookup.store_nodal_fields
+    assert setup.softplus_kappa == 120.0
     assert stored_lookup_fingerprint(out) == setup.fingerprint()
     summary = json.loads((out / "generation_summary.json").read_text())
     assert summary["softplus_kappa"] == 120.0 and summary["model_setup_fingerprint"] == setup.fingerprint()
-    assert summary["nodal_fields_stored"] is True and lookup_stores_nodal_fields(out)
-    assert load_contact_lookup(out).nodal_fields_stored
+    assert summary["schema_version"] == LOOKUP_SCHEMA_VERSION
+    assert load_contact_model(out).softplus_kappa == 120.0
     for name in ("compliance_results.npz", "mesh.msh", "mesh.vtk", "Cbb_force_heatmap.png", "fem_summary.json"):
         assert (out / "fem" / name).is_file(), name
-    assert list(out.glob("*_interval_heatmap.png"))
 
     mtime = (out / "contact_lookup.npz").stat().st_mtime_ns
     main([str(cfg), "--quiet"])
     assert (out / "contact_lookup.npz").stat().st_mtime_ns == mtime
-
-
-# --- nodal field storage ---------------------------------------------------------------------
-
-
-def test_store_nodal_fields_parsing() -> None:
-    assert model_setup_from_dict(_minimal()).lookup.store_nodal_fields is False
-    assert model_setup_from_dict(_minimal(lookup={"store_nodal_fields": True})).lookup.store_nodal_fields is True
-    with pytest.raises(ConfigFileError, match="store_nodal_fields"):
-        model_setup_from_dict(_minimal(lookup={"store_nodal_fields": "yes"}))
-    s = model_setup_from_dict(_minimal())
-    assert replace(s, lookup=replace(s.lookup, store_nodal_fields=True)).fingerprint() == s.fingerprint()
-
-
-def test_built_lookup_is_compact_by_default(built) -> None:
-    setup, lookup, npz = built
-    assert not setup.lookup.store_nodal_fields
-    assert not lookup.nodal_fields_stored and lookup.has_nodal_fields
-    assert not lookup_stores_nodal_fields(npz)
-    with np.load(npz, allow_pickle=True) as data:
-        assert not any(k.endswith("_basis") and k.startswith(("bottom_", "reaction_", "top_force_")) for k in data.files)
-        assert "field_solver_compliance" in data.files
-    wants_fields = replace(setup, lookup=replace(setup.lookup, store_nodal_fields=True))
-    assert matching_prebuilt_lookup(wants_fields) is None
-    assert matching_prebuilt_lookup(setup) == npz
 
 
 # --- GUI consistency -------------------------------------------------------------------------

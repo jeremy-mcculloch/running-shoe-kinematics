@@ -1,38 +1,40 @@
-"""Fixed-frame deformed-geometry plot data (GUI-independent).
+"""Fixed-frame deformed-geometry plot data (GUI-independent) for one continuous contact state.
 
-Every rendered point is mapped with the complete transformation
+Every rendered point is mapped with
 
-    r^F = r_a^F + Q(varphi) [ (X - X_a) + s_d (d^T - d_a^T) ],
+    r^F = r_p^F + Q(varphi) [ (X - X_p) + s_d (d - d_p) ],
 
-so the rigid co-rotation is never exaggerated; only the elastic part is scaled
-by the display factor ``s_d``. ``X_a = (x_a, y_a)`` is the interval-midpoint
-anchor on the reference bottom profile and the gauge ``r_a^F = (x_a, 0)`` puts
-it on the ground. The anchor is a numerical decomposition point only: the
-physical contact boundaries are the heel and toe contact edges ``x_i`` and
-``x_j`` of the selected interval ``I_ij``.
+where ``X_p`` is the reaction-weighted contact centroid (``contact_model.display_pivot``),
+``d_p`` its local displacement and ``r_p^F`` its true fixed-frame position. With
+``s_d = 1`` this is the exact placement ``r^F = T + Q (X + d)``; the rigid
+rotation is never exaggerated, only the elastic part. The pivot is continuous
+in the solution, so exaggerated shapes do not jump at active-set changes.
+
+Contact is shown per node: active nodes, inactive nodes and *transition* nodes
+(active with a reaction below ``TRANSITION_FRACTION`` of the peak, or inactive
+with a gap below ``TRANSITION_FRACTION * h``). Disconnected patches are drawn
+separately; the range between them is never shaded. The patch edge estimates
+are derived display quantities (``continuous_contact.contact_edge_estimate``).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from compliance_fem.contact.lookup import ContactLookupResult
-from compliance_fem.contact.topology import ContactType
+from compliance_fem.contact.basis import shape_mode_phi1
 from compliance_fem.contact.corotation import transform_to_fixed_frame
-from compliance_fem.contact.force_control import ContactSelection, top_displacement_vector
 
 if TYPE_CHECKING:
+    from compliance_fem.contact.contact_model import ContactModel
     from compliance_fem.fem.plate_response import PlateRuntimeState
 
-GAUGE_DESCRIPTION = (
-    "Visualization gauge: the interval-midpoint anchor X_a = ((x_i + x_j)/2, y_b) is "
-    "pinned to the ground point r_a^F = (x_a, 0). The anchor is a numerical "
-    "decomposition point, not a contact boundary; the contact edges are x_i and x_j. "
-    "Absolute horizontal position is not determined by the model."
-)
+TRANSITION_FRACTION = 0.02
+NODE_ACTIVE = "active"
+NODE_INACTIVE = "inactive"
+NODE_TRANSITION = "transition"
 
 
 @dataclass(frozen=True)
@@ -53,11 +55,7 @@ class ShapePlotData:
     force_origin: tuple[float, float]
     force_vector: tuple[float, float]
     ground_y: float
-    contact_type: str
-    contact_span: tuple[float, float]
-    free_spans: tuple[tuple[float, float], ...]
-    anchor_x: float
-    x_anchor_rot: float
+    contact_label: str
     toe_length: float
     L: float
     H: float
@@ -67,21 +65,20 @@ class ShapePlotData:
     scale: float
     scale_mode: str
     caption: str
-    # Interval I_ij and its fixed-frame markers.
-    contact_start_index: int = -1
-    contact_end_index: int = -1
-    anchor_y: float = 0.0
-    contact_curve_x: np.ndarray | None = None
-    contact_curve_y: np.ndarray | None = None
-    free_curves: tuple[tuple[np.ndarray, np.ndarray], ...] = ()
-    contact_node_x: np.ndarray | None = None
-    contact_node_y: np.ndarray | None = None
-    free_node_x: np.ndarray | None = None
-    free_node_y: np.ndarray | None = None
-    heel_edge_xy: tuple[float, float] | None = None
-    toe_edge_xy: tuple[float, float] | None = None
-    heel_adjacent_xy: tuple[float, float] | None = None
-    toe_adjacent_xy: tuple[float, float] | None = None
+    # Per bottom node (heel -> toe): material x, deformed fixed-frame position,
+    # gap, compressive normal reaction, active mask and display class.
+    bottom_material_x: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    bottom_node_x: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    bottom_node_y: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    bottom_gap: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    bottom_normal_reaction: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    active: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    node_class: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=object))
+    # One deformed polyline per connected active patch, plus patch metadata.
+    contact_curves: tuple[tuple[np.ndarray, np.ndarray], ...] = ()
+    patches: tuple[Any, ...] = ()
+    # Derived (display-only) patch edge points in the fixed frame.
+    edge_estimate_points: tuple[tuple[float, float], ...] = ()
     anchor_xy: tuple[float, float] = (0.0, 0.0)
     y_plate_ref: np.ndarray | None = None
     x_plate_def: np.ndarray | None = None
@@ -105,7 +102,7 @@ class ShapePlotData:
     show_undeformed_plate: bool = False
     show_plate_nodes: bool = False
     show_plate_rotations: bool = False
-    # Exact nodal rendering of the two foam regions from the lookup's render influence.
+    # Exact nodal rendering of the two foam regions from the render influence.
     has_render_mesh: bool = False
     region_ref: dict = field(default_factory=dict)  # name -> (x, y) closed loop, reference
     region_def: dict = field(default_factory=dict)  # name -> (x, y) closed loop, fixed frame
@@ -122,12 +119,8 @@ class ShapePlotData:
     foam_energy_density: np.ndarray | None = None  # (n_el,)
 
     @property
-    def contact_start_x(self) -> float:
-        return float(self.contact_span[0])
-
-    @property
-    def contact_end_x(self) -> float:
-        return float(self.contact_span[1])
+    def n_patches(self) -> int:
+        return len(self.patches)
 
 
 MAX_CONTACT_DRIFT_FRACTION = 0.02
@@ -166,18 +159,6 @@ def choose_display_scale(
     return float(s), f"auto-exaggerated elastic scale s={s:.3g} (display only; not true scale)"
 
 
-def _profile(x: np.ndarray, x_nodes: np.ndarray | None, y_nodes: np.ndarray | None, fallback: float) -> np.ndarray:
-    if x_nodes is None or y_nodes is None:
-        return np.full_like(x, fallback)
-    return np.interp(x, x_nodes, y_nodes)
-
-
-def _as_contact_type(raw) -> ContactType:
-    if isinstance(raw, ContactType):
-        return raw
-    return ContactType(str(raw))
-
-
 def _plate_rotation_quivers(
     plate: PlateRuntimeState,
     *,
@@ -198,24 +179,24 @@ def _plate_rotation_quivers(
     return x[idx], y[idx], half * nx, half * ny
 
 
-def _selection_interval(selection, lookup: ContactLookupResult) -> tuple[int, int]:
-    i = getattr(selection, "contact_start_index", None)
-    j = getattr(selection, "contact_end_index", None)
-    if i is None or j is None:
-        row = int(selection.selected_row)
-        i = int(lookup.contact_start_index[row])
-        j = int(lookup.contact_end_index[row])
-    return int(i), int(j)
+def node_classes(active: np.ndarray, gap: np.ndarray, lam: np.ndarray, h: float) -> np.ndarray:
+    """Display class per bottom node: active / inactive / transition (near g = lambda = 0)."""
+    a = np.asarray(active, dtype=bool)
+    lam = np.asarray(lam, dtype=float)
+    peak = float(np.max(lam)) if lam.size and np.max(lam) > 0 else 0.0
+    trans = (a & (lam <= TRANSITION_FRACTION * peak)) | (~a & (np.asarray(gap) <= TRANSITION_FRACTION * float(h)))
+    out = np.where(a, NODE_ACTIVE, NODE_INACTIVE).astype(object)
+    out[trans] = NODE_TRANSITION
+    return out
 
 
 def build_shape_plot_data(
-    lookup: ContactLookupResult,
-    selection: ContactSelection,
+    model: ContactModel,
+    state,
     *,
     scale_mode: str = "true",
     manual_scale: float = 1.0,
     n_plot: int = 200,
-    plate: PlateRuntimeState | None = None,
     show_plate: bool = True,
     show_undeformed_plate: bool = True,
     show_plate_nodes: bool = False,
@@ -224,122 +205,79 @@ def build_shape_plot_data(
     samples_per_element: int = 16,
     foam_energy: bool = False,
 ) -> ShapePlotData:
-    """Construct fixed-frame deformed geometry for the selected interval record.
+    """Fixed-frame deformed geometry of one contact state (``contact_model.selection_proxy``).
 
     With ``foam_energy`` and a measured render section, the deformed foam mesh
     and each element's strain energy density are included (true displacement;
     the display scale only moves the drawn vertices).
     """
-    anchor_raw = getattr(selection, "anchor_x", None)
-    d_ax_raw = getattr(selection, "d_ax", None)
-    d_ay_raw = getattr(selection, "d_ay", None)
-    if selection.selected_row is None or anchor_raw is None or d_ax_raw is None or d_ay_raw is None:
-        raise ValueError("Cannot build shape plot without a selected record.")
+    from compliance_fem.contact.contact_model import plate_state_for_solution, render_vertex_displacements
 
-    x_a = float(anchor_raw)
-    y_a = float(getattr(selection, "anchor_y", 0.0) or 0.0)
-    d_ax = float(d_ax_raw)
-    d_ay = float(d_ay_raw)
-    varphi = float(selection.varphi)
-    L = float(lookup.L)
-    i_c, j_c = _selection_interval(selection, lookup)
-    ctype_raw = getattr(selection, "contact_type", None)
-    ctype = _as_contact_type(ctype_raw) if ctype_raw is not None else ContactType.INTERIOR
-
-    x_b = np.asarray(lookup.x_bottom, dtype=float)
+    sol = state.solution
+    op = model.operator
+    x_a, y_a = float(state.anchor_x), float(state.anchor_y)
+    d_ax, d_ay = float(state.d_ax), float(state.d_ay)
+    anchor_fixed = tuple(state.anchor_fixed)
+    varphi = float(state.varphi)
+    L = float(op.L)
+    x_b, y_b = op.x_bottom, op.y_bottom
     n_b = x_b.size
-    y_b = np.asarray(lookup.y_bottom, dtype=float) if lookup.y_bottom is not None else np.zeros(n_b)
-    x_i, x_j = float(x_b[i_c]), float(x_b[j_c])
-    span = (x_i, x_j)
-    free_spans = tuple(s for s in ((float(x_b[0]), x_i), (x_j, float(x_b[-1]))) if s[1] > s[0])
+    u_bot_nodes = np.asarray(state.full_bottom_u, dtype=float)
+    v_bot_nodes = np.asarray(state.full_bottom_v, dtype=float)
 
     x = np.linspace(0.0, L, n_plot)
-    u_top, v_top = top_displacement_vector(x, selection.alpha, lookup.L, lookup.softplus_toe_length, lookup.softplus_kappa)
-    u_bot_nodes = np.nan_to_num(np.asarray(selection.full_bottom_u, dtype=float))
-    v_bot_nodes = np.nan_to_num(np.asarray(selection.full_bottom_v, dtype=float))
+    u_top = np.zeros_like(x)
+    v_top = float(state.alpha) * shape_mode_phi1(x, L, op.toe_length, op.kappa)
     u_bot = np.interp(x, x_b, u_bot_nodes)
     v_bot = np.interp(x, x_b, v_bot_nodes)
-
-    lever = max(abs(x_i - x_a), abs(x_j - x_a))
-    scale, label = choose_display_scale(
-        lookup.H, v_top, v_bot, scale_mode, manual_scale,
-        u=np.concatenate([u_top, u_bot]),
-        rotation_drift=float(np.hypot(np.cos(varphi) - 1.0, np.sin(varphi))) * lever,
-    )
-    render_disp = None
-    if getattr(lookup, "render_section", None):
-        render_disp = _render_displacements(lookup, selection)
-        # Scale from the region outlines, as before the render nodes covered the whole mesh.
-        k_out = _outline_index(lookup)
+    render_disp = render_vertex_displacements(model, sol) if model.render_section else None
+    if render_disp is not None:
+        k_out = _outline_index(model)
         scale, label = choose_display_scale(
-            lookup.H, render_disp[1][k_out], np.zeros(1), scale_mode, manual_scale, u=render_disp[0][k_out],
-            rotation_drift=float(np.hypot(np.cos(varphi) - 1.0, np.sin(varphi))) * lever,
+            op.H, render_disp[1][k_out], np.zeros(1), scale_mode, manual_scale, u=render_disp[0][k_out]
         )
+    else:
+        scale, label = choose_display_scale(op.H, v_top, v_bot, scale_mode, manual_scale, u=u_bot)
 
-    y_top_ref = _profile(x, lookup.x_top, lookup.y_top, lookup.H)
-    y_bottom_ref = _profile(x, x_b, y_b, 0.0)
+    y_top_ref = np.interp(x, op.x_top, op.y_top)
+    y_bottom_ref = np.interp(x, x_b, y_b)
     y_plate_ref = None
-    if lookup.x_plate is not None and lookup.y_plate is not None:
-        y_plate_ref = np.interp(x, lookup.x_plate, lookup.y_plate)
+    if model.x_plate is not None and model.y_plate is not None:
+        y_plate_ref = np.interp(x, model.x_plate, model.y_plate)
 
     def _to_fixed(xr, yr, u, v):
-        return transform_to_fixed_frame(xr, yr, u, v, x_a, d_ax, d_ay, varphi, elastic_scale=scale, y_anchor=y_a)
+        return transform_to_fixed_frame(
+            xr, yr, u, v, x_a, d_ax, d_ay, varphi, anchor=anchor_fixed, elastic_scale=scale, y_anchor=y_a
+        )
 
     x_top_def, y_top_def = _to_fixed(x, y_top_ref, u_top, v_top)
     x_bottom_def, y_bottom_def = _to_fixed(x, y_bottom_ref, u_bot, v_bot)
-
-    # Nodal bottom points (exact nodal displacements, no interpolation).
     xn, yn = _to_fixed(x_b, y_b, u_bot_nodes, v_bot_nodes)
-    contact_ids = np.arange(i_c, j_c + 1)
-    free_ids = np.setdiff1d(np.arange(n_b), contact_ids)
-
-    def _curve(lo: int, hi: int) -> tuple[np.ndarray, np.ndarray]:
-        """Deformed bottom between nodes lo..hi (nodal polyline; bottom edges are linear in x)."""
-        ids = np.arange(lo, hi + 1)
-        return xn[ids].copy(), yn[ids].copy()
-
-    contact_curve = _curve(i_c, j_c)
-    free_curves = []
-    if i_c > 0:
-        free_curves.append(_curve(0, i_c))
-    if j_c < n_b - 1:
-        free_curves.append(_curve(j_c, n_b - 1))
-
-    def _pt(k: int) -> tuple[float, float] | None:
-        if 0 <= k < n_b:
-            return float(xn[k]), float(yn[k])
-        return None
+    patches = tuple(state.patches)
+    curves = tuple((xn[p.start : p.end + 1].copy(), yn[p.start : p.end + 1].copy()) for p in patches)
+    edges = []
+    for p in patches:
+        for xe in (p.edge_estimate_start_x, p.edge_estimate_end_x):
+            if np.isfinite(xe):
+                edges.append((float(np.interp(xe, x_b, xn)), float(np.interp(xe, x_b, yn))))
 
     x_plate_def = y_plate_def = None
     if y_plate_ref is not None:
         x_plate_def, y_plate_def = _to_fixed(x, y_plate_ref, np.zeros_like(x), np.zeros_like(x))
-
     chord_x = np.array([x_top_def[0], x_top_def[-1]], dtype=float)
     chord_y = np.array([y_top_def[0], y_top_def[-1]], dtype=float)
     force_origin = (float(0.5 * (chord_x[0] + chord_x[1])), float(0.5 * (chord_y[0] + chord_y[1])))
-    force_vector = (float(selection.Fx_star), float(selection.Fy_star))
-    x_anchor_rot = float(x_a + d_ax)
+    force_vector = (float(state.Fx_star), float(state.Fy_star))
 
-    plate_state = plate
-    if plate_state is None and show_plate and getattr(lookup, "has_plate_response", False):
-        from compliance_fem.fem.plate_response import plate_state_for_selection
-
-        plate_state = plate_state_for_selection(
-            lookup, selection, elastic_scale=scale, samples_per_element=samples_per_element,
+    plate_state = (
+        plate_state_for_solution(
+            model, sol, elastic_scale=scale, samples_per_element=samples_per_element,
             color_quantity=plate_color_quantity,
         )
-    elif (
-        plate_state is not None
-        and str(plate_color_quantity or "none").lower() != str(plate_state.color_quantity).lower()
-    ):
-        from compliance_fem.fem.plate_response import plate_state_for_selection
-
-        plate_state = plate_state_for_selection(
-            lookup, selection, elastic_scale=scale, samples_per_element=samples_per_element,
-            color_quantity=plate_color_quantity,
-        )
-
-    has_plate = bool(show_plate and plate_state is not None)
+        if show_plate
+        else None
+    )
+    has_plate = plate_state is not None
     plate_is_schematic = (not has_plate) and (y_plate_ref is not None)
     plate_x_ref = plate_y_ref = None
     plate_x_hermite = plate_y_hermite = None
@@ -348,15 +286,13 @@ def build_shape_plot_data(
     plate_summary: dict = {}
     plate_node_x = plate_node_y = None
     plate_quiver_x = plate_quiver_y = plate_quiver_u = plate_quiver_v = None
-
-    if has_plate and plate_state is not None:
+    if plate_state is not None:
         mesh = plate_state.mesh
         zeros_u = np.zeros(mesh.n_nodes, dtype=float)
-        plate_x_ref, plate_y_ref = _to_fixed(mesh.reference_x, mesh.reference_y, zeros_u, zeros_u)
+        plate_x_ref, plate_y_ref = _to_fixed(mesh.reference_x, mesh.reference_y, zeros_u + d_ax, zeros_u + d_ay)
         plate_x_hermite = np.asarray(plate_state.sample_x_fixed, dtype=float)
         plate_y_hermite = np.asarray(plate_state.sample_y_fixed, dtype=float)
-        x_plate_def = plate_x_hermite
-        y_plate_def = plate_y_hermite
+        x_plate_def, y_plate_def = plate_x_hermite, plate_y_hermite
         plate_color_values = plate_state.color_values
         plate_color_units = str(plate_state.color_units or "")
         plate_summary = dict(plate_state.summary)
@@ -365,14 +301,14 @@ def build_shape_plot_data(
                 mesh.reference_x, mesh.reference_y, plate_state.u_local, plate_state.v_local
             )
         if show_plate_rotations:
-            tick = 0.04 * max(float(lookup.H), float(L) * 0.05, 1e-6)
+            tick = 0.04 * max(float(op.H), L * 0.05, 1e-6)
             plate_quiver_x, plate_quiver_y, plate_quiver_u, plate_quiver_v = _plate_rotation_quivers(
                 plate_state, tick_length=tick
             )
 
     render: dict = {}
     if render_disp is not None:
-        render = _render_fields(lookup, render_disp, _to_fixed, foam_energy=foam_energy)
+        render = _render_fields(model, render_disp, _to_fixed, foam_energy=foam_energy)
         x, y_top_ref, y_bottom_ref = render["x_top_ref"], render["y_top_ref"], render["y_bottom_ref"]
         x_top_def, y_top_def = render["x_top_def"], render["y_top_def"]
         x_bottom_def, y_bottom_def = render["x_bottom_def"], render["y_bottom_def"]
@@ -385,27 +321,20 @@ def build_shape_plot_data(
         chord_y = np.array([y_top_def[0], y_top_def[-2]], dtype=float)
         force_origin = (float(0.5 * (chord_x[0] + chord_x[1])), float(0.5 * (chord_y[0] + chord_y[1])))
 
-    n_contact = j_c - i_c + 1
+    n_act = int(np.count_nonzero(state.active))
+    span = ", ".join(f"{{{p.start}..{p.end}}}" for p in patches) or "none"
     caption = (
-        f"{ctype.value} interval I = {{{i_c}..{j_c}}} ({n_contact} contact node"
-        f"{'s' if n_contact != 1 else ''}) on reference x in [{x_i:.4g}, {x_j:.4g}]. "
-        f"phi = {np.rad2deg(selection.phi):.3g} deg, "
-        f"varphi = {np.rad2deg(varphi):.3g} deg (rigid, never scaled). "
-        f"Elastic display scale: {label}. {GAUGE_DESCRIPTION}"
+        f"{state.contact_label} contact: {n_act} active node{'s' if n_act != 1 else ''} in "
+        f"{len(patches)} patch{'es' if len(patches) != 1 else ''} {span}. "
+        f"phi = {np.rad2deg(state.phi):.3g} deg, varphi = {np.rad2deg(varphi):.3g} deg (rigid, never scaled). "
+        f"Elastic display scale: {label}. Display pivot: reaction-weighted contact centroid."
     )
     if has_plate:
-        caption += " Internal plate shown from Hermite superposition of stored plate basis fields."
+        caption += " Plate from the shared plate influence of the coupled FEM operator."
     elif plate_is_schematic:
-        caption += (
-            " Internal plate is carried rigidly with the frame at its undeformed "
-            "reference offset (schematic; interface displacement is not stored)."
-        )
-
+        caption += " Plate drawn rigidly at its reference offset (schematic)."
     if render:
-        caption += (
-            " Both foam regions are drawn from exact nodal displacements "
-            "(stored render influence of the free-body FEM operator)."
-        )
+        caption += " Foam regions from exact nodal displacements (shared render influence)."
 
     return ShapePlotData(
         x_dense=x,
@@ -422,35 +351,27 @@ def build_shape_plot_data(
         force_origin=force_origin,
         force_vector=force_vector,
         ground_y=0.0,
-        contact_type=ctype.value,
-        contact_span=span,
-        free_spans=free_spans,
-        anchor_x=x_a,
-        x_anchor_rot=x_anchor_rot,
-        toe_length=float(lookup.softplus_toe_length),
+        contact_label=str(state.contact_label),
+        toe_length=float(op.toe_length),
         L=L,
-        H=float(lookup.H),
-        phi_deg=float(np.rad2deg(selection.phi)),
-        theta_deg=float(np.rad2deg(selection.theta)),
+        H=float(op.H),
+        phi_deg=float(np.rad2deg(state.phi)),
+        theta_deg=float(np.rad2deg(state.theta)),
         varphi_deg=float(np.rad2deg(varphi)),
         scale=scale,
         scale_mode=label,
         caption=caption,
-        contact_start_index=i_c,
-        contact_end_index=j_c,
-        anchor_y=y_a,
-        contact_curve_x=contact_curve[0],
-        contact_curve_y=contact_curve[1],
-        free_curves=tuple(free_curves),
-        contact_node_x=xn[contact_ids],
-        contact_node_y=yn[contact_ids],
-        free_node_x=xn[free_ids],
-        free_node_y=yn[free_ids],
-        heel_edge_xy=_pt(i_c),
-        toe_edge_xy=_pt(j_c),
-        heel_adjacent_xy=_pt(i_c - 1) if i_c > 0 else None,
-        toe_adjacent_xy=_pt(j_c + 1) if j_c < n_b - 1 else None,
-        anchor_xy=(x_a, 0.0),
+        bottom_material_x=x_b.copy(),
+        bottom_node_x=xn,
+        bottom_node_y=yn,
+        bottom_gap=np.asarray(state.gap, dtype=float),
+        bottom_normal_reaction=np.asarray(state.lam, dtype=float),
+        active=np.asarray(state.active, dtype=bool),
+        node_class=node_classes(state.active, state.gap, state.lam, op.h_mesh),
+        contact_curves=curves,
+        patches=patches,
+        edge_estimate_points=tuple(edges),
+        anchor_xy=(float(anchor_fixed[0]), float(anchor_fixed[1])),
         y_plate_ref=y_plate_ref,
         x_plate_def=x_plate_def,
         y_plate_def=y_plate_def,
@@ -462,7 +383,7 @@ def build_shape_plot_data(
         plate_y_def=plate_y_hermite,
         plate_color_values=plate_color_values,
         plate_color_units=plate_color_units,
-        plate_color_quantity=str(plate_state.color_quantity) if has_plate and plate_state is not None else "none",
+        plate_color_quantity=str(plate_state.color_quantity) if plate_state is not None else "none",
         plate_summary=plate_summary,
         plate_node_x=plate_node_x,
         plate_node_y=plate_node_y,
@@ -487,20 +408,6 @@ def build_shape_plot_data(
         foam_y_def=render.get("foam_y_def"),
         foam_energy_density=render.get("foam_energy_density"),
     )
-
-
-def _render_displacements(lookup, selection) -> tuple[np.ndarray, np.ndarray]:
-    """Local (u, v) at the measured render nodes for the selected record and gamma."""
-    from compliance_fem.contact.corotation import affine_coefficients
-    from compliance_fem.geometry.render import render_node_displacements
-
-    varphi = float(selection.varphi)
-    gamma = np.array(
-        [float(selection.alpha), float(selection.d_ax), float(selection.d_ay),
-         np.cos(varphi) - 1.0, -np.sin(varphi)],
-        dtype=float,
-    )
-    return render_node_displacements(lookup, int(selection.selected_row), affine_coefficients(gamma))
 
 
 def _outline_index(lookup) -> np.ndarray:

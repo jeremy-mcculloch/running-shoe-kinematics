@@ -15,10 +15,10 @@ element centroid for a graded foam).
 ``G`` (``2 n_r x (2 n_t + 2 n_b)``, component-major rows ``[u..., v...]``)
 comes from one multi-RHS solve of the factorized free-body operator, exactly
 like the plate influence; ``R_render`` is the rigid-mode matrix about the
-solver reference ``(x_r, y_r)``. Per record, ``F_t`` / ``F_bottom`` and the
-rigid amplitudes are contracted from the stored six-column affine bases with
-``z = z_closure + sum_k gamma_k z_k``. Displacements are rotating-frame local
-values; the fixed-frame transform is applied by the renderer.
+solver reference ``(x_r, y_r)``. ``F_t``, ``F_bottom`` and the rigid amplitudes
+come from one continuous contact solution
+(``contact_model.render_vertex_displacements``). Displacements are
+rotating-frame local values; the fixed-frame transform is applied by the renderer.
 """
 
 from __future__ import annotations
@@ -183,25 +183,6 @@ def render_section_to_payload(section: dict, geometry_metadata: dict) -> dict:
     payload = {key: np.asarray(section[key]) for key in RENDER_KEYS}
     payload["geometry_metadata_json"] = np.asarray(json.dumps(geometry_metadata, sort_keys=True))
     return payload
-
-
-def render_node_displacements(lookup, row: int, coefficients: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Local (u, v) at ``render_node_ids`` for record ``row`` and affine coefficients (6,)."""
-    sec = lookup.render_section
-    if not sec:
-        raise ValueError("Lookup has no measured render section.")
-    c = np.asarray(coefficients, dtype=float).reshape(-1)
-    r = int(row)
-    f = lookup.record_fields([r])
-    f_tx = c @ np.asarray(f["top_force_x"][0], dtype=float)
-    f_ty = c @ np.asarray(f["top_force_y"][0], dtype=float)
-    r_x = np.nan_to_num(c @ np.asarray(f["reaction_x"][0], dtype=float))
-    r_y = np.nan_to_num(c @ np.asarray(f["reaction_y"][0], dtype=float))
-    alpha = c @ np.asarray(lookup.rigid_alpha_basis[r], dtype=float)
-    loads = np.concatenate([f_tx, f_ty, r_x, r_y])
-    d = np.asarray(sec["render_influence_loads"]) @ loads + np.asarray(sec["render_influence_rigid"]) @ alpha
-    n_r = d.size // 2
-    return d[:n_r], d[n_r:]
 
 
 def render_index(lookup, node_ids: np.ndarray) -> np.ndarray:

@@ -1,4 +1,4 @@
-"""External-codebase interface: SoleModel.step with the passive toe spring."""
+"""External-codebase interface: SoleModel.step with continuous contact and the passive toe spring."""
 
 from __future__ import annotations
 
@@ -8,43 +8,38 @@ import numpy as np
 import pytest
 
 from compliance_fem.api import SoleModel
-from compliance_fem.contact.lookup import save_contact_lookup
-from compliance_fem.gait.passive_toe import pick_instant_best_passive, solve_passive_toe_candidates
+from compliance_fem.contact.contact_model import save_contact_model
+from compliance_fem.contact.continuous_toe import solve_toe_contact
 from compliance_fem.contact.toe_spring import ToeSpringConfig
 
 WIDTH = 0.10
-LOAD = (-8.0, -80.0)  # N per shoe, foot on shoe (compressive)
+LOAD = (-20.0, -300.0)  # N per shoe, foot on shoe (compressive)
 
 
 @pytest.fixture()
-def model(rocker_lookup):
-    return SoleModel(rocker_lookup, shoe_width_m=WIDTH)
+def model(rocker_model):
+    return SoleModel(rocker_model, shoe_width_m=WIDTH)
 
 
-def test_step_matches_passive_toe_pipeline(model, rocker_lookup) -> None:
+def test_step_matches_coupled_solver(model, rocker_model) -> None:
     st = model.step(*LOAD, 2.0)
-    cands = solve_passive_toe_candidates(
-        rocker_lookup, Fx_star=LOAD[0] / WIDTH, Fy_star=LOAD[1] / WIDTH, Mz_meas=float("nan"),
-        phi_rad=np.deg2rad(2.0), config=ToeSpringConfig(), width_m=WIDTH,
-    )
-    best = pick_instant_best_passive(cands)
-    assert best is not None
-    assert st.valid and st.contact_interval == best.interval
-    assert st.theta_deg == pytest.approx(best.theta_deg, abs=1e-12)
-    assert st.Fx_N == pytest.approx(best.Fx_pred * WIDTH, rel=1e-12)
+    ref = solve_toe_contact(rocker_model.operator, np.array(LOAD) / WIDTH, np.deg2rad(2.0), ToeSpringConfig(), WIDTH)
+    assert st.valid and st.admissible
+    assert st.theta_deg == pytest.approx(ref.theta_deg, abs=1e-12)
+    np.testing.assert_array_equal(st.contact_mask, ref.contact.active)
+    first, last = st.contact_interval or (-1, -1)
+    assert (first, last) == (int(np.flatnonzero(ref.contact.active)[0]), int(np.flatnonzero(ref.contact.active)[-1]))
 
 
 def test_force_balance_and_ground_contact(model) -> None:
     st = model.step(*LOAD, 2.0)
-    assert st.admissible
-    np.testing.assert_allclose(st.top_force_N.sum(axis=1), LOAD, rtol=1e-8, atol=1e-9)
-    np.testing.assert_allclose(st.bottom_reaction_N.sum(axis=1), -np.array(LOAD), rtol=1e-8, atol=1e-9)
-    assert (st.Fx_N, st.Fy_N) == pytest.approx(LOAD, rel=1e-8)
+    np.testing.assert_allclose(st.top_force_N.sum(axis=1), LOAD, rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(st.bottom_reaction_N.sum(axis=1), -np.array(LOAD), rtol=1e-9, atol=1e-9)
+    assert (st.Fx_N, st.Fy_N) == pytest.approx(LOAD, rel=1e-9)
     assert np.max(np.abs(st.bottom_xy_m[1, st.contact_mask])) < 1e-12
-    free = ~st.contact_mask
-    if free.any():
-        assert st.bottom_xy_m[1, free].min() > -1e-9
-    assert np.all(st.bottom_reaction_N[:, free] == 0.0)
+    assert st.bottom_xy_m[1].min() > -1e-12
+    assert np.all(st.bottom_reaction_N[:, ~st.contact_mask] == 0.0)
+    np.testing.assert_allclose(st.bottom_gap_m, st.bottom_xy_m[1], atol=1e-15)
 
 
 def test_shapes_and_moments(model) -> None:
@@ -57,15 +52,19 @@ def test_shapes_and_moments(model) -> None:
     assert st.Mz_shoe_Nm == pytest.approx(Mz, rel=1e-8, abs=1e-12)
     fixed = float(np.sum(st.top_xy_m[0] * st.top_force_N[1] - st.top_xy_m[1] * st.top_force_N[0]))
     assert st.Mz_fixed_Nm == pytest.approx(fixed, rel=1e-12)
+    lam = st.bottom_reaction_N[1]
+    assert st.centre_of_pressure_x_m == pytest.approx(float(lam @ st.bottom_xy_m[0] / lam.sum()), rel=1e-12)
 
 
-def test_continuity_state_and_reset(model) -> None:
-    assert model._previous_interval is None
+def test_warm_start_state_and_reset(model) -> None:
+    assert model._warm is None
     st = model.step(*LOAD, 2.0)
-    assert model._previous_interval == st.contact_interval
-    assert model._previous_theta_deg == pytest.approx(st.theta_deg)
+    assert model._warm is not None and model._warm.theta_rad == pytest.approx(np.deg2rad(st.theta_deg))
+    again = model.step(*LOAD, 2.0)
+    assert again.theta_deg == pytest.approx(st.theta_deg, abs=1e-11)
+    assert again.diagnostics["toe_iterations"] < 20
     model.reset()
-    assert model._previous_interval is None and model._previous_theta_deg is None
+    assert model._warm is None
 
 
 def test_to_dict_is_json_serializable(model) -> None:
@@ -74,15 +73,14 @@ def test_to_dict_is_json_serializable(model) -> None:
     assert len(d["top_xy_m"]) == 2 and len(d["top_xy_m"][0]) == model.n_top
 
 
-def test_loads_from_path(rocker_lookup, tmp_path) -> None:
-    save_contact_lookup(rocker_lookup, tmp_path)
-    m = SoleModel(tmp_path, shoe_width_m=WIDTH)
-    st = m.step(*LOAD, 2.0)
-    ref = SoleModel(rocker_lookup, shoe_width_m=WIDTH).step(*LOAD, 2.0)
+def test_loads_from_path(rocker_model, tmp_path) -> None:
+    save_contact_model(rocker_model, tmp_path)
+    st = SoleModel(tmp_path, shoe_width_m=WIDTH).step(*LOAD, 2.0)
+    ref = SoleModel(rocker_model, shoe_width_m=WIDTH).step(*LOAD, 2.0)
     assert st.contact_interval == ref.contact_interval
     assert st.theta_deg == pytest.approx(ref.theta_deg, abs=1e-10)
 
 
-def test_rejects_bad_configuration(rocker_lookup) -> None:
+def test_rejects_bad_configuration(rocker_model) -> None:
     with pytest.raises(ValueError, match="shoe_width_m"):
-        SoleModel(rocker_lookup, shoe_width_m=0.0)
+        SoleModel(rocker_model, shoe_width_m=0.0)

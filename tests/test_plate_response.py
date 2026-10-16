@@ -1,32 +1,27 @@
-"""Plate-response recovery, Hermite postprocess, and runtime lookup checks."""
+"""Plate-response recovery, Hermite postprocess, and plate runtime state checks."""
 
 from __future__ import annotations
 
-import time
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-from compliance_fem.fem.compliance import compute_compliance
-from compliance_fem.contact.sole_config import SoleConfig
-from compliance_fem.contact.lookup import (
+from compliance_fem.contact.contact_model import (
     LOOKUP_SCHEMA_VERSION,
-    get_compliance_block_matrix,
-    generate_contact_lookup,
-    load_contact_lookup,
-    save_contact_lookup,
-    solve_candidate,
+    PLATE_INFLUENCE_ARRAY_FIELDS,
+    REGENERATE_LOOKUP_MESSAGE,
+    ContactModel,
+    build_contact_model,
+    load_contact_model,
+    plate_fields,
+    plate_state_for_solution,
+    save_contact_model,
 )
-from compliance_fem.contact.basis import build_top_affine_matrix
-from compliance_fem.contact.lookup import SOLVER_YR, prepare_compliance_blocks
-from compliance_fem.contact.topology import ContactMode, ContactType
-from compliance_fem.contact.corotation import (
-    affine_coefficients,
-    basis_coefficients,
-    contract_basis,
-    transform_to_fixed_frame,
-)
-from compliance_fem.contact.force_control import evaluate_from_angles
+from compliance_fem.contact.continuous_contact import ContactSolution, fixed_frame_positions, solve_contact_state
+from compliance_fem.contact.corotation import transform_to_fixed_frame
+from compliance_fem.contact.sole_config import SoleConfig
+from compliance_fem.fem.compliance import compute_compliance
 from compliance_fem.fem.plate_response import (
     COLOR_UNITS,
     axial_force_from_multiplier,
@@ -35,15 +30,7 @@ from compliance_fem.fem.plate_response import (
     hermite_deflection,
     hermite_rotation,
     hermite_shear,
-    plate_mesh_from_lookup,
-    plate_state_for_selection,
-    rigid_primal_from_alpha,
     sample_plate_centerline,
-)
-from reference import (
-    extract_plate_nodal_fields,
-    recover_plate_basis_for_record,
-    recover_primal_from_boundary_forces,
 )
 
 from conftest import SMALL_TOE_LENGTH, small_config
@@ -65,21 +52,23 @@ def fem_result(sole_config: SoleConfig):
 
 
 @pytest.fixture(scope="module")
-def lookup(fem_result):
-    blocks = get_compliance_block_matrix(fem_result)
-    return generate_contact_lookup(
-        blocks,
-        toe_length=SMALL_TOE_LENGTH,
-        kappa=30.0,
-        fem_result=fem_result,
-        require_plate=True,
-        store_fields=True,
-    )
+def model(fem_result) -> ContactModel:
+    m = build_contact_model(fem_result, toe_length=SMALL_TOE_LENGTH, kappa=30.0)
+    assert m.has_plate_response
+    return m
 
 
 @pytest.fixture(scope="module")
 def plate_mesh(fem_result):
     return extract_plate_mesh_info(fem_result)
+
+
+@pytest.fixture(scope="module")
+def solution(model: ContactModel) -> ContactSolution:
+    # Moderate compressive load (per metre width) with small rotations.
+    return solve_contact_state(
+        model.operator, np.deg2rad(-2.0), np.tan(np.deg2rad(1.5)), np.array([50.0, -2.0e3])
+    )
 
 
 def _mesh_h(cfg: SoleConfig) -> float:
@@ -94,36 +83,6 @@ def _disp_atol(cfg: SoleConfig, magnitude: float, rtol: float = 1e-8) -> float:
 def _rel_atol(ref: np.ndarray | float, cfg: SoleConfig, rtol: float = 1e-8) -> float:
     mag = float(np.linalg.norm(np.ravel(ref)))
     return _disp_atol(cfg, mag, rtol=rtol)
-
-
-def _pick_row(lookup, kind: ContactType) -> int:
-    rows = lookup.rows_for(kind)
-    assert rows.size >= 1
-    if kind is ContactType.FULL:
-        return int(rows[0])
-    # Prefer an interior partial-contact edge when available.
-    mid = int(rows[len(rows) // 2])
-    return mid
-
-
-def _selection_for(lookup, mode: ContactMode):
-    # Moderate compressive load with a small angle so every forced mode finds a row.
-    return evaluate_from_angles(
-        lookup,
-        Fx=50.0,
-        Fy=-2.0e3,
-        phi_deg=-2.0,
-        theta_deg=1.5,
-        mode=mode,
-    )
-
-
-def _solve_row(fem_result, lookup, row: int):
-    prepared, _ = prepare_compliance_blocks(get_compliance_block_matrix(fem_result))
-    W = build_top_affine_matrix(prepared.x_top, prepared.L, toe_length=SMALL_TOE_LENGTH, kappa=30.0)
-    x_r = 0.5 * prepared.L
-    sol = solve_candidate(prepared, lookup.interval(row), W, x_r, toe_length=SMALL_TOE_LENGTH, y_r=SOLVER_YR)
-    return prepared, W, x_r, sol
 
 
 # ---------------------------------------------------------------------------
@@ -146,212 +105,40 @@ def test_plate_dof_indices_identify_continuum_and_rotations(fem_result, plate_me
     assert plate_mesh.n_primal == n_foam + n_plate
 
 
+
+
 # ---------------------------------------------------------------------------
-# 2–5. Lookup plate recovery, Bp, dimensions, serialization
+# Serialization and schema rejection
 # ---------------------------------------------------------------------------
 
 
-def test_recovered_basis_reproduces_prescribed_boundary_displacements(
-    fem_result, lookup, plate_mesh, sole_config
-) -> None:
-    """Recovered full primal matches W_t / W_c (generation residuals + direct recover)."""
-    assert lookup.has_plate_response
-    assert lookup.plate_bp_residual is not None
-    # Generation already enforced plate BC residuals; confirm they stayed small.
-    bp = np.asarray(lookup.plate_bp_residual, dtype=float)
-    assert float(np.max(bp)) < 1e-7
-
-    for kind in (ContactType.HEEL, ContactType.FULL, ContactType.TOE, ContactType.INTERIOR):
-        row = _pick_row(lookup, kind)
-        prepared, W, x_r, sol = _solve_row(fem_result, lookup, row)
-        contact = np.asarray(sol.contact, dtype=int)
-        plate = recover_plate_basis_for_record(
-            fem_result,
-            plate_mesh,
-            np.asarray(sol.F_t, dtype=float),
-            np.asarray(sol.F_c, dtype=float),
-            contact,
-            W,
-            np.asarray(sol.W_c, dtype=float),
-            prepared.x_top,
-            prepared.x_bottom[contact] if contact.size else np.zeros(0),
-            Alpha=np.asarray(sol.Alpha, dtype=float),
-            x_r=x_r,
-            y_r=SOLVER_YR,
-        )
-        atol_bc = _disp_atol(sole_config, 1.0, rtol=1e-5)
-        assert float(np.max(plate.top_bc_residual)) < max(1e-5, atol_bc)
-        assert float(np.max(plate.contact_bc_residual)) < max(1e-5, atol_bc)
-        np.testing.assert_allclose(
-            plate.u_local,
-            lookup.plate_u_local_basis[row],
-            atol=_rel_atol(plate.u_local, sole_config),
-        )
-        np.testing.assert_allclose(
-            plate.v_local,
-            lookup.plate_v_local_basis[row],
-            atol=_rel_atol(plate.v_local, sole_config),
-        )
-        np.testing.assert_allclose(
-            plate.rotation_local,
-            lookup.plate_rotation_local_basis[row],
-            atol=_rel_atol(plate.rotation_local, sole_config),
-        )
-
-
-def test_every_basis_solution_satisfies_Bp_q(lookup, sole_config) -> None:
-    """3. Every stored basis solution satisfies B_p q ≈ 0."""
-    assert lookup.plate_bp_residual is not None
-    residual = np.asarray(lookup.plate_bp_residual, dtype=float)
-    # Relative to the record's displacement scale (>= 1 m here: unit contact-motion columns).
-    assert float(np.max(np.abs(residual))) < 1e-7 + 1e-12 * _mesh_h(sole_config)
-
-
-def test_plate_array_dimensions_consistent_across_contact_types(lookup, plate_mesh) -> None:
-    """4. Heel / full / toe share the same n_plate and array ranks."""
-    n_plate = plate_mesh.n_nodes
-    n_el = plate_mesh.n_elements
-    n_rec = lookup.n_records
-    assert lookup.plate_u_local_basis.shape == (n_rec, 6, n_plate)
-    assert lookup.plate_v_local_basis.shape == (n_rec, 6, n_plate)
-    assert lookup.plate_rotation_local_basis.shape == (n_rec, 6, n_plate)
-    assert lookup.plate_constraint_multiplier_basis.shape == (n_rec, 6, n_el)
-    assert lookup.plate_axial_force_basis.shape == (n_rec, 6, n_el)
-    assert lookup.plate_bp_residual.shape == (n_rec, 6)
-    for kind in (ContactType.HEEL, ContactType.FULL, ContactType.TOE, ContactType.INTERIOR):
-        row = _pick_row(lookup, kind)
-        assert lookup.plate_u_local_basis[row].shape[1] == n_plate
-        assert lookup.plate_axial_force_basis[row].shape[1] == n_el
-
-
-def test_serialization_preserves_plate_fields(lookup, tmp_path, sole_config) -> None:
-    """5. save / load roundtrip preserves plate arrays."""
-    out = tmp_path / "lookup_plate"
-    save_contact_lookup(lookup, out)
-    reloaded = load_contact_lookup(out / "contact_lookup.npz")
+def test_serialization_preserves_plate_fields(model, tmp_path: Path, sole_config) -> None:
+    """save / load roundtrip preserves the plate influence and plate mesh."""
+    npz_path = save_contact_model(model, tmp_path / "lookup_plate")
+    reloaded = load_contact_model(npz_path)
     assert reloaded.has_plate_response
     assert reloaded.schema_version == LOOKUP_SCHEMA_VERSION
-    assert reloaded.plate_u_local_basis is not None and reloaded.plate_v_local_basis is not None
-    assert reloaded.plate_rotation_local_basis is not None and reloaded.plate_axial_force_basis is not None
-    assert reloaded.plate_reference_x is not None and reloaded.plate_reference_y is not None
-    np.testing.assert_allclose(
-        reloaded.plate_u_local_basis,
-        lookup.plate_u_local_basis,
-        atol=_rel_atol(lookup.plate_u_local_basis, sole_config),
-    )
-    np.testing.assert_allclose(
-        reloaded.plate_v_local_basis,
-        lookup.plate_v_local_basis,
-        atol=_rel_atol(lookup.plate_v_local_basis, sole_config),
-    )
-    np.testing.assert_allclose(
-        reloaded.plate_rotation_local_basis,
-        lookup.plate_rotation_local_basis,
-        atol=_rel_atol(lookup.plate_rotation_local_basis, sole_config),
-    )
-    np.testing.assert_allclose(
-        reloaded.plate_axial_force_basis,
-        lookup.plate_axial_force_basis,
-        atol=_rel_atol(lookup.plate_axial_force_basis, sole_config),
-    )
-    np.testing.assert_allclose(reloaded.plate_reference_x, lookup.plate_reference_x)
-    np.testing.assert_allclose(reloaded.plate_reference_y, lookup.plate_reference_y)
-    assert reloaded.EI_plate_Nm2_per_m == pytest.approx(lookup.EI_plate_Nm2_per_m)
+    for name in PLATE_INFLUENCE_ARRAY_FIELDS:
+        ref = getattr(model.plate_influence, name)
+        np.testing.assert_allclose(getattr(reloaded.plate_influence, name), ref, atol=_rel_atol(ref, sole_config))
+    np.testing.assert_allclose(reloaded.plate_mesh.reference_x, model.plate_mesh.reference_x)
+    np.testing.assert_allclose(reloaded.plate_mesh.reference_y, model.plate_mesh.reference_y)
+    np.testing.assert_array_equal(reloaded.plate_mesh.node_ids, model.plate_mesh.node_ids)
+    assert reloaded.plate_mesh.n_nodes == model.plate_mesh.n_nodes
+    assert reloaded.EI_plate_Nm2_per_m == pytest.approx(model.EI_plate_Nm2_per_m)
 
 
-def test_schema_5_load_rejected(lookup, tmp_path) -> None:
-    """Schema rejection: load with schema_version=5 fails."""
-    out = tmp_path / "lookup_v5"
-    npz_path = save_contact_lookup(lookup, out)
-    data = dict(np.load(npz_path, allow_pickle=True))
-    data["schema_version"] = np.asarray(5)
-    bad = tmp_path / "contact_lookup_v5.npz"
+@pytest.mark.parametrize("version", (5, 11, 12))
+def test_other_schema_versions_rejected(model, tmp_path: Path, version: int) -> None:
+    npz_path = save_contact_model(model, tmp_path / "lookup")
+    with np.load(npz_path, allow_pickle=True) as npz:
+        data = dict(npz)
+    data["schema_version"] = np.asarray(version)
+    bad = tmp_path / f"contact_lookup_v{version}.npz"
     np.savez_compressed(bad, **data)
-    with pytest.raises(ValueError, match="Regenerate"):
-        load_contact_lookup(bad)
-
-
-# ---------------------------------------------------------------------------
-# 6–7. Runtime superposition and FEM reconstruction
-# ---------------------------------------------------------------------------
-
-
-def test_runtime_superposition_matches_affine_sum(lookup, sole_config) -> None:
-    """6. Runtime plate nodal values agree with the closure plus five-term vector sum."""
-    sel = _selection_for(lookup, ContactMode.FULL)
-    if sel.selected_row is None:
-        pytest.skip("No full-contact selection for this load.")
-    row = int(sel.selected_row)
-    gamma = basis_coefficients(sel.alpha, sel.d_ax, sel.d_ay, sel.varphi)
-    u_rt = contract_basis(lookup.plate_u_local_basis[row], gamma, mode_axis=0)
-    v_rt = contract_basis(lookup.plate_v_local_basis[row], gamma, mode_axis=0)
-    th_rt = contract_basis(lookup.plate_rotation_local_basis[row], gamma, mode_axis=0)
-
-    g6 = affine_coefficients(gamma)
-    assert g6[0] == 1.0
-    u_sum = sum(g6[k] * lookup.plate_u_local_basis[row, k] for k in range(6))
-    v_sum = sum(g6[k] * lookup.plate_v_local_basis[row, k] for k in range(6))
-    th_sum = sum(g6[k] * lookup.plate_rotation_local_basis[row, k] for k in range(6))
-    np.testing.assert_allclose(u_rt, u_sum, atol=_rel_atol(u_sum, sole_config, rtol=1e-12))
-    np.testing.assert_allclose(v_rt, v_sum, atol=_rel_atol(v_sum, sole_config, rtol=1e-12))
-    np.testing.assert_allclose(th_rt, th_sum, atol=_rel_atol(th_sum, sole_config, rtol=1e-12))
-
-    state = plate_state_for_selection(lookup, sel)
-    assert state is not None
-    np.testing.assert_allclose(state.u_local, u_sum, atol=_rel_atol(u_sum, sole_config))
-    np.testing.assert_allclose(state.v_local, v_sum, atol=_rel_atol(v_sum, sole_config))
-    np.testing.assert_allclose(
-        state.rotation_local, th_sum, atol=_rel_atol(th_sum, sole_config)
-    )
-
-
-def test_runtime_plate_agrees_with_direct_fem_reconstruction(
-    fem_result, lookup, plate_mesh, sole_config
-) -> None:
-    """7. Lookup+gamma plate matches recover from F_t,F_c for heel/full/toe."""
-    for mode, kind in (
-        (ContactMode.HEEL, ContactType.HEEL),
-        (ContactMode.FULL, ContactType.FULL),
-        (ContactMode.TOE, ContactType.TOE),
-    ):
-        sel = _selection_for(lookup, mode)
-        if sel.selected_row is None:
-            pytest.skip(f"No {kind.value} selection for this load.")
-        row = int(sel.selected_row)
-        assert lookup.contact_type(row) is kind
-        gamma = basis_coefficients(sel.alpha, sel.d_ax, sel.d_ay, sel.varphi)
-
-        u_lookup = contract_basis(lookup.plate_u_local_basis[row], gamma, mode_axis=0)
-        v_lookup = contract_basis(lookup.plate_v_local_basis[row], gamma, mode_axis=0)
-        th_lookup = contract_basis(
-            lookup.plate_rotation_local_basis[row], gamma, mode_axis=0
-        )
-
-        _, _, x_r, sol = _solve_row(fem_result, lookup, row)
-        contact = np.asarray(sol.contact, dtype=int)
-        F_t = np.asarray(sol.F_t, dtype=float)
-        F_c = np.asarray(sol.F_c, dtype=float)
-        Alpha = np.asarray(sol.Alpha, dtype=float)
-        F_t_s = contract_basis(F_t, gamma, mode_axis=1)
-        F_c_s = (
-            contract_basis(F_c, gamma, mode_axis=1)
-            if F_c.size
-            else np.zeros(0, dtype=float)
-        )
-        Alpha_s = contract_basis(Alpha, gamma, mode_axis=1)
-        q, lam, _ = recover_primal_from_boundary_forces(fem_result, F_t_s, F_c_s, contact)
-        q = q + rigid_primal_from_alpha(fem_result, plate_mesh, Alpha_s, x_r, SOLVER_YR)
-        u, v, th, _, _ = extract_plate_nodal_fields(q, lam, plate_mesh)
-
-        np.testing.assert_allclose(
-            u_lookup, u, atol=_rel_atol(u, sole_config, rtol=1e-6)
-        )
-        np.testing.assert_allclose(
-            v_lookup, v, atol=_rel_atol(v, sole_config, rtol=1e-6)
-        )
-        np.testing.assert_allclose(
-            th_lookup, th, atol=_rel_atol(th, sole_config, rtol=1e-6)
-        )
+    with pytest.raises(ValueError, match="Regenerate") as exc:
+        load_contact_model(bad)
+    assert REGENERATE_LOOKUP_MESSAGE in str(exc.value)
 
 
 # ---------------------------------------------------------------------------
@@ -451,24 +238,19 @@ def test_no_duplicate_sample_points_at_element_boundaries(plate_mesh) -> None:
     assert np.all(np.diff(out["s"]) > 0.0)
 
 
-# ---------------------------------------------------------------------------
-# 15–16. Axial constraint / multiplier convention
-# ---------------------------------------------------------------------------
 
 
-def test_infinite_ea_tangential_differences_below_tolerance(
-    lookup, sole_config
-) -> None:
-    """15. Infinite-EA tangential displacement differences below tolerance."""
-    sel = _selection_for(lookup, ContactMode.FULL)
-    if sel.selected_row is None:
-        pytest.skip("No selection.")
-    state = plate_state_for_selection(lookup, sel)
+def test_infinite_ea_tangential_differences_below_tolerance(model, solution, sole_config) -> None:
+    """Infinite-EA tangential displacement differences and B_p residual below tolerance."""
+    state = plate_state_for_solution(model, solution)
     assert state is not None
     # Mesh-scaled: inextensibility residual should be near machine/mesh zero.
     assert state.maximum_plate_axial_displacement_difference < 1e-6 * max(
         1.0, _mesh_h(sole_config)
     ) + 1e-8 * max(1.0, float(np.max(np.abs(state.u_tangential))))
+    f = plate_fields(model, solution)
+    scale = max(1.0, float(np.max(np.abs(np.concatenate([f["u"], f["v"]])))))
+    assert float(f["bp_residual"][0]) < 1e-8 * scale
 
 
 def test_axial_force_from_multiplier_is_identity() -> None:
@@ -479,18 +261,13 @@ def test_axial_force_from_multiplier_is_identity() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 17–19. Fixed-frame transform and elastic scale
+# Fixed-frame transform and elastic scale
 # ---------------------------------------------------------------------------
 
 
-def test_fixed_frame_plate_coordinates_agree_with_foam_transform(
-    lookup, sole_config
-) -> None:
-    """17. Fixed-frame plate coordinates agree with common foam transform."""
-    sel = _selection_for(lookup, ContactMode.HEEL)
-    if sel.selected_row is None:
-        pytest.skip("No heel selection.")
-    state = plate_state_for_selection(lookup, sel, elastic_scale=1.0)
+def test_fixed_frame_plate_coordinates_agree_with_foam_transform(model, solution, sole_config) -> None:
+    """At s_d = 1 the plate samples sit at the exact fixed-frame placement r = T + Q (X + d)."""
+    state = plate_state_for_solution(model, solution, elastic_scale=1.0)
     assert state is not None
     mesh = state.mesh
     # Reconstruct local sample displacements and re-apply the shared transform.
@@ -502,83 +279,14 @@ def test_fixed_frame_plate_coordinates_agree_with_foam_transform(
         t_e = mesh.element_tangents[e]
         s0 = float(mesh.reference_arc_length[i])
         xi = (float(state.sample_s[idx]) - s0) / L_e if L_e > 0 else 0.0
-        X_i = np.array([mesh.reference_x[i], mesh.reference_y[i]])
-        X = X_i + xi * L_e * t_e
+        X = np.array([mesh.reference_x[i], mesh.reference_y[i]]) + xi * L_e * t_e
         x_ref[idx] = X[0]
         y_ref[idx] = X[1]
     u_samp = state.sample_x_local - x_ref
     v_samp = state.sample_y_local - y_ref
-    assert sel.anchor_x is not None and sel.anchor_y is not None
-    x_f, y_f = transform_to_fixed_frame(
-        x_ref,
-        y_ref,
-        u_samp,
-        v_samp,
-        float(sel.anchor_x),
-        float(sel.d_ax),
-        float(sel.d_ay),
-        float(sel.varphi),
-        elastic_scale=1.0,
-        y_anchor=float(sel.anchor_y),
-    )
-    np.testing.assert_allclose(
-        state.sample_x_fixed, x_f, atol=_rel_atol(x_f, sole_config, rtol=1e-12)
-    )
-    np.testing.assert_allclose(
-        state.sample_y_fixed, y_f, atol=_rel_atol(y_f, sole_config, rtol=1e-12)
-    )
-
-
-def test_plate_and_foam_interface_nodes_coincide_after_transform(
-    fem_result, lookup, plate_mesh, sole_config
-) -> None:
-    """18. Plate and foam interface nodes coincide after transformation."""
-    sel = _selection_for(lookup, ContactMode.FULL)
-    if sel.selected_row is None:
-        pytest.skip("No selection.")
-    row = int(sel.selected_row)
-    gamma = basis_coefficients(sel.alpha, sel.d_ax, sel.d_ay, sel.varphi)
-    u_p = contract_basis(lookup.plate_u_local_basis[row], gamma, mode_axis=0)
-    v_p = contract_basis(lookup.plate_v_local_basis[row], gamma, mode_axis=0)
-
-    # Foam interface: same continuum DOFs as plate translations.
-    prepared, _, _, sol = _solve_row(fem_result, lookup, row)
-    contact = np.asarray(sol.contact, dtype=int)
-    F_t_s = contract_basis(np.asarray(sol.F_t), gamma, mode_axis=1)
-    F_c = np.asarray(sol.F_c, dtype=float)
-    F_c_s = contract_basis(F_c, gamma, mode_axis=1) if F_c.size else np.zeros(0)
-    Alpha_s = contract_basis(np.asarray(sol.Alpha), gamma, mode_axis=1)
-    q, lam, _ = recover_primal_from_boundary_forces(fem_result, F_t_s, F_c_s, contact)
-    q = q + rigid_primal_from_alpha(
-        fem_result, plate_mesh, Alpha_s, 0.5 * prepared.L, SOLVER_YR
-    )
-    u_foam = q[plate_mesh.u_dof_ids]
-    v_foam = q[plate_mesh.v_dof_ids]
-    np.testing.assert_allclose(u_p, u_foam, atol=_rel_atol(u_foam, sole_config, rtol=1e-6))
-    np.testing.assert_allclose(v_p, v_foam, atol=_rel_atol(v_foam, sole_config, rtol=1e-6))
-
-    assert sel.anchor_x is not None
-    x_a, d_ax, d_ay, varphi = (
-        float(sel.anchor_x),
-        float(sel.d_ax),
-        float(sel.d_ay),
-        float(sel.varphi),
-    )
-    xp, yp = transform_to_fixed_frame(
-        plate_mesh.reference_x, plate_mesh.reference_y, u_p, v_p, x_a, d_ax, d_ay, varphi
-    )
-    xf, yf = transform_to_fixed_frame(
-        plate_mesh.reference_x,
-        plate_mesh.reference_y,
-        u_foam,
-        v_foam,
-        x_a,
-        d_ax,
-        d_ay,
-        varphi,
-    )
-    np.testing.assert_allclose(xp, xf, atol=_rel_atol(xf, sole_config, rtol=1e-6))
-    np.testing.assert_allclose(yp, yf, atol=_rel_atol(yf, sole_config, rtol=1e-6))
+    x_f, y_f = fixed_frame_positions(model.operator, solution, x_ref, y_ref, u_samp, v_samp)
+    np.testing.assert_allclose(state.sample_x_fixed, x_f, atol=_rel_atol(x_f, sole_config, rtol=1e-12))
+    np.testing.assert_allclose(state.sample_y_fixed, y_f, atol=_rel_atol(y_f, sole_config, rtol=1e-12))
 
 
 def test_rigid_rotation_varphi_not_multiplied_by_elastic_scale() -> None:
@@ -614,81 +322,15 @@ def test_rigid_rotation_varphi_not_multiplied_by_elastic_scale() -> None:
     np.testing.assert_allclose(y_s2 - y_r, 2.0 * (y_s1 - y_r), atol=1e-14)
 
 
+
+
 # ---------------------------------------------------------------------------
-# Contact-type switching / color map
+# Color map
 # ---------------------------------------------------------------------------
 
 
-def test_changing_contact_type_updates_plate_without_fem_solve(
-    lookup, sole_config
-) -> None:
-    """21. HEEL vs TOE vs FULL yield different plate fields (no FEM re-solve)."""
-    fields = {}
-    t0 = time.perf_counter()
-    for mode, kind in (
-        (ContactMode.HEEL, ContactType.HEEL),
-        (ContactMode.TOE, ContactType.TOE),
-        (ContactMode.FULL, ContactType.FULL),
-    ):
-        sel = _selection_for(lookup, mode)
-        if sel.selected_row is None:
-            pytest.skip(f"No {kind.value} selection.")
-        state = plate_state_for_selection(lookup, sel)
-        assert state is not None
-        fields[kind] = (state.u_local.copy(), state.v_local.copy(), state.rotation_local.copy())
-    elapsed = time.perf_counter() - t0
-    # Three runtime contractions should be far cheaper than a FEM solve.
-    assert elapsed < 2.0
-
-    heel_u, heel_v, heel_th = fields[ContactType.HEEL]
-    toe_u, toe_v, toe_th = fields[ContactType.TOE]
-    full_u, full_v, full_th = fields[ContactType.FULL]
-    # At least one nodal field differs between topologies.
-    diffs = [
-        np.linalg.norm(heel_u - toe_u) + np.linalg.norm(heel_v - toe_v),
-        np.linalg.norm(heel_u - full_u) + np.linalg.norm(heel_v - full_v),
-        np.linalg.norm(toe_u - full_u) + np.linalg.norm(toe_v - full_v),
-        np.linalg.norm(heel_th - toe_th),
-        np.linalg.norm(heel_th - full_th),
-    ]
-    assert max(diffs) > _disp_atol(sole_config, 1e-3, rtol=1e-3)
-
-
-def test_plate_uses_selected_interval_response(lookup, sole_config) -> None:
-    """68. The rendered plate is contracted from the selected interval's own row."""
-    rows = lookup.rows_for(ContactType.INTERIOR)
-    assert rows.size >= 2
-    states = {}
-    for row in (int(rows[0]), int(rows[-1])):
-        iv = lookup.interval(row)
-        sel = evaluate_from_angles(
-            lookup,
-            Fx=50.0,
-            Fy=-2.0e3,
-            phi_deg=-2.0,
-            theta_deg=1.5,
-            mode=ContactMode.SPECIFIC,
-            specific_interval=(iv.start, iv.end),
-        )
-        assert sel.selected_row == row
-        assert tuple(sel.interval) == (iv.start, iv.end)
-        state = plate_state_for_selection(lookup, sel)
-        assert state is not None
-        gamma = basis_coefficients(sel.alpha, sel.d_ax, sel.d_ay, sel.varphi)
-        u_row = contract_basis(lookup.plate_u_local_basis[row], gamma, mode_axis=0)
-        v_row = contract_basis(lookup.plate_v_local_basis[row], gamma, mode_axis=0)
-        np.testing.assert_allclose(state.u_local, u_row, atol=_rel_atol(u_row, sole_config))
-        np.testing.assert_allclose(state.v_local, v_row, atol=_rel_atol(v_row, sole_config))
-        states[row] = np.concatenate([state.u_local, state.v_local])
-    a, b = states.values()
-    assert np.linalg.norm(a - b) > _disp_atol(sole_config, 1e-6, rtol=1e-6)
-
-
-def test_plate_color_quantities_and_units(lookup) -> None:
-    """22. COLOR_UNITS / build with each color quantity."""
-    sel = _selection_for(lookup, ContactMode.FULL)
-    if sel.selected_row is None:
-        pytest.skip("No selection.")
+def test_plate_color_quantities_and_units(model, solution) -> None:
+    """COLOR_UNITS / build with each color quantity."""
     expected = {
         "none": "",
         "normal_displacement": "length",
@@ -702,7 +344,7 @@ def test_plate_color_quantities_and_units(lookup) -> None:
     }
     assert COLOR_UNITS == expected
     for color, units in expected.items():
-        state = plate_state_for_selection(lookup, sel, color_quantity=color)
+        state = plate_state_for_solution(model, solution, color_quantity=color)
         assert state is not None
         assert state.color_quantity == color
         assert state.color_units == units
@@ -711,10 +353,3 @@ def test_plate_color_quantities_and_units(lookup) -> None:
         else:
             assert state.color_values is not None
             assert state.color_values.shape == state.sample_s.shape
-
-
-def test_plate_mesh_from_lookup_roundtrip(lookup) -> None:
-    mesh = plate_mesh_from_lookup(lookup)
-    assert mesh is not None
-    assert mesh.n_nodes == int(lookup.plate_node_ids.size)
-    assert mesh.EI_plate_Nm2_per_m == pytest.approx(lookup.EI_plate_Nm2_per_m)
