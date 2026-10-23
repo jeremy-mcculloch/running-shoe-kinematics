@@ -26,22 +26,18 @@ def shape_for_frame(
     *,
     scale_mode: str = "true",
     manual_scale: float = 1.0,
-    n_plot: int = 120,
-    show_plate: bool | None = None,
+    show_plate: bool = True,
     samples_per_element: int = 16,
     plate_color_quantity: str = "none",
     foam_energy: bool = False,
 ) -> ShapePlotData:
-    """Fixed-frame deformed geometry for one replay frame (plate drawn when the model has one)."""
+    """Fixed-frame deformed geometry for one replay frame."""
     state = selection_proxy_for_frame(model, result, frame)
-    if show_plate is None:
-        show_plate = bool(model.has_plate_response)
     return build_shape_plot_data(
         model,
         state,
         scale_mode=scale_mode,
         manual_scale=manual_scale,
-        n_plot=n_plot,
         show_plate=bool(show_plate),
         show_undeformed_plate=False,
         samples_per_element=int(samples_per_element),
@@ -59,12 +55,7 @@ def _foot_xy_payload(shape: ShapePlotData) -> dict[str, Any]:
     poly_x = np.concatenate([x_bot, x_top[::-1], x_bot[:1]])
     poly_y = np.concatenate([y_bot, y_top[::-1], y_bot[:1]])
 
-    px = py = None
-    if getattr(shape, "has_plate", False):
-        px = shape.plate_x_def if shape.plate_x_def is not None else shape.x_plate_def
-        py = shape.plate_y_def if shape.plate_y_def is not None else shape.y_plate_def
-    elif shape.x_plate_def is not None and shape.y_plate_def is not None:
-        px, py = shape.x_plate_def, shape.y_plate_def
+    px, py = shape.plate_x_def, shape.plate_y_def
     if px is None or py is None:
         px = np.array([np.nan, np.nan], dtype=float)
         py = np.array([np.nan, np.nan], dtype=float)
@@ -144,7 +135,7 @@ def animation_frame_stride(model: ContactModel, result: GaitReplayResult, *, ene
                            max_energy_frames: int = MAX_ENERGY_FRAMES) -> int:
     """Replay frames per animation frame: >1 only when foam energy colouring is on and frames are many."""
     n_valid = int(np.count_nonzero(np.asarray(result.frame_valid)))
-    if not (energy and model.render_section) or n_valid <= max_energy_frames:
+    if not energy or n_valid <= max_energy_frames:
         return 1
     return int(np.ceil(n_valid / max(int(max_energy_frames), 1)))
 
@@ -157,7 +148,6 @@ def plotly_foot_animation_figure(
     manual_scale: float = 1.0,
     fps: float = 10.0,
     loop: bool = True,
-    n_plot: int = 80,
     samples_per_element: int = 4,
     energy: bool = True,
     max_energy_frames: int = MAX_ENERGY_FRAMES,
@@ -167,8 +157,7 @@ def plotly_foot_animation_figure(
     Frames only patch ``x``/``y`` on existing traces with ``redraw=False`` so the
     previous outline stays visible until the next frame is applied (no white flash).
 
-    With ``energy`` (and a model with a render section / plate response), the
-    foam mesh and the plate are coloured by strain energy density on colour
+    With ``energy`` the foam mesh and the plate are coloured by strain energy density on colour
     scales fixed over the whole stance. Each foam frame is ~0.2 MB, so only every
     k-th replay frame is animated, at most ``max_energy_frames`` frames.
     """
@@ -182,8 +171,7 @@ def plotly_foot_animation_figure(
 
     n = int(result.times.size)
     valid = [i for i in range(n) if bool(result.frame_valid[i])]
-    foam_on = bool(energy and model.render_section)
-    plate_on = bool(energy and model.has_plate_response)
+    foam_on = plate_on = bool(energy)
     stride = animation_frame_stride(model, result, energy=energy, max_energy_frames=max_energy_frames)
     payloads: list[dict[str, Any]] = []
     shapes: list[ShapePlotData] = []
@@ -196,7 +184,6 @@ def plotly_foot_animation_figure(
                 i,
                 scale_mode=scale_mode,
                 manual_scale=manual_scale,
-                n_plot=n_plot,
                 samples_per_element=samples_per_element,
                 plate_color_quantity="strain_energy_density" if plate_on else "none",
                 foam_energy=foam_on,
@@ -227,8 +214,7 @@ def plotly_foot_animation_figure(
                 vmax=foam_vmax, show_colorbar=colorbar,
             )
         if plate_on:
-            px = sh.plate_x_def if sh.plate_x_def is not None else sh.x_plate_def
-            py = sh.plate_y_def if sh.plate_y_def is not None else sh.y_plate_def
+            px, py = sh.plate_x_def, sh.plate_y_def
             assert px is not None and py is not None and sh.plate_color_values is not None
             plate = plate_energy_traces(px, py, sh.plate_color_values, vmax=plate_vmax, show_colorbar=colorbar)
         return foam, plate
@@ -494,31 +480,28 @@ def plotly_foot_animation_figure(
 def stance_strain_energy(model: ContactModel, result: GaitReplayResult, *, samples_per_element: int = 16) -> dict[str, np.ndarray]:
     """Total strain energy (J, whole shoe width) in the foam and in the plate per replay frame.
 
-    Foam: ``sum_e W_e A_e`` over the mesh (``element_strain_energy_density``).
+    Foam: ``sum_e W_e A_e`` over the mesh (``RenderSection.strain_energy_density``).
     Plate: ``int 1/2 EI kappa^2 ds`` over its Hermite samples (trapezoid). Both
     are per metre width in the model and are multiplied by ``shoe_width_m``.
-    Frames without a solved state, or a model without the render section /
-    plate response, give NaN.
+    Frames without a solved state give NaN.
     """
     from compliance_fem.contact.contact_model import plate_state_for_solution, render_vertex_displacements
-    from compliance_fem.geometry.render import element_areas, element_strain_energy_density
 
     n = int(result.times.size)
     width = float(result.model_info.get("shoe_width_m", 1.0))
     foam = np.full(n, np.nan)
     plate = np.full(n, np.nan)
-    areas = element_areas(model) if model.render_section else None
+    areas = model.render.element_areas()
     for i in range(min(n, len(result.frames))):
         if not bool(result.frame_valid[i]):
             continue
         sol = result.frames[i].contact
-        if areas is not None:
-            u, v = render_vertex_displacements(model, sol)
-            foam[i] = width * float(element_strain_energy_density(model, u, v) @ areas)
+        u, v = render_vertex_displacements(model, sol)
+        foam[i] = width * float(model.render.strain_energy_density(u, v) @ areas)
         state = plate_state_for_solution(
             model, sol, samples_per_element=samples_per_element, color_quantity="strain_energy_density"
         )
-        if state is not None and state.color_values is not None:
+        if state.color_values is not None:
             plate[i] = width * float(np.trapezoid(state.color_values, state.sample_s))
     return {"times": np.asarray(result.times, dtype=float), "foam_J": foam, "plate_J": plate}
 

@@ -111,8 +111,8 @@ def assemble_plate_bending(
     n_foam: int,
     u_dofs: np.ndarray,
     v_dofs: np.ndarray,
-    coords: np.ndarray,
-    n_p: np.ndarray,
+    plate_coords: np.ndarray,
+    plate_normals: np.ndarray,
     EI: float,
 ) -> sparse.csc_matrix:
     """Assemble the global plate bending matrix in the enlarged primal space.
@@ -125,13 +125,13 @@ def assemble_plate_bending(
     """
     u_dofs = np.asarray(u_dofs, dtype=int)
     v_dofs = np.asarray(v_dofs, dtype=int)
-    coords = np.asarray(coords, dtype=float)
+    plate_coords = np.asarray(plate_coords, dtype=float)
     n_plate = int(u_dofs.size)
-    normals = _per_element(n_p, max(n_plate - 1, 0), "n_p")
+    plate_normals = _per_element(plate_normals, max(n_plate - 1, 0), "n_p") # broadcast to (n_plate - 1, 2)
     if v_dofs.size != n_plate:
         raise ValueError("u_dofs and v_dofs must have the same length.")
-    if coords.shape != (2, n_plate):
-        raise ValueError(f"coords must have shape (2, n_plate), got {coords.shape}.")
+    if plate_coords.shape != (2, n_plate):
+        raise ValueError(f"coords must have shape (2, n_plate), got {plate_coords.shape}.")
     if n_plate < 2:
         raise ValueError("A plate mesh requires at least two interface nodes.")
 
@@ -149,7 +149,7 @@ def assemble_plate_bending(
     data: list[float] = []
     for i in range(n_plate - 1):
         j = i + 1
-        delta = coords[:, j] - coords[:, i]
+        delta = plate_coords[:, j] - plate_coords[:, i]
         length = float(np.linalg.norm(delta))
         K_p = hermite_bending_matrix(EI, length)
         theta_i = n_foam + i
@@ -162,12 +162,16 @@ def assemble_plate_bending(
             int(u_dofs[j]),
             int(v_dofs[j]),
             theta_j,
-            normals[i],
+            plate_normals[i],
         )
         K_e = (T.T @ sparse.csc_matrix(K_p) @ T).tocoo()
         rows.extend(K_e.row.tolist())
         cols.extend(K_e.col.tolist())
         data.extend(K_e.data.tolist())
+    # row_col_pairs = zip(rows, cols)
+    # row_col_set = set(row_col_pairs)
+    # if len(row_col_set) != len(rows):
+    #     raise ValueError("Duplicate row/column indices in plate bending assembly.")
     return sparse.csc_matrix((data, (rows, cols)), shape=(n_q, n_q))
 
 

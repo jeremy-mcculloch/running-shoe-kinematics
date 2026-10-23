@@ -2,7 +2,7 @@
 
 The measured pitch ``phi`` is the rearfoot (heel -> MTP) angle, so the frame
 rotation depends on the toe shape amplitude, ``varphi(alpha) = phi -
-atan2(dy_mtp + alpha phi1_mtp, L - toe_length)`` (``toe_spring.RearfootGeometry``).
+atan2(y_mtp_0 + alpha y_mtp_shape_mode, L - toe_length)`` (``toe_spring.RearfootGeometry``).
 For each trial ``theta`` (``alpha = tan(theta)``, never ``alpha = theta``) the
 contact complementarity problem is solved to convergence at ``varphi(alpha)``
 and the toe balance

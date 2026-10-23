@@ -144,7 +144,7 @@ def saved_model(coarse_model, tmp_path_factory):
 def _solve(model: ContactModel, phi_deg=0.0, theta_deg=0.0, Fx=0.0, Fy=-1500.0) -> ContactSolution:
     """Contact state at absolute chord angle ``phi_deg`` and toe angle ``theta_deg`` (per-metre loads)."""
     varphi = float(np.deg2rad(phi_deg)) - model.phi_ref
-    return solve_contact_state(model.operator, varphi, float(np.tan(np.deg2rad(theta_deg))), np.array([Fx, Fy]))
+    return solve_contact_state(model.contact_operator, varphi, float(np.tan(np.deg2rad(theta_deg))), np.array([Fx, Fy]))
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +307,7 @@ def test_interface_endpoints_on_exterior(meas_geom) -> None:
 def test_two_subdomains(meas_geom, meas_mesh) -> None:
     assert set(meas_geom.region_polygons) == set(FOAM_REGION_TAGS)
     assert sum(meas_geom.region_areas.values()) == pytest.approx(meas_geom.total_area, rel=1e-9)
-    regions = np.unique(meas_mesh.element_region)
+    regions = np.unique(meas_mesh.triangle_id_to_region_id)
     assert regions.tolist() == [0, 1]
 
 
@@ -336,7 +336,7 @@ def test_material_regions(meas_cfg, meas_mesh) -> None:
     iface = meas_mesh.geometry.interface
     y_if = np.interp(c[:, 0], iface[:, 0], iface[:, 1])
     inside = (c[:, 0] > iface[0, 0]) & (c[:, 0] < iface[-1, 0])
-    up = meas_mesh.element_region == 0
+    up = meas_mesh.triangle_id_to_region_id == 0
     assert np.all(c[up & inside, 1] > y_if[up & inside] - 1e-9)
     assert np.all(c[~up & inside, 1] < y_if[~up & inside] + 1e-9)
 
@@ -344,8 +344,8 @@ def test_material_regions(meas_cfg, meas_mesh) -> None:
 # 23. Interface nodes are shared by both regions.
 def test_interface_nodes_shared(meas_mesh) -> None:
     t = meas_mesh.mesh.t
-    up_nodes = set(np.unique(t[:, meas_mesh.element_region == 0]).tolist())
-    lo_nodes = set(np.unique(t[:, meas_mesh.element_region == 1]).tolist())
+    up_nodes = set(np.unique(t[:, meas_mesh.triangle_id_to_region_id == 0]).tolist())
+    lo_nodes = set(np.unique(t[:, meas_mesh.triangle_id_to_region_id == 1]).tolist())
     assert up_nodes & lo_nodes == set(int(n) for n in meas_mesh.interface_nodes)
 
 
@@ -354,11 +354,11 @@ def test_material_independent_of_numbering(meas_mesh) -> None:
     c = _centroids(meas_mesh.mesh)
     upper = MplPath(meas_mesh.geometry.region_polygons["upper_foam"])
     in_upper = upper.contains_points(c)
-    np.testing.assert_array_equal(in_upper, meas_mesh.element_region == 0)
+    np.testing.assert_array_equal(in_upper, meas_mesh.triangle_id_to_region_id == 0)
     perm = np.random.default_rng(0).permutation(c.shape[0])
     np.testing.assert_array_equal(
         upper.contains_points(c[perm]),
-        (meas_mesh.element_region == 0)[perm],
+        (meas_mesh.triangle_id_to_region_id == 0)[perm],
     )
 
 
@@ -378,11 +378,11 @@ def test_boundary_tags(meas_mesh) -> None:
 
 
 # 26. Positive element areas.
-def test_positive_areas(meas_mesh) -> None:
+def test_positive_areas(meas_mesh, meas_cfg) -> None:
     p, t = meas_mesh.mesh.p, meas_mesh.mesh.t
     a, b, c = p[:, t[0]], p[:, t[1]], p[:, t[2]]
     area = 0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
-    assert np.all(area > 1e-6 * meas_mesh.config.mesh_size_m**2)
+    assert np.all(area > 1e-6 * meas_cfg.mesh_size_m**2)
 
 
 # 27. Mesh quality is enforced near the point toe.
@@ -399,7 +399,7 @@ def test_toe_quality_enforced(meas_mesh, meas_cfg) -> None:
 # 28. Unequal top / bottom node counts.
 def test_unequal_node_counts(meas_fem, coarse_fem) -> None:
     for fem in (meas_fem, coarse_fem):
-        assert fem.n_top_nodes != fem.n_bottom_nodes
+        assert fem.x_top.size != fem.x_bottom.size
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +424,7 @@ def test_plate_elements_within_span(meas_fem, meas_geom) -> None:
     np.testing.assert_allclose(p[:, 0], meas_geom.interface[meas_geom.plate_heel_index], atol=1e-12 * L_M)
     np.testing.assert_allclose(p[:, -1], meas_geom.interface[meas_geom.plate_toe_index], atol=1e-12 * L_M)
     assert np.all(np.diff(p[0]) > 0.0)
-    assert meas_fem.plate_element_ids.size == meas_fem.n_plate_nodes - 1
+    assert meas_fem.n_lambda == meas_fem.n_plate_nodes - 1
 
 
 # 32-33. No plate stiffness / rotation DOFs outside the span.
@@ -442,10 +442,10 @@ def test_no_plate_terms_outside_span(meas_fem) -> None:
 
 # 34. Inextensibility rows only on plate elements.
 def test_constraints_only_on_plate(meas_fem) -> None:
-    B = meas_fem.B_p.tocoo()
-    assert meas_fem.B_p.shape[0] == meas_fem.n_plate_nodes - 1 == meas_fem.constraint_rank
+    constraint = meas_fem.plate_inextensibility_constraint.tocoo()
+    assert meas_fem.plate_inextensibility_constraint.shape[0] == meas_fem.n_plate_nodes - 1 == meas_fem.constraint_rank
     allowed = set(np.concatenate([meas_fem.plate_u_dof_ids, meas_fem.plate_v_dof_ids]).tolist())
-    assert set(B.col.tolist()) <= allowed
+    assert set(constraint.col.tolist()) <= allowed
     assert meas_fem.inextensibility_residuals.top <= 1e-12 * L_M
 
 
@@ -457,7 +457,6 @@ def test_element_frames(meas_fem) -> None:
     np.testing.assert_allclose(n, np.column_stack([-t[:, 1], t[:, 0]]), atol=0)
     np.testing.assert_allclose(t * lengths[:, None], np.diff(coords, axis=1).T, rtol=1e-12, atol=1e-15)
     assert np.all(t[:, 0] > 0.0) and np.all(n[:, 1] > 0.0)
-    np.testing.assert_allclose(meas_fem.plate_element_tangents, t)
     assert np.ptp(np.arctan2(t[:, 1], t[:, 0])) > np.deg2rad(5.0)  # the plate is curved
 
 
@@ -490,7 +489,7 @@ def test_curved_plate_matches_direct_assembly(meas_fem) -> None:
 def test_natural_end_rotation(meas_fem) -> None:
     r = meas_fem
     rot = r.plate_rotation_dof_ids
-    assert r.B_p.tocsc()[:, rot].nnz == 0
+    assert r.plate_inextensibility_constraint.tocsc()[:, rot].nnz == 0
     for side in ("top", "bottom"):
         assert np.intersect1d(np.concatenate(r.selector_dofs(side)), rot).size == 0
     K = r.K.tocsr()
@@ -525,7 +524,7 @@ def test_toe_selector_ownership(meas_fem, meas_mesh) -> None:
 
 # 43. Top resultants sum over the top selector only (toe not double-counted).
 def test_top_force_no_double_count(coarse_model, coarse_fem) -> None:
-    n_t = coarse_fem.n_top_nodes
+    n_t = coarse_fem.x_top.size
     assert n_t == len(coarse_fem.mesh_data.top_curve_nodes) - 1
     assert coarse_model.n_top_nodes == n_t
     sol = _solve(coarse_model, 4.0, 3.0, Fx=150.0)
@@ -544,7 +543,7 @@ def test_top_force_no_double_count(coarse_model, coarse_fem) -> None:
 
 # 45. Blocks support unequal node counts.
 def test_block_shapes(coarse_fem) -> None:
-    n_t, n_b = coarse_fem.n_top_nodes, coarse_fem.n_bottom_nodes
+    n_t, n_b = coarse_fem.x_top.size, coarse_fem.x_bottom.size
     assert coarse_fem.Ctt_force.shape == (2 * n_t, 2 * n_t)
     assert coarse_fem.Cbb_force.shape == (2 * n_b, 2 * n_b)
     assert coarse_fem.Ctb_force.shape == (2 * n_t, 2 * n_b)
@@ -575,7 +574,7 @@ def test_fixed_frame_gap_and_reaction(coarse_model, phi, theta) -> None:
         np.testing.assert_allclose(cy, 0.0, atol=1e-9 * L)
         np.testing.assert_allclose(cx, sh.bottom_node_x[p.start : p.end + 1], atol=1e-12 * L)
     np.testing.assert_allclose(sh.bottom_gap, sol.gap)
-    assert sh.has_render_mesh and set(sh.region_def) == set(FOAM_REGION_TAGS)
+    assert set(sh.region_def) == set(FOAM_REGION_TAGS)
 
 
 # 56. Passive toe equilibrium with k = 25 N m/rad.
@@ -583,7 +582,7 @@ def test_passive_toe_exact(coarse_model) -> None:
     cfg = ToeSpringConfig()
     assert cfg.toe_stiffness_Nm_per_rad == 25.0
     F = np.array([150.0, -1500.0])
-    fr = solve_toe_contact(coarse_model.operator, F, -0.05, cfg, 0.1)
+    fr = solve_toe_contact(coarse_model.contact_operator, F, -0.05, cfg, 0.1)
     assert fr.converged
     assert fr.toe_equilibrium_relative_residual < 1e-9
     assert fr.contact.diagnostics["force_residual"] <= 1e-9 * np.hypot(*F)
@@ -601,7 +600,7 @@ def test_no_runtime_fem_solve(coarse_model, monkeypatch) -> None:
     for mod, name in ((spla, "splu"), (spla, "spsolve"), (comp, "splu"), (comp, "compute_compliance")):
         monkeypatch.setattr(mod, name, _forbidden)
     for phi, fy in ((0.0, -800.0), (0.14, -1500.0), (-0.2, -2500.0)):
-        fr = solve_toe_contact(coarse_model.operator, np.array([0.1 * abs(fy), fy]), phi, ToeSpringConfig(), 0.1)
+        fr = solve_toe_contact(coarse_model.contact_operator, np.array([0.1 * abs(fy), fy]), phi, ToeSpringConfig(), 0.1)
         build_shape_plot_data(coarse_model, selection_proxy(coarse_model, fr))
 
 
@@ -623,12 +622,12 @@ def test_lookup_serialization(saved_model, coarse_model) -> None:
     assert gm["foam_region_tags"] == list(FOAM_REGION_TAGS)
     assert gm["boundary_tags"] == list(BOUNDARY_TAGS)
     assert gm["shared_toe_policy"] == SHARED_TOE_POLICY
-    assert gm["shared_toe_node_id"] == int(coarse_model.render_section["bottom_curve_node_ids"][-1])
-    for key, arr in coarse_model.render_section.items():
-        np.testing.assert_array_equal(lk.render_section[key], arr)
-    np.testing.assert_array_equal(lk.plate_mesh.node_ids, coarse_model.plate_mesh.node_ids)
-    np.testing.assert_array_equal(lk.operator.G_bb, coarse_model.operator.G_bb)
-    np.testing.assert_array_equal(lk.operator.psi_top, coarse_model.operator.psi_top)
+    assert gm["shared_toe_node_id"] == int(coarse_model.render.bottom_curve_node_ids[-1])
+    for f in dataclasses.fields(coarse_model.render):
+        np.testing.assert_array_equal(getattr(lk.render, f.name), getattr(coarse_model.render, f.name))
+    np.testing.assert_array_equal(lk.plate.node_ids, coarse_model.plate.node_ids)
+    np.testing.assert_array_equal(lk.contact_operator.db_fb, coarse_model.contact_operator.db_fb)
+    np.testing.assert_array_equal(lk.contact_operator.toe_shape_mode_flat_rearfoot, coarse_model.contact_operator.toe_shape_mode_flat_rearfoot)
 
 
 def _flat(obj):
@@ -680,7 +679,7 @@ def test_gui_plate_partial_span(coarse_model) -> None:
     sol = _solve(coarse_model, 6.0, 4.0)
     sh = build_shape_plot_data(coarse_model, selection_proxy(coarse_model, sol), show_plate_nodes=True)
     gm = coarse_model.geometry_metadata
-    mesh = coarse_model.plate_mesh
+    mesh = coarse_model.plate
     np.testing.assert_allclose(
         [mesh.reference_x[0], mesh.reference_y[0]], gm["plate_start_reference_coordinate"], atol=1e-12 * L_M
     )
@@ -692,9 +691,8 @@ def test_gui_plate_partial_span(coarse_model) -> None:
     assert sh.interface_def is not None
     assert sh.plate_x_def[0] == pytest.approx(sh.plate_node_x[0], abs=tol)
     assert sh.plate_x_def[-1] == pytest.approx(sh.plate_node_x[-1], abs=tol)
-    sec = coarse_model.render_section
-    iface = np.asarray(sec["interface_node_ids"])
-    on_plate = np.isin(iface, sec["plate_curve_node_ids"])
+    iface = coarse_model.render.interface_node_ids
+    on_plate = np.isin(iface, coarse_model.plate.node_ids)
     np.testing.assert_allclose(sh.interface_def[0][on_plate], sh.plate_node_x, atol=1e-7 * L_M)
     np.testing.assert_allclose(sh.interface_def[1][on_plate], sh.plate_node_y, atol=1e-7 * L_M)
     assert not np.all(on_plate)
@@ -705,15 +703,15 @@ def test_old_schema_messages(saved_model, tmp_path) -> None:
     path, _ = saved_model
     with np.load(path, allow_pickle=True) as npz:
         data = dict(npz)
-    for version in (8, 9, 11, 12):
+    for version in (8, 9, 11, 12, 13, 14, 15, 16):
         old = dict(data)
         old["schema_version"] = np.asarray(version)
         np.savez_compressed(tmp_path / f"v{version}.npz", **old)
         with pytest.raises(ValueError, match=f"schema_version={version}"):
             load_contact_model(tmp_path / f"v{version}.npz")
     assert f"schema_version={LOOKUP_SCHEMA_VERSION}" in REGENERATE_LOOKUP_MESSAGE
-    assert LOOKUP_SCHEMA_VERSION == 13
+    assert LOOKUP_SCHEMA_VERSION == 17
     broken = {k: v for k, v in data.items() if k != "render_influence_loads"}
     np.savez_compressed(tmp_path / "broken.npz", **broken)
-    with pytest.raises(ValueError, match="Render section is missing"):
+    with pytest.raises(ValueError, match="render section arrays missing"):
         load_contact_model(tmp_path / "broken.npz")

@@ -16,18 +16,18 @@ import numpy as np
 
 from compliance_fem.contact.corotation import SHAPE_MODE_SIGN
 
-def softplus_w2(x: np.ndarray, L: float, toe_length: float, kappa: float) -> np.ndarray:
+def softplus_scaled(x: np.ndarray, L: float, toe_length: float, scale_factor: float) -> np.ndarray:
     """Unnormalized softplus ramp s(x) approaching max(0, x - (L - toe_length)) for large kappa.
 
     ``L`` and ``toe_length`` are in metres. Evaluated stably as
     (L / kappa) * logaddexp(0, kappa * (x - (L - toe_length)) / L).
     """
-    if kappa <= 0.0:
-        raise ValueError(f"kappa must be positive, got {kappa}.")
+    if scale_factor <= 0.0:
+        raise ValueError(f"kappa must be positive, got {scale_factor}.")
     if L <= 0.0:
         raise ValueError(f"L must be positive, got {L}.")
     x = np.asarray(x, dtype=float)
-    return (L / kappa) * np.logaddexp(0.0, kappa * (x - (L - toe_length)) / L)
+    return (L / scale_factor) * np.logaddexp(0.0, scale_factor * (x - (L - toe_length)) / L)
 
 
 def kappa_from_min_bend_radius(L: float, min_bend_radius_mm: float) -> float:
@@ -59,7 +59,7 @@ def min_bend_radius_mm_from_kappa(L: float, kappa: float) -> float:
     return 4.0 * float(L) * 1000.0 / float(kappa)
 
 
-def shape_mode_phi1(x: np.ndarray, L: float, toe_length: float, kappa: float) -> np.ndarray:
+def shape_mode_toe_bend(x: np.ndarray, L: float, toe_length: float, toe_bend_scale_factor: float) -> np.ndarray:
     """Endpoint-fixed top shape mode phi1(x), zero at x=0 and x=L.
 
     phi1(x) = s(x) - (1 - x/L) s(0) - (x/L) s(L)
@@ -69,14 +69,14 @@ def shape_mode_phi1(x: np.ndarray, L: float, toe_length: float, kappa: float) ->
     relative to the heel-to-toe chord.
     """
     x = np.asarray(x, dtype=float)
-    s = softplus_w2(x, L=L, toe_length=toe_length, kappa=kappa)
-    s0 = float(softplus_w2(np.array([0.0]), L=L, toe_length=toe_length, kappa=kappa)[0])
-    sL = float(softplus_w2(np.array([float(L)]), L=L, toe_length=toe_length, kappa=kappa)[0])
+    s = softplus_scaled(x, L=L, toe_length=toe_length, scale_factor=toe_bend_scale_factor)
+    s0 = float(softplus_scaled(np.array([0.0]), L=L, toe_length=toe_length, scale_factor=toe_bend_scale_factor)[0])
+    sL = float(softplus_scaled(np.array([float(L)]), L=L, toe_length=toe_length, scale_factor=toe_bend_scale_factor)[0])
     t = x / float(L)
     return SHAPE_MODE_SIGN * (s - (1.0 - t) * s0 - t * sL)
 
 
-def top_shape_displacement(x_top: np.ndarray, L: float, toe_length: float, kappa: float) -> np.ndarray:
+def toe_bend_displacement(x_top: np.ndarray, L: float, toe_length: float, toe_bend_scale_factor: float) -> np.ndarray:
     """Top displacement per unit ``alpha``, component-major ``[u; v] = [0; phi1(x)]`` (2 n_t,)."""
     x_top = np.asarray(x_top, dtype=float)
-    return np.concatenate([np.zeros(x_top.size), shape_mode_phi1(x_top, L=L, toe_length=toe_length, kappa=kappa)])
+    return np.concatenate([np.zeros(x_top.size), shape_mode_toe_bend(x_top, L=L, toe_length=toe_length, toe_bend_scale_factor=toe_bend_scale_factor)])

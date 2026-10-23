@@ -23,7 +23,7 @@ def model(rocker_model):
 
 def test_step_matches_coupled_solver(model, rocker_model) -> None:
     st = model.step(*LOAD, 2.0)
-    ref = solve_toe_contact(rocker_model.operator, np.array(LOAD) / WIDTH, np.deg2rad(2.0), ToeSpringConfig(), WIDTH)
+    ref = solve_toe_contact(rocker_model.contact_operator, np.array(LOAD) / WIDTH, np.deg2rad(2.0), ToeSpringConfig(), WIDTH)
     assert st.valid and st.admissible
     assert st.theta_deg == pytest.approx(ref.theta_deg, abs=1e-12)
     np.testing.assert_array_equal(st.contact_mask, ref.contact.active)

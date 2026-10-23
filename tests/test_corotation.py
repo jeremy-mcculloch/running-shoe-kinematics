@@ -7,7 +7,7 @@ import inspect
 import numpy as np
 import pytest
 
-from compliance_fem.contact.basis import shape_mode_phi1
+from compliance_fem.contact.basis import shape_mode_toe_bend
 from compliance_fem.contact.contact_model import build_contact_model, selection_proxy
 from compliance_fem.contact.continuous_contact import solve_contact_state
 from compliance_fem.contact.corotation import (
@@ -30,7 +30,7 @@ def _Q(v: float) -> np.ndarray:
 def test_shape_mode_vanishes_at_endpoints() -> None:
     for L, toe_length, kappa in ((1.0, 0.5, 30.0), (0.25, 0.10, 60.0), (2.0, 0.3, 8.0)):
         np.testing.assert_allclose(
-            shape_mode_phi1(np.array([0.0, L]), L=L, toe_length=toe_length, kappa=kappa), 0.0, atol=1e-14
+            shape_mode_toe_bend(np.array([0.0, L]), L=L, toe_length=toe_length, toe_bend_scale_factor=kappa), 0.0, atol=1e-14
         )
 
 
@@ -51,7 +51,7 @@ def test_vector_rotation_to_fixed_and_back(varphi_deg) -> None:
 def test_positive_theta_bends_the_toe_up() -> None:
     L, toe_length, kappa = 1.0, 0.5, 30.0
     x = np.linspace(0.0, L, 401)
-    v = SHAPE_MODE_SIGN * np.tan(np.deg2rad(10.0)) * shape_mode_phi1(x, L=L, toe_length=toe_length, kappa=kappa)
+    v = SHAPE_MODE_SIGN * np.tan(np.deg2rad(10.0)) * shape_mode_toe_bend(x, L=L, toe_length=toe_length, toe_bend_scale_factor=kappa)
     slope = np.gradient(v, x)
     assert float(np.mean(slope[x >= L - toe_length])) > 0.0
     assert float(np.mean(slope[x <= L - toe_length])) < 0.0
@@ -65,7 +65,7 @@ def test_sloped_top_reference_chord() -> None:
     x_top, y_top = model.x_top, model.y_top
     expected = np.arctan2(float(y_top[-1] - y_top[0]), float(x_top[-1] - x_top[0]))
     assert model.phi_ref == pytest.approx(expected) and abs(expected) > 1e-3
-    assert reference_chord_angle(np.array([0.0, 1.0]), None) == 0.0
+    assert reference_chord_angle(np.array([0.0, 1.0]), np.array([0.3, 0.3])) == 0.0
 
 
 def test_transform_to_fixed_frame_is_exact_rotation() -> None:
@@ -80,7 +80,7 @@ def test_transform_to_fixed_frame_is_exact_rotation() -> None:
 
 
 def test_shape_plot_scales_only_the_elastic_part(rocker_model) -> None:
-    op = rocker_model.operator
+    op = rocker_model.contact_operator
     sol = solve_contact_state(op, np.deg2rad(-2.0), np.tan(np.deg2rad(5.0)), np.array([0.0, -900.0]))
     state = selection_proxy(rocker_model, sol)
     exact = build_shape_plot_data(rocker_model, state)

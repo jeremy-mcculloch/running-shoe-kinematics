@@ -36,7 +36,7 @@ import time
 import types
 from dataclasses import Field, asdict, dataclass, fields, is_dataclass
 from pathlib import Path
-from typing import Union, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Union, get_args, get_origin, get_type_hints
 
 import numpy as np
 
@@ -44,6 +44,10 @@ from compliance_fem import compute_compliance
 from compliance_fem.contact.sole_config import SoleConfig
 from compliance_fem.geometry.profile import NormalizedSoleGeometry
 from compliance_fem.contact.toe_spring import ToeSpringConfig
+
+if TYPE_CHECKING:
+    from compliance_fem.contact.contact_model import ContactModel
+    from compliance_fem.fem.compliance import ComplianceResult
 
 CONFIG_SCHEMA_VERSION = 2
 DEFAULT_TOE_LENGTH_MM = 59.4
@@ -441,7 +445,7 @@ def ensure_lookup_exists(
     return npz_path
 
 
-def _save_fem_outputs(fem, setup: ModelSetup, fem_dir: Path, say, *, plots: bool) -> None:
+def _save_fem_outputs(fem: ComplianceResult, setup: ModelSetup, fem_dir: Path, say, *, plots: bool) -> None:
     """Compliance NPZ, ParaView mesh, compliance heatmaps and the FEM residual checks."""
     from compliance_fem.fem.compliance import save_compliance_npz
     from compliance_fem.plotting.compliance import plot_compliance_heatmap
@@ -469,24 +473,20 @@ def _save_fem_outputs(fem, setup: ModelSetup, fem_dir: Path, say, *, plots: bool
     say(f"FEM outputs written to {fem_dir}")
 
 
-def _write_model_summary(model, setup: ModelSetup, npz_path: Path, out: Path, say) -> None:
+def _write_model_summary(model: ContactModel, setup: ModelSetup, npz_path: Path, out: Path, say) -> None:
     """``generation_summary.json`` for the shared-operator model."""
-    op = model.operator
+    op = model.contact_operator
+    meta = model.metadata
     summary = {
         "contact_set_model": "continuous_node_to_ground_complementarity",
-        "tangential_contact_law": model.metadata.get("tangential_contact_law"),
+        "tangential_contact_law": meta.get("tangential_contact_law"),
         "n_bottom_nodes": int(op.n_bottom),
         "n_top_nodes": int(op.n_top),
-        "G_symmetry_error": float(op.G_symmetry_error),
-        "G_min_eigenvalue": float(op.G_min_eigenvalue),
-        "G_max_eigenvalue": float(op.G_max_eigenvalue),
-        "clamp_condition": float(op.clamp_condition),
+        **{k: meta.get(k) for k in ("reciprocity_error", "G_symmetry_error", "G_min_eigenvalue", "G_max_eigenvalue", "clamp_condition")},
         "build_time_s": float(model.build_time_s),
         "file_size_bytes": int(npz_path.stat().st_size),
         "softplus_toe_length": float(op.toe_length),
         "softplus_kappa": float(op.kappa),
-        "has_plate_response": bool(model.has_plate_response),
-        "has_render_section": bool(model.render_section),
         "schema_version": int(model.schema_version),
         "geometry": model.geometry_metadata or None,
         "config_source": setup.source_path,
@@ -496,7 +496,6 @@ def _write_model_summary(model, setup: ModelSetup, npz_path: Path, out: Path, sa
     (out / "generation_summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     say(f"Contact model written to {out}")
     say(
-        f"N_b={op.n_bottom}  G sym err={op.G_symmetry_error:.1e}  eig(G) in [{op.G_min_eigenvalue:.3e}, "
-        f"{op.G_max_eigenvalue:.3e}]  build={model.build_time_s:.1f} s  size={summary['file_size_bytes'] / 1e6:.1f} MB  "
-        f"plate_response={model.has_plate_response}  render={bool(model.render_section)}"
+        f"N_b={op.n_bottom}  G sym err={meta['G_symmetry_error']:.1e}  eig(G) in [{meta['G_min_eigenvalue']:.3e}, "
+        f"{meta['G_max_eigenvalue']:.3e}]  build={model.build_time_s:.1f} s  size={summary['file_size_bytes'] / 1e6:.1f} MB"
     )

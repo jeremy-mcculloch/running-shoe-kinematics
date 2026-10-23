@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from compliance_fem.contact.basis import shape_mode_phi1
 from compliance_fem.contact.corotation import transform_to_fixed_frame
 
 if TYPE_CHECKING:
@@ -80,10 +79,6 @@ class ShapePlotData:
     # Derived (display-only) patch edge points in the fixed frame.
     edge_estimate_points: tuple[tuple[float, float], ...] = ()
     anchor_xy: tuple[float, float] = (0.0, 0.0)
-    y_plate_ref: np.ndarray | None = None
-    x_plate_def: np.ndarray | None = None
-    y_plate_def: np.ndarray | None = None
-    plate_is_schematic: bool = False
     has_plate: bool = False
     plate_x_ref: np.ndarray | None = None
     plate_y_ref: np.ndarray | None = None
@@ -103,7 +98,6 @@ class ShapePlotData:
     show_plate_nodes: bool = False
     show_plate_rotations: bool = False
     # Exact nodal rendering of the two foam regions from the render influence.
-    has_render_mesh: bool = False
     region_ref: dict = field(default_factory=dict)  # name -> (x, y) closed loop, reference
     region_def: dict = field(default_factory=dict)  # name -> (x, y) closed loop, fixed frame
     region_materials: dict = field(default_factory=dict)  # name -> material name
@@ -196,7 +190,6 @@ def build_shape_plot_data(
     *,
     scale_mode: str = "true",
     manual_scale: float = 1.0,
-    n_plot: int = 200,
     show_plate: bool = True,
     show_undeformed_plate: bool = True,
     show_plate_nodes: bool = False,
@@ -207,51 +200,34 @@ def build_shape_plot_data(
 ) -> ShapePlotData:
     """Fixed-frame deformed geometry of one contact state (``contact_model.selection_proxy``).
 
-    With ``foam_energy`` and a measured render section, the deformed foam mesh
-    and each element's strain energy density are included (true displacement;
+    With ``foam_energy`` the deformed foam mesh and each element's strain energy
+    density are included (true displacement;
     the display scale only moves the drawn vertices).
     """
     from compliance_fem.contact.contact_model import plate_state_for_solution, render_vertex_displacements
 
     sol = state.solution
-    op = model.operator
+    op = model.contact_operator
     x_a, y_a = float(state.anchor_x), float(state.anchor_y)
     d_ax, d_ay = float(state.d_ax), float(state.d_ay)
     anchor_fixed = tuple(state.anchor_fixed)
     varphi = float(state.varphi)
     L = float(op.L)
     x_b, y_b = op.x_bottom, op.y_bottom
-    n_b = x_b.size
     u_bot_nodes = np.asarray(state.full_bottom_u, dtype=float)
     v_bot_nodes = np.asarray(state.full_bottom_v, dtype=float)
 
-    x = np.linspace(0.0, L, n_plot)
-    u_top = np.zeros_like(x)
-    v_top = float(state.alpha) * shape_mode_phi1(x, L, op.toe_length, op.kappa)
-    u_bot = np.interp(x, x_b, u_bot_nodes)
-    v_bot = np.interp(x, x_b, v_bot_nodes)
-    render_disp = render_vertex_displacements(model, sol) if model.render_section else None
-    if render_disp is not None:
-        k_out = _outline_index(model)
-        scale, label = choose_display_scale(
-            op.H, render_disp[1][k_out], np.zeros(1), scale_mode, manual_scale, u=render_disp[0][k_out]
-        )
-    else:
-        scale, label = choose_display_scale(op.H, v_top, v_bot, scale_mode, manual_scale, u=u_bot)
-
-    y_top_ref = np.interp(x, op.x_top, op.y_top)
-    y_bottom_ref = np.interp(x, x_b, y_b)
-    y_plate_ref = None
-    if model.x_plate is not None and model.y_plate is not None:
-        y_plate_ref = np.interp(x, model.x_plate, model.y_plate)
+    render_disp = render_vertex_displacements(model, sol)
+    k_out = _outline_index(model)
+    scale, label = choose_display_scale(
+        op.H, render_disp[1][k_out], np.zeros(1), scale_mode, manual_scale, u=render_disp[0][k_out]
+    )
 
     def _to_fixed(xr, yr, u, v):
         return transform_to_fixed_frame(
             xr, yr, u, v, x_a, d_ax, d_ay, varphi, anchor=anchor_fixed, elastic_scale=scale, y_anchor=y_a
         )
 
-    x_top_def, y_top_def = _to_fixed(x, y_top_ref, u_top, v_top)
-    x_bottom_def, y_bottom_def = _to_fixed(x, y_bottom_ref, u_bot, v_bot)
     xn, yn = _to_fixed(x_b, y_b, u_bot_nodes, v_bot_nodes)
     patches = tuple(state.patches)
     curves = tuple((xn[p.start : p.end + 1].copy(), yn[p.start : p.end + 1].copy()) for p in patches)
@@ -261,12 +237,6 @@ def build_shape_plot_data(
             if np.isfinite(xe):
                 edges.append((float(np.interp(xe, x_b, xn)), float(np.interp(xe, x_b, yn))))
 
-    x_plate_def = y_plate_def = None
-    if y_plate_ref is not None:
-        x_plate_def, y_plate_def = _to_fixed(x, y_plate_ref, np.zeros_like(x), np.zeros_like(x))
-    chord_x = np.array([x_top_def[0], x_top_def[-1]], dtype=float)
-    chord_y = np.array([y_top_def[0], y_top_def[-1]], dtype=float)
-    force_origin = (float(0.5 * (chord_x[0] + chord_x[1])), float(0.5 * (chord_y[0] + chord_y[1])))
     force_vector = (float(state.Fx_star), float(state.Fy_star))
 
     plate_state = (
@@ -278,7 +248,6 @@ def build_shape_plot_data(
         else None
     )
     has_plate = plate_state is not None
-    plate_is_schematic = (not has_plate) and (y_plate_ref is not None)
     plate_x_ref = plate_y_ref = None
     plate_x_hermite = plate_y_hermite = None
     plate_color_values = None
@@ -292,7 +261,6 @@ def build_shape_plot_data(
         plate_x_ref, plate_y_ref = _to_fixed(mesh.reference_x, mesh.reference_y, zeros_u + d_ax, zeros_u + d_ay)
         plate_x_hermite = np.asarray(plate_state.sample_x_fixed, dtype=float)
         plate_y_hermite = np.asarray(plate_state.sample_y_fixed, dtype=float)
-        x_plate_def, y_plate_def = plate_x_hermite, plate_y_hermite
         plate_color_values = plate_state.color_values
         plate_color_units = str(plate_state.color_units or "")
         plate_summary = dict(plate_state.summary)
@@ -306,20 +274,14 @@ def build_shape_plot_data(
                 plate_state, tick_length=tick
             )
 
-    render: dict = {}
-    if render_disp is not None:
-        render = _render_fields(model, render_disp, _to_fixed, foam_energy=foam_energy)
-        x, y_top_ref, y_bottom_ref = render["x_top_ref"], render["y_top_ref"], render["y_bottom_ref"]
-        x_top_def, y_top_def = render["x_top_def"], render["y_top_def"]
-        x_bottom_def, y_bottom_def = render["x_bottom_def"], render["y_bottom_def"]
-        y_plate_ref = None
-        if not has_plate:
-            x_plate_def = y_plate_def = None
-        plate_is_schematic = False
-        # phi_ref uses the top selector, whose last node precedes the bottom-owned toe vertex.
-        chord_x = np.array([x_top_def[0], x_top_def[-2]], dtype=float)
-        chord_y = np.array([y_top_def[0], y_top_def[-2]], dtype=float)
-        force_origin = (float(0.5 * (chord_x[0] + chord_x[1])), float(0.5 * (chord_y[0] + chord_y[1])))
+    render = _render_fields(model, render_disp, _to_fixed, foam_energy=foam_energy)
+    x, y_top_ref, y_bottom_ref = render["x_top_ref"], render["y_top_ref"], render["y_bottom_ref"]
+    x_top_def, y_top_def = render["x_top_def"], render["y_top_def"]
+    x_bottom_def, y_bottom_def = render["x_bottom_def"], render["y_bottom_def"]
+    # phi_ref uses the top selector, whose last node precedes the bottom-owned toe vertex.
+    chord_x = np.array([x_top_def[0], x_top_def[-2]], dtype=float)
+    chord_y = np.array([y_top_def[0], y_top_def[-2]], dtype=float)
+    force_origin = (float(0.5 * (chord_x[0] + chord_x[1])), float(0.5 * (chord_y[0] + chord_y[1])))
 
     n_act = int(np.count_nonzero(state.active))
     span = ", ".join(f"{{{p.start}..{p.end}}}" for p in patches) or "none"
@@ -331,15 +293,12 @@ def build_shape_plot_data(
     )
     if has_plate:
         caption += " Plate from the shared plate influence of the coupled FEM operator."
-    elif plate_is_schematic:
-        caption += " Plate drawn rigidly at its reference offset (schematic)."
-    if render:
-        caption += " Foam regions from exact nodal displacements (shared render influence)."
+    caption += " Foam regions from exact nodal displacements (shared render influence)."
 
     return ShapePlotData(
         x_dense=x,
         x_top_ref=x.copy(),
-        x_bottom_ref=render["x_bottom_ref"] if render else x.copy(),
+        x_bottom_ref=render["x_bottom_ref"],
         y_top_ref=y_top_ref,
         y_bottom_ref=y_bottom_ref,
         x_top_def=x_top_def,
@@ -372,10 +331,6 @@ def build_shape_plot_data(
         patches=patches,
         edge_estimate_points=tuple(edges),
         anchor_xy=(float(anchor_fixed[0]), float(anchor_fixed[1])),
-        y_plate_ref=y_plate_ref,
-        x_plate_def=x_plate_def,
-        y_plate_def=y_plate_def,
-        plate_is_schematic=plate_is_schematic,
         has_plate=has_plate,
         plate_x_ref=plate_x_ref,
         plate_y_ref=plate_y_ref,
@@ -394,7 +349,6 @@ def build_shape_plot_data(
         show_undeformed_plate=bool(show_undeformed_plate and has_plate),
         show_plate_nodes=bool(show_plate_nodes and has_plate),
         show_plate_rotations=bool(show_plate_rotations and has_plate),
-        has_render_mesh=bool(render),
         region_ref=render.get("region_ref", {}),
         region_def=render.get("region_def", {}),
         region_materials=render.get("region_materials", {}),
@@ -410,28 +364,21 @@ def build_shape_plot_data(
     )
 
 
-def _outline_index(lookup) -> np.ndarray:
-    """Positions of the two region-loop nodes inside ``render_node_ids``."""
-    from compliance_fem.geometry.render import render_index
-
-    sec = lookup.render_section
-    ids = np.unique(np.concatenate([np.asarray(sec["upper_foam_loop"]), np.asarray(sec["lower_foam_loop"])]))
-    return render_index(lookup, ids.astype(int))
+def _outline_index(model: ContactModel) -> np.ndarray:
+    """Mesh vertices of the two region loops (the drawn foam outline)."""
+    return np.unique(np.concatenate([model.render.upper_foam_loop, model.render.lower_foam_loop])).astype(int)
 
 
-def _render_fields(lookup, disp: tuple[np.ndarray, np.ndarray], to_fixed, *, foam_energy: bool = False) -> dict:
+def _render_fields(model: ContactModel, disp: tuple[np.ndarray, np.ndarray], to_fixed, *, foam_energy: bool = False) -> dict:
     """Fixed-frame curves and region loops of the measured sole (nodal, no interpolation)."""
-    from compliance_fem.geometry.render import element_strain_energy_density, render_index
-
-    sec = lookup.render_section
+    sec = model.render
     u_r, v_r = disp
-    pts = np.asarray(sec["mesh_points"], dtype=float)
+    pts = sec.mesh_points
 
     def _fixed(name: str):
-        ids = np.asarray(sec[name], dtype=int)
-        k = render_index(lookup, ids)
+        ids = np.asarray(getattr(sec, name), dtype=int)
         x0, y0 = pts[0, ids], pts[1, ids]
-        return (x0, y0), to_fixed(x0, y0, u_r[k], v_r[k])
+        return (x0, y0), to_fixed(x0, y0, u_r[ids], v_r[ids])
 
     out: dict = {}
     (xt, yt), (xtd, ytd) = _fixed("top_curve_node_ids")
@@ -449,15 +396,14 @@ def _render_fields(lookup, disp: tuple[np.ndarray, np.ndarray], to_fixed, *, foa
         region_def[name] = (np.append(dfm[0], dfm[0][0]), np.append(dfm[1], dfm[1][0]))
     out["region_ref"] = region_ref
     out["region_def"] = region_def
-    meta = getattr(lookup, "geometry_metadata", {}) or {}
+    meta = model.geometry_metadata
     out["region_materials"] = {
         "upper_foam": str(meta.get("upper_foam_material", "")),
         "lower_foam": str(meta.get("lower_foam_material", "")),
     }
     out["toe_marker_xy"] = (float(xtd[-1]), float(ytd[-1]))
     if foam_energy:
-        out["foam_triangles"] = np.asarray(sec["mesh_triangles"], dtype=int)
-        k_all = render_index(lookup, np.arange(pts.shape[1]))
-        out["foam_x_def"], out["foam_y_def"] = to_fixed(pts[0], pts[1], u_r[k_all], v_r[k_all])
-        out["foam_energy_density"] = element_strain_energy_density(lookup, u_r[k_all], v_r[k_all])
+        out["foam_triangles"] = sec.mesh_triangles
+        out["foam_x_def"], out["foam_y_def"] = to_fixed(pts[0], pts[1], u_r, v_r)
+        out["foam_energy_density"] = sec.strain_energy_density(u_r, v_r)
     return out

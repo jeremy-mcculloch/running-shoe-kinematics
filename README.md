@@ -21,15 +21,10 @@ weak form assembled with scikit-fem. Natural (zero-traction) conditions are
 imposed on the unloaded boundaries while the global stiffness matrix \(\mathbf K\)
 is assembled **without** displacement boundary conditions.
 
-## Nodal-force vs nodal-traction compliance
+## Nodal-force compliance
 
-Two related operators are computed:
-
-| Symbol | Meaning |
-|--------|---------|
-| \(\mathbf C^{F}_{ab}\) | \(2n_a\times 2n_b\) nodal-force operator, component-major \([u;v]\) / \([f_x;f_y]\) |
-| \(\mathbf C^{q,yy}\) | Vertical traction map from the \(yy\) block of \(\mathbf C^F\) times the 1D boundary mass |
-
+The FEM stage computes the \(2n_a\times 2n_b\) nodal-force operators
+\(\mathbf C^{F}_{ab}\) (component-major \([u;v]\) / \([f_x;f_y]\)).
 Boundary vectors are ordered **component-major**, nodes sorted by increasing \(x\):
 
 \[
@@ -38,13 +33,9 @@ F_\Gamma=\begin{bmatrix}f_{\Gamma,x}\\ f_{\Gamma,y}\end{bmatrix},\qquad
 \texttt{dof\_ordering}=\texttt{component\_major\_uv}.
 \]
 
-**The contact lookup uses only the stacked nodal-force matrices** \(\mathbf C^{F}_{tt}\),
+**The contact lookup uses the stacked nodal-force matrices** \(\mathbf C^{F}_{tt}\),
 \(\mathbf C^{F}_{tb}\), \(\mathbf C^{F}_{bt}\), \(\mathbf C^{F}_{bb}\) (each \(2n\times 2n\)).
 Old vertical-only \(n\times n\) compliance files must be regenerated; there is no silent fallback.
-
-Here \(\mathbf M_t\) and \(\mathbf M_b\) are consistent 1D boundary mass matrices
-on the top and bottom edges (vertical DOFs). If \(\mathbf q_t\) holds nodal
-vertical traction samples, then \(\mathbf F_{t,y} = \mathbf M_t \mathbf q_t\).
 
 ## Rigid-body gauge
 
@@ -105,7 +96,7 @@ Disconnected contact patches are reported separately; a derived contact-edge
 estimate is display only. Full formulation, tolerances, storage, complexity,
 validation and limitations: [docs/continuous_contact.md](docs/continuous_contact.md).
 
-The model file `contact_lookup.npz` has `schema_version` **13** (shared
+The model file `contact_lookup.npz` has `schema_version` **17** (shared
 operators, plate influence, render section, metadata). Files with any other
 schema version are **rejected** with a regenerate message.
 
@@ -200,7 +191,7 @@ streamlit run src/compliance_fem/gui/app.py
 python scripts/validate_continuous_contact.py configs/setup.json
 ```
 
-Outputs in `lookup.output_dir`: `contact_lookup.npz` (schema 13),
+Outputs in `lookup.output_dir`: `contact_lookup.npz` (schema 17),
 `measured_sole_config.json` and `generation_summary.json` (operator symmetry
 and eigenvalue checks, build time, file size, fingerprint).
 
@@ -259,7 +250,7 @@ compliance-fem-contact-lookup configs/setup.json --save-fem
 
 To change a parameter, edit the config (or copy it); there are no
 per-parameter override flags. The contact model is written to `lookup.output_dir`
-(default `outputs/contact_lookup`). If that directory already holds a schema-13
+(default `outputs/contact_lookup`). If that directory already holds a schema-17
 model with the same fingerprint the build is skipped; `--force` rebuilds it.
 
 ```python
@@ -279,14 +270,14 @@ must be regenerated.
 
 `--save-fem` also writes the FEM artifacts to `<output_dir>/fem/`:
 
-- `compliance_results.npz` — compliance blocks, mass matrices, coordinates, errors
+- `compliance_results.npz` — compliance blocks, boundary / plate node ids and coordinates, errors
 - `mesh.msh`, `mesh.vtk` — mesh for ParaView
 - `Cbt_force_heatmap.png`, `Cbb_force_heatmap.png`
 - `fem_summary.json` — residual and reciprocity checks
 
-The NPZ stores the `SoleConfig` settings under their field names, plate metadata, and
-`x_plate` / `y_plate` / `y_top` for plotting. The GUI uses those arrays when
-present.
+The NPZ (`compliance_schema_version = 7`) also stores the `SoleConfig` settings under
+their field names, the materials and the geometry metadata. It is a diagnostic dump;
+nothing in the package reads it back.
 
 ## Public interface
 
@@ -301,7 +292,13 @@ Everything a user runs is listed here; all other modules (the rest of `contact`,
 - `compliance_fem.contact.model_setup` — `load_model_setup`, `save_model_setup`, `ensure_lookup_exists`
   (the build command's Python equivalent), `lookup_matches_setup`, `matching_prebuilt_lookup`, `stored_lookup_fingerprint`
 - `compliance_fem.viscoelasticity` — `create_material` and the material configs
-- `compliance_fem` — `SoleConfig`, `compute_compliance`, `ComplianceResult`
+- `compliance_fem` — `SoleConfig`, `compute_compliance`, `ComplianceResult`. A `ComplianceResult`
+  holds the four nodal-force blocks (`Ctt_force`, `Ctb_force`, `Cbt_force`, `Cbb_force`), the
+  `config`, the `mesh_data`, the FEM objects (`basis`, `K`, `factorization`,
+  `plate_inextensibility_constraint`, `n_plate_rotation_dofs`) and the residual diagnostics.
+  Node ids and coordinates (`top_node_ids`, `x_top`, `x_plate`, ...), DOF indices
+  (`selector_dofs`, `node_dofs`, `plate_*_dof_ids`), sizes (`n_primal`, `n_lambda`) and
+  `geometry_metadata` are properties derived from `mesh_data` and `basis`.
 
 ## Tests
 
@@ -325,18 +322,17 @@ src/compliance_fem/
     plate_response.py     Plate influence matrices, Hermite postprocess, runtime state
     constraints.py        Exact plate inextensibility rows B_p
     rigid_modes.py        Rigid-body modes and verification
-    boundaries.py         Boundary selectors and mass matrices
+    boundaries.py         Boundary selectors and rigid-mode rows
     compliance.py         Saddle-point solves and compliance blocks
   contact/
     sole_config.py        SoleConfig and foam materials
     model_setup.py        ModelSetup JSON config: parse, fingerprint, build/reuse the contact model
-    compliance_blocks.py  Nodal-force compliance blocks: extraction, reciprocity check, symmetrization
-    contact_operator.py   Top-clamped bottom operators G_bb etc. (shared, condensed once)
+    contact_operator.py   Top-clamped bottom operators db_fb etc. (reciprocity check, symmetrization, condensed once)
     active_set.py         Warm-started primal-dual active-set solver for the contact LCP
     continuous_contact.py One-pose contact solve, signs, diagnostics, patches
     continuous_toe.py     Exact passive toe spring coupled to the contact solve
     out_of_plane.py       2.5D out-of-plane tangent stiffness (lateral, roll, yaw)
-    contact_model.py      ContactModel: build, schema-13 storage, full-field / plate recovery
+    contact_model.py      ContactModel: build, schema-17 storage, full-field / plate recovery
     corotation.py         Frame math: phi_ref, rotations, fixed-frame transform
     basis.py              Softplus top shape mode
     toe_spring.py         Spring law, rearfoot geometry and toe mode, toe moment

@@ -38,7 +38,7 @@ WIDTH = 0.1
 
 def _H(model, varphi: float, mu: float = 0.0) -> np.ndarray:
     c, s = np.cos(varphi), np.sin(varphi)
-    return _normal_operator(model.operator, c, s, c * mu + s, -s * mu + c)
+    return _normal_operator(model.contact_operator, c, s, c * mu + s, -s * mu + c)
 
 
 def _assert_admissible(sol, rel: float = 1e-8) -> None:
@@ -64,11 +64,11 @@ POSES = [
 
 # 1, 3. Operator shape, symmetry and definiteness.
 def test_gap_operator_dimensions_symmetry_and_definiteness(rocker_model) -> None:
-    op = rocker_model.operator
+    op = rocker_model.contact_operator
     n = op.n_bottom
-    assert op.G_bb.shape == (2 * n, 2 * n)
-    assert op.G_symmetry_error < 1e-10
-    assert op.G_min_eigenvalue > 0.0
+    assert op.db_fb.shape == (2 * n, 2 * n)
+    assert rocker_model.metadata["G_symmetry_error"] < 1e-10
+    assert rocker_model.metadata["G_min_eigenvalue"] > 0.0
     for varphi in (0.0, 0.07, -0.1):
         H = _H(rocker_model, varphi)
         assert H.shape == (n, n)
@@ -84,7 +84,7 @@ def test_gap_operator_dimensions_symmetry_and_definiteness(rocker_model) -> None
 @pytest.mark.parametrize("varphi", [0.0, np.deg2rad(5.0)])
 def test_gap_operator_matches_direct_fem(rocker_case, varphi: float) -> None:
     fem, model = rocker_case
-    op = model.operator
+    op = model.contact_operator
     n = op.n_bottom
     c, s = np.cos(varphi), np.sin(varphi)
     H = _H(model, varphi)
@@ -102,7 +102,7 @@ def test_gap_operator_matches_direct_fem(rocker_case, varphi: float) -> None:
 def test_contact_solution_is_admissible(request, sole, pose) -> None:
     model = request.getfixturevalue(sole)
     varphi, alpha, F = pose
-    sol = solve_contact_state(model.operator, varphi, alpha, np.array(F))
+    sol = solve_contact_state(model.contact_operator, varphi, alpha, np.array(F))
     _assert_admissible(sol)
     assert sol.diagnostics["admissible"]
 
@@ -111,7 +111,7 @@ def test_contact_solution_is_admissible(request, sole, pose) -> None:
 @pytest.mark.parametrize("pose", POSES)
 def test_global_force_and_moment_equilibrium(rocker_model, pose) -> None:
     varphi, alpha, F = pose
-    sol = solve_contact_state(rocker_model.operator, varphi, alpha, np.array(F))
+    sol = solve_contact_state(rocker_model.contact_operator, varphi, alpha, np.array(F))
     d = sol.diagnostics
     Fs = float(np.hypot(*F))
     assert d["force_residual"] < 1e-10 * Fs
@@ -125,19 +125,18 @@ def test_global_force_and_moment_equilibrium(rocker_model, pose) -> None:
 # 11-12. Reconstructed displacement and plate response agree with direct FEM.
 def test_full_field_and_plate_match_direct_fem(rocker_case) -> None:
     fem, model = rocker_case
-    sol = solve_contact_state(model.operator, np.deg2rad(2.0), 0.15, np.array([200.0, -3000.0]))
+    sol = solve_contact_state(model.contact_operator, np.deg2rad(2.0), 0.15, np.array([200.0, -3000.0]))
     ref = solve_top_clamped(fem, sol.d_t, sol.f_b)
     assert relative_error(sol.d_b, ref.bottom_displacement) < 1e-9
     assert relative_error(sol.F_t, ref.top_force) < 1e-9
-    nd = fem.basis.nodal_dofs
-    ids = np.asarray(model.render_section["render_node_ids"])
+    u_dofs, v_dofs = fem.node_dofs(np.arange(model.render.n_vertices))
     u, v = render_vertex_displacements(model, sol)
-    assert relative_error(np.concatenate([u, v]), np.concatenate([ref.u[nd[0, ids]], ref.u[nd[1, ids]]])) < 1e-9
-    pf, pm = plate_fields(model, sol), model.plate_mesh
-    assert relative_error(pf["u"], ref.u[pm.u_dof_ids]) < 1e-9
-    assert relative_error(pf["v"], ref.u[pm.v_dof_ids]) < 1e-9
-    assert relative_error(pf["theta"], ref.u[pm.rotation_dof_ids]) < 1e-9
-    assert relative_error(pf["lam"], ref.multipliers[: pf["lam"].size]) < 1e-8
+    assert relative_error(np.concatenate([u, v]), np.concatenate([ref.u[u_dofs], ref.u[v_dofs]])) < 1e-9
+    pf = plate_fields(model, sol)
+    assert relative_error(pf["u"], ref.u[fem.plate_u_dof_ids]) < 1e-9
+    assert relative_error(pf["v"], ref.u[fem.plate_v_dof_ids]) < 1e-9
+    assert relative_error(pf["theta"], ref.u[fem.plate_rotation_dof_ids]) < 1e-9
+    assert relative_error(pf["plate_tension"], ref.multipliers[: pf["plate_tension"].size]) < 1e-8
 
 
 # --- one-node transitions -------------------------------------------------------------
@@ -166,7 +165,7 @@ def _one_node_bracket(fn, grid):
 
 @pytest.fixture(scope="module")
 def entering(rocker_model):
-    op = rocker_model.operator
+    op = rocker_model.contact_operator
 
     def fn(Fy):
         return solve_contact_state(op, 0.0, 0.0, np.array([0.1 * abs(Fy), Fy]))
@@ -178,7 +177,7 @@ def entering(rocker_model):
 
 @pytest.fixture(scope="module")
 def leaving(rocker_model):
-    op = rocker_model.operator
+    op = rocker_model.contact_operator
 
     def fn(varphi):
         return solve_contact_state(op, varphi, 0.05, np.array([150.0, -3000.0]))
@@ -193,7 +192,7 @@ def leaving(rocker_model):
 # 13. A node enters contact with approximately zero reaction.
 def test_node_enters_with_zero_reaction(rocker_model, entering) -> None:
     left, right, node = entering
-    h = rocker_model.operator.h_mesh
+    h = rocker_model.contact_operator.h_mesh
     assert not left.active[node] and right.active[node]
     assert right.lam[node] <= 1e-6 * right.lam.max()
     assert 0.0 <= left.gap[node] <= 1e-8 * h
@@ -202,7 +201,7 @@ def test_node_enters_with_zero_reaction(rocker_model, entering) -> None:
 # 14. A node leaves contact when its reaction reaches zero.
 def test_node_leaves_with_zero_reaction(rocker_model, leaving) -> None:
     left, right, node = leaving
-    h = rocker_model.operator.h_mesh
+    h = rocker_model.contact_operator.h_mesh
     on, off = (left, right) if left.active[node] else (right, left)
     assert on.lam[node] <= 1e-6 * on.lam.max()
     assert 0.0 <= off.gap[node] <= 1e-8 * h
@@ -210,7 +209,7 @@ def test_node_leaves_with_zero_reaction(rocker_model, leaving) -> None:
 
 def _plate_vec(model, sol):
     pf = plate_fields(model, sol)
-    return np.concatenate([pf["u"], pf["v"], pf["theta"], pf["lam"]])
+    return np.concatenate([pf["u"], pf["v"], pf["theta"], pf["plate_tension"]])
 
 
 # 15-19. Force, moment, displacement, plate and COP are continuous at one-node transitions.
@@ -232,7 +231,7 @@ def test_physical_outputs_continuous_across_transition(request, rocker_model, wh
 # 20. The derivative may change at a transition (the entering reaction grows from zero).
 def test_derivative_change_is_permitted(rocker_model, entering) -> None:
     left, right, node = entering
-    op = rocker_model.operator
+    op = rocker_model.contact_operator
     h = 1e-3 * abs(right.F_star[1])
 
     def lam_node(Fy):
@@ -246,7 +245,7 @@ def test_derivative_change_is_permitted(rocker_model, entering) -> None:
 
 # 21-22. Warm, cold and arbitrary initial active sets give the same solution.
 def test_warm_cold_and_random_starts_agree(rocker_model) -> None:
-    op = rocker_model.operator
+    op = rocker_model.contact_operator
     rng = np.random.default_rng(3)
     for varphi, alpha, F in POSES:
         cold = solve_contact_state(op, varphi, alpha, np.array(F))
@@ -289,7 +288,7 @@ def test_patch_reporting() -> None:
 
 
 def test_two_low_regions_give_two_patches(rocker_model) -> None:
-    op = rocker_model.operator
+    op = rocker_model.contact_operator
     n = op.n_bottom
     H = _H(rocker_model, 0.0)
     x = op.x_bottom / op.L
@@ -302,7 +301,7 @@ def test_two_low_regions_give_two_patches(rocker_model) -> None:
 
 
 def test_single_patch_state_reports_one_interval(rocker_model) -> None:
-    sol = solve_contact_state(rocker_model.operator, 0.0, 0.0, np.array([0.0, -2000.0]))
+    sol = solve_contact_state(rocker_model.contact_operator, 0.0, 0.0, np.array([0.0, -2000.0]))
     d = sol.diagnostics
     assert d["n_patches"] == 1 and not d["disconnected_contact"]
     p = d["patches"][0]
@@ -312,7 +311,7 @@ def test_single_patch_state_reports_one_interval(rocker_model) -> None:
 
 # 26. The interpolated contact edge is a reporting quantity only.
 def test_edge_estimate_is_reporting_only(rocker_model) -> None:
-    op = rocker_model.operator
+    op = rocker_model.contact_operator
     sol = solve_contact_state(op, 0.0, 0.0, np.array([0.0, -2000.0]))
     p = sol.diagnostics["patches"][0]
     x = op.x_bottom
@@ -328,7 +327,7 @@ def test_edge_estimate_is_reporting_only(rocker_model) -> None:
 # 27-29. Exact passive toe spring coupled to contact.
 @pytest.mark.parametrize("F,phi", [((150.0, -1500.0), 0.05), ((300.0, -6000.0), -0.05), ((0.0, -3000.0), 0.0)])
 def test_passive_toe_spring_is_exact_and_coupled(rocker_model, F, phi) -> None:
-    op = rocker_model.operator
+    op = rocker_model.contact_operator
     cfg = ToeSpringConfig()
     F_m = np.asarray(F) / WIDTH
     fr = solve_toe_contact(op, F_m, phi, cfg, WIDTH)
@@ -352,7 +351,7 @@ def test_passive_toe_spring_is_exact_and_coupled(rocker_model, F, phi) -> None:
 
 
 def test_warm_toe_continuation_matches_cold(rocker_model) -> None:
-    op = rocker_model.operator
+    op = rocker_model.contact_operator
     cfg = ToeSpringConfig()
     F = np.array([300.0, -6000.0]) / WIDTH
     cold = solve_toe_contact(op, F, -0.05, cfg, WIDTH)
@@ -396,8 +395,8 @@ def test_online_cost_scales_with_active_set_not_intervals(rocker_model, monkeypa
         return original(self, idx)
 
     monkeypatch.setattr(active_set_module.ActiveBlockSolver, "_factor", counting)
-    n = rocker_model.operator.n_bottom
-    sol = solve_contact_state(rocker_model.operator, 0.0, 0.0, np.array([0.0, -3000.0]))
+    n = rocker_model.contact_operator.n_bottom
+    sol = solve_contact_state(rocker_model.contact_operator, 0.0, 0.0, np.array([0.0, -3000.0]))
     assert len(calls) == sol.lcp.iterations <= 10 < n * (n + 1) // 2
     assert max(calls) <= n
 
@@ -406,12 +405,12 @@ def test_online_cost_scales_with_active_set_not_intervals(rocker_model, monkeypa
 def test_serialization_round_trip(rocker_model, tmp_path) -> None:
     path = save_contact_model(rocker_model, tmp_path)
     loaded = load_contact_model(tmp_path)
-    for f in dataclasses.fields(rocker_model.operator):
-        a, b = getattr(rocker_model.operator, f.name), getattr(loaded.operator, f.name)
+    for f in dataclasses.fields(rocker_model.contact_operator):
+        a, b = getattr(rocker_model.contact_operator, f.name), getattr(loaded.contact_operator, f.name)
         if isinstance(a, np.ndarray):
             np.testing.assert_array_equal(a, b)
-    s1 = solve_contact_state(rocker_model.operator, 0.03, 0.1, np.array([100.0, -2500.0]))
-    s2 = solve_contact_state(loaded.operator, 0.03, 0.1, np.array([100.0, -2500.0]))
+    s1 = solve_contact_state(rocker_model.contact_operator, 0.03, 0.1, np.array([100.0, -2500.0]))
+    s2 = solve_contact_state(loaded.contact_operator, 0.03, 0.1, np.array([100.0, -2500.0]))
     np.testing.assert_array_equal(s1.lam, s2.lam)
     # Stored arrays are bitwise identical; matrix products may differ in summation order only.
     np.testing.assert_allclose(plate_fields(rocker_model, s1)["v"], plate_fields(loaded, s2)["v"], rtol=1e-13)
@@ -421,9 +420,9 @@ def test_serialization_round_trip(rocker_model, tmp_path) -> None:
 def test_old_schema_rejected_with_regeneration_message(rocker_model, tmp_path) -> None:
     save_contact_model(rocker_model, tmp_path)
     data = dict(np.load(tmp_path / "contact_lookup.npz", allow_pickle=True))
-    data["schema_version"] = np.asarray(12)
+    data["schema_version"] = np.asarray(16)
     np.savez_compressed(tmp_path / "contact_lookup.npz", **data)
-    with pytest.raises(ValueError, match=r"schema_version=13.*--force.*found schema_version=12"):
+    with pytest.raises(ValueError, match=r"schema_version=17.*--force.*found schema_version=16"):
         load_contact_model(tmp_path)
 
 
@@ -431,7 +430,7 @@ def test_old_schema_rejected_with_regeneration_message(rocker_model, tmp_path) -
 def test_plotting_handles_zero_one_and_two_patches(rocker_model) -> None:
     from compliance_fem.gui.app import _draw_shape, _profile_figure
 
-    op = rocker_model.operator
+    op = rocker_model.contact_operator
     none = solve_contact_state(op, 0.0, 0.0, np.array([0.0, 0.0]))
     one = solve_contact_state(op, 0.0, 0.0, np.array([0.0, -2000.0]))
     two = dataclasses.replace(one, active=one.active.copy(), lam=one.lam.copy())
@@ -452,7 +451,7 @@ def test_plotting_handles_zero_one_and_two_patches(rocker_model) -> None:
 
 
 def test_no_load_state_touches_without_reaction(rocker_model) -> None:
-    sol = solve_contact_state(rocker_model.operator, 0.02, 0.1, np.array([0.0, 0.0]))
+    sol = solve_contact_state(rocker_model.contact_operator, 0.02, 0.1, np.array([0.0, 0.0]))
     assert not sol.active.any() and np.all(sol.lam == 0.0)
     assert sol.gap.min() == pytest.approx(0.0, abs=1e-15)
 

@@ -59,26 +59,26 @@ shear traction is distributed like the pressure.
 Given local bottom nodal forces `f_b` (component-major `[f_x…; f_y…]`), the
 top-clamped body response is unique (the clamp removes the rigid modes):
 
-    d_b = α d_α + G_bb f_b,     F_t = α f_α + P_tb f_b,     a = α a_α + A_rb f_b,
+    d_b = α db_toe + db_fb f_b,     F_t = α ft_toe + ft_fb f_b,     a = α r_toe + r_fb f_b,
 
 with `R_t^T F_t + R_b^T f_b = 0` built in. They are condensed once from the
 stored nodal-force compliance blocks by LU-factoring the small
 `(2 n_t + 3)` matrix `[[C_tt, R_t], [R_t^T, 0]]` (no FEM solve, no explicit
-inverse). `G_bb` is the top-clamped bottom compliance; it is symmetric
+inverse). `db_fb` is the top-clamped bottom compliance; it is symmetric
 (roundoff `G_symmetry_error ≈ 1e-12`, then symmetrized) and positive definite
-(`G_min_eigenvalue > 0`, both recorded in the model metadata). `a` are the
+(`G_min_eigenvalue > 0`, both recorded in the model metadata, not on the operator). `a` are the
 rigid amplitudes about `(x_r, y_r)` that the plate and render influence
 matrices use.
 
 With `B = [(c μ + s) I; (c − s μ) I]` (local components of the unit ground
 force) and `N = [s I, c I]` (ground-normal component of a local displacement),
 
-    g = q + T_y 1 + H λ,     q = s(x + α d_α,x) + c(y + α d_α,y),     H = N G_bb B.
+    g = q + T_y 1 + H λ,     q = s(x + α db_toe,x) + c(y + α db_toe,y),     H = N db_fb B.
 
-`H` is symmetric positive definite for `μ_eff = 0` (`H = N G_bb Nᵀ`); for
+`H` is symmetric positive definite for `μ_eff = 0` (`H = N db_fb Nᵀ`); for
 `μ_eff ≠ 0` it is nonsymmetric with a positive definite symmetric part, i.e. a
 P-matrix for moderate shear ratios. `H` costs `O(N_b²)` to form per evaluation
-from the four component blocks of `G_bb`.
+from the four component blocks of `db_fb`.
 
 ## Complementarity problem
 
@@ -120,7 +120,7 @@ Unchanged physics: `k_toe = 25 N·m/rad`, `θ0 = 0`, `α = tan θ` exactly,
 
     g(θ) = Q_α,shoe→foot(α) − k (arctan α − θ0)/(1 + α²) = 0,
     Q_α,shoe→foot = width · (−ψᵀ f_t,y),
-    varphi(α) = φ_rearfoot − atan2(dy_mtp + α φ₁(x_mtp), L − ℓ_toe).
+    varphi(α) = φ_rearfoot − atan2(y_mtp_0 + α y_mtp_shape_mode, L − ℓ_toe).
 
 Nested exact scalar solve: every residual evaluation solves the contact
 problem to convergence at `varphi(α)` (warm-started from the nearest evaluated
@@ -193,14 +193,29 @@ Scale-aware, resolved per solve with `h` the median bottom node spacing and
 Values within tolerance may be reported as numerical zero; significant
 penetration or tension is never clipped (it fails `admissible`).
 
-## Storage (`contact_lookup.npz`, `schema_version = 13`)
+## Storage (`contact_lookup.npz`, `schema_version = 17`)
 
-`contact_operator_*` arrays (`x_top`, `y_top`, `x_bottom`, `y_bottom`,
-`w_alpha`, `G_bb`, `d_alpha`, `P_tb`, `f_alpha`, `A_rb`, `a_alpha`, `psi_top`)
-and scalars (`L`, `H`, toe length, `kappa`, `phi_ref`, `x_r`, `y_r`, `h_mesh`,
-rearfoot geometry, `G` diagnostics); the plate mesh and `plate_influence_*`
-matrices; the render section (mesh, per-element `E`, `ν`, render influence for
-every vertex); `metadata_json` (formulation, tangential law, fingerprint).
+Three sections, each written and read by its own class, plus two JSON blobs:
+
+- `contact_operator_*` (`ContactOperator`): arrays `x_top`, `y_top`, `x_bottom`,
+  `y_bottom`, `shape_mode_toe_bend`, `db_fb`, `db_toe`, `ft_fb`, `ft_toe`, `r_fb`,
+  `r_toe`, `toe_shape_mode_flat_rearfoot` and scalars `L`, `H`, toe length, `kappa`,
+  `phi_ref`, `x_r`, `y_r`, `h_mesh`, `rearfoot_y_mtp_shape_mode`, `rearfoot_y_mtp_0`.
+- `render_*` (`RenderSection`): mesh points / triangles / element regions,
+  per-element `E` and `ν`, the boundary and region-loop node ids, and the
+  displacement influence of **every** mesh vertex (`influence_loads`,
+  `influence_rigid`; rows `[u...; v...]` in vertex order).
+- `plate_*` (`PlateResponse`): plate `node_ids`, `EI_plate_Nm2_per_m`, rotation
+  `theta`, element axial force `plate_tension` (positive = tension) and the
+  inextensibility residual `inextensibility_residual`, each per unit boundary load,
+  with `rigid_*` counterparts per unit rigid amplitude. The plate reference
+  coordinates are the render mesh points at `node_ids`, the element frames come
+  from `fem.plate.plate_element_frames`, and the plate nodal `u, v` are the
+  plate-node rows of the render influence, so none of them is stored twice.
+- `metadata_json` (formulation, tangential law, the operator build diagnostics
+  `reciprocity_error`, `G_symmetry_error`, `G_min_eigenvalue`, `G_max_eigenvalue`,
+  `clamp_condition`, the bottom foam Poisson ratio, the setup and its fingerprint)
+  and `geometry_metadata_json`.
 Files with any other schema (e.g. the schema-12 interval tables) are rejected
 with a regeneration message. At the 3 mm measured mesh (`N_b = 126`) the build
 takes ~1.5 s after the FEM solve and the file is 19.4 MB (mostly the render

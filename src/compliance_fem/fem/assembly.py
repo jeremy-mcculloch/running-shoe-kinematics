@@ -38,7 +38,7 @@ def plane_strain_moduli(E: float | np.ndarray, nu: float) -> tuple[np.ndarray | 
     return lam, G
 
 
-def spatially_varying_plane_strain(E_heel: float, E_toe: float, L: float, nu: float):
+def bilinear_form_foam(E_heel: float, E_toe: float, L: float, nu: float):
     """Bilinear form with E(x) evaluated at quadrature coordinates."""
 
     @BilinearForm
@@ -58,31 +58,32 @@ def assemble_region_foam_stiffness(
     L: float,
     order: int = 1,
 ) -> tuple[sparse.csc_matrix, Basis, dict[str, sparse.csc_matrix]]:
-    """Plane-strain ``K = sum_r K_r``, each region with its own material.
-
-    ``region_materials[name]`` is a :class:`compliance_fem.contact.sole_config.FoamMaterial`;
-    its modulus ``E(x)`` is evaluated at quadrature points (constant unless the
-    material is graded heel to toe). Every element must belong to exactly one region.
-    """
+    """Compute the stiffness matrix corresponding to the foam. To do this we sum the stiffness matrices of each region, 
+    which are computed with the appropriate material properties."""
+    
     element = _vector_element(mesh, order)
     basis = Basis(mesh, element)
     n_el = int(mesh.t.shape[1])
+
+    # Verify that every element belongs to exactly one region.
     owner = np.full(n_el, -1, dtype=int)
-    for k, name in enumerate(region_elements):
-        idx = np.asarray(region_elements[name], dtype=int)
-        if np.any(owner[idx] >= 0):
-            raise ValueError(f"Elements are assigned to more than one foam region ({name}).")
-        owner[idx] = k
+    for k, region_name in enumerate(region_elements):
+        region_idx = np.asarray(region_elements[region_name], dtype=int)
+        if np.any(owner[region_idx] >= 0):
+            raise ValueError(f"Elements are assigned to more than one foam region ({region_name}).")
+        owner[region_idx] = k
     if np.any(owner < 0):
         raise ValueError(f"{int(np.count_nonzero(owner < 0))} elements belong to no foam region.")
-    blocks: dict[str, sparse.csc_matrix] = {}
+    
+    # Build the stiffness matrix for each region and sum them. The result is symmetric by construction.
+    K_by_region: dict[str, sparse.csc_matrix] = {}
     K: sparse.csc_matrix | None = None
-    for name, idx in region_elements.items():
-        mat = region_materials[name]
-        sub = Basis(mesh, element, elements=np.asarray(idx, dtype=int))
-        K_r = spatially_varying_plane_strain(mat.E_heel, mat.E_toe, L, mat.nu).assemble(sub).tocsc()
-        blocks[name] = K_r
+    for region_name, region_idx in region_elements.items():
+        mat = region_materials[region_name] # Get region material properties (E_heel, E_toe, nu)
+        region_basis = Basis(mesh, element, elements=np.asarray(region_idx, dtype=int)) # Create a sub-basis for the region
+        K_r = bilinear_form_foam(mat.E_heel, mat.E_toe, L, mat.nu).assemble(region_basis).tocsc()
+        K_by_region[region_name] = K_r
         K = K_r if K is None else K + K_r
     if K is None:
         raise ValueError("region_elements must name at least one foam region.")
-    return K.tocsc(), basis, blocks
+    return K.tocsc(), basis, K_by_region

@@ -42,19 +42,20 @@ from compliance_fem.contact.contact_model import build_contact_model, plate_fiel
 from compliance_fem.contact.continuous_contact import solve_contact_state  # noqa: E402
 from compliance_fem.contact.continuous_toe import solve_toe_contact  # noqa: E402
 from compliance_fem.contact.model_setup import load_model_setup  # noqa: E402
-from compliance_fem.fem.compliance import compute_compliance  # noqa: E402
+from compliance_fem.fem.compliance import ComplianceResult, compute_compliance  # noqa: E402
 from compliance_fem.gait.replay import replay_stance  # noqa: E402
 
 
 class DirectFEM:
     """Sparse FEM with the top selector clamped; factorized once, then one solve per state."""
 
-    def __init__(self, fem) -> None:
+    def __init__(self, fem: ComplianceResult) -> None:
         K = fem.K.tocsc()
         self.n_q = int(fem.n_primal)
         self.u_top, self.v_top = fem.selector_dofs("top")
         self.u_bot, self.v_bot = fem.selector_dofs("bottom")
-        B = fem.B_p.tocsc()
+        self.plate_dofs = np.concatenate([fem.plate_u_dof_ids, fem.plate_v_dof_ids, fem.plate_rotation_dof_ids])
+        B = fem.plate_inextensibility_constraint.tocsc()
         n_l = B.shape[0]
         A = sparse.csc_matrix(sparse.bmat([[K, B.T], [B, None]], format="csc"))
         n = A.shape[0]
@@ -91,19 +92,19 @@ def rel(a, b) -> float:
 
 def direct_check(direct: DirectFEM, model, sol) -> dict:
     ref = direct.solve(sol.d_t, sol.f_b)
-    op = model.operator
+    op = model.contact_operator
     n = op.n_bottom
     c, s = np.cos(sol.varphi), np.sin(sol.varphi)
     u, v = ref["bottom"][:n], ref["bottom"][n:]
     gap = sol.T[1] + s * (op.x_bottom + u) + c * (op.y_bottom + v)
-    pf, pm = plate_fields(model, sol), model.plate_mesh
+    pf = plate_fields(model, sol)
     lam_scale = max(float(sol.lam.max()), 1.0)
     return {
         "bottom_displacement_rel_error": rel(sol.d_b, ref["bottom"]),
         "top_force_rel_error": rel(sol.F_t, ref["top_force"]),
         "plate_rel_error": rel(
             np.concatenate([pf["u"], pf["v"], pf["theta"]]),
-            np.concatenate([ref["u"][pm.u_dof_ids], ref["u"][pm.v_dof_ids], ref["u"][pm.rotation_dof_ids]]),
+            ref["u"][direct.plate_dofs],
         ),
         "direct_min_gap_over_h": float(gap.min() / op.h_mesh),
         "direct_max_active_gap_over_h": float(np.max(np.abs(gap[sol.active])) / op.h_mesh) if sol.active.any() else 0.0,
@@ -113,7 +114,7 @@ def direct_check(direct: DirectFEM, model, sol) -> dict:
 
 def sweep(model, direct, params, solve_fn: Callable[[float, Any], Any], label: str):
     """Solve along ``params``; return per-step scalars, transitions and the direct-FEM check summary."""
-    op = model.operator
+    op = model.contact_operator
     rows, checks, states = [], [], []
     prev = None
     t_solve = 0.0
@@ -242,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     model = build_contact_model(fem, toe_length=setup.toe_length_m, kappa=setup.softplus_kappa,
                                 reciprocity_tol=setup.lookup.reciprocity_tol)
     direct = DirectFEM(fem)
-    op = model.operator
+    op = model.contact_operator
     width = float(setup.runtime.shoe_width_m)
     toe_cfg = setup.toe_spring
     summary: dict = {"config": str(Path(args.config).resolve()), "n_bottom_nodes": op.n_bottom,
@@ -312,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
                      "cop": d["cop_fixed_x"], "theta": fr.theta_deg, "n_active": d["n_active"],
                      "first": d["first_active"], "last": d["last_active"], "n_patches": d["n_patches"],
                      "min_gap": d["min_gap"], "min_reaction": d["min_reaction"],
-                     "plate_v_mid": float(plate_fields(model, fr.contact)["v"][len(model.plate_mesh.node_ids) // 2]),
+                     "plate_v_mid": float(plate_fields(model, fr.contact)["v"][model.plate.n_nodes // 2]),
                      "active": fr.contact.active})
     act = np.array([q["active"] for q in rows])
     tr = np.flatnonzero(np.any(act[1:] != act[:-1], axis=1))

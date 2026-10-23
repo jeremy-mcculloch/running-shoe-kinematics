@@ -17,7 +17,7 @@ Signs (fixed frame ``F``: x heel -> toe, y up, ground ``y = 0``)
   ``mu_eff = F*_x / F*_y``, so both force components are met exactly.
 
 The normal-gap response is affine in the reactions,
-``g = q + T_y 1 + H lambda`` with ``H = N G_bb B`` (``N`` extracts the ground
+``g = q + T_y 1 + H lambda`` with ``H = N db_fb B`` (``N`` extracts the ground
 normal ``(s, c)`` of each local displacement, ``B`` maps ``lambda`` to local
 nodal forces). ``H`` is symmetric positive definite for ``mu_eff = 0``.
 
@@ -205,7 +205,7 @@ def solve_contact_state(
     bx, by = c * mu + s, -s * mu + c
     H = _normal_operator(op, c, s, bx, by)
     x, y = op.x_bottom, op.y_bottom
-    dax, day = op.d_alpha[:n], op.d_alpha[n:]
+    dax, day = op.db_toe[:n], op.db_toe[n:]
     q = s * (x + alpha * dax) + c * (y + alpha * day)
     t1 = time.perf_counter()
     lcp = solve_mixed_lcp(
@@ -216,10 +216,10 @@ def solve_contact_state(
     t2 = time.perf_counter()
     lam = lcp.lam
     f_b = np.concatenate([bx * lam, by * lam])
-    d_b = alpha * op.d_alpha + op.G_bb @ f_b
-    F_t = alpha * op.f_alpha + op.P_tb @ f_b
-    a = alpha * op.a_alpha + op.A_rb @ f_b
-    d_t = alpha * op.w_alpha
+    d_b = alpha * op.db_toe + op.db_fb @ f_b
+    F_t = alpha * op.ft_toe + op.ft_fb @ f_b
+    a = alpha * op.r_toe + op.r_fb @ f_b
+    d_t = alpha * op.shape_mode_toe_bend
     u, v = d_b[:n], d_b[n:]
     T_y = float(lcp.t)
     T_x = op.x_r - (c * op.x_r - s * op.y_r)
@@ -285,7 +285,7 @@ def contact_diagnostics(op: ContactOperator, sol: ContactSolution) -> dict:
         "Mz_shoe": float(op.x_top @ f_ty - op.y_top @ f_tx),
         "Mv_shoe": float(op.x_top @ f_ty),
         "T_toe": float(T_toe),
-        "Q_alpha_shoe_on_foot_per_m": float(-op.psi_top @ f_ty),
+        "Q_alpha_shoe_on_foot_per_m": float(-op.toe_shape_mode_flat_rearfoot @ f_ty),
         # Ground-reaction moment about the fixed origin and centre of pressure (fixed frame).
         "grf_moment_fixed": float(np.sum(xF * lam - yF * sol.tau)),
         "cop_fixed_x": cop_x,

@@ -35,12 +35,12 @@ def _settings(**kw) -> OutOfPlaneSettings:
 
 
 def _state(model, F=(0.0, -2000.0), varphi=0.0, alpha=0.0):
-    return solve_contact_state(model.operator, varphi, alpha, np.array(F))
+    return solve_contact_state(model.contact_operator, varphi, alpha, np.array(F))
 
 
 def _K_active(model, sol) -> np.ndarray:
     """Explicit per-width normal tangent of the active set (test reference only)."""
-    op = model.operator
+    op = model.contact_operator
     c, s = np.cos(sol.varphi), np.sin(sol.varphi)
     a = np.flatnonzero(sol.active)
     H = _normal_operator(op, c, s, s, c)[np.ix_(a, a)]
@@ -48,7 +48,7 @@ def _K_active(model, sol) -> np.ndarray:
 
 
 def _x_fixed(model, sol) -> np.ndarray:
-    op = model.operator
+    op = model.contact_operator
     n = op.n_bottom
     c, s = np.cos(sol.varphi), np.sin(sol.varphi)
     return sol.T[0] + c * (op.x_bottom + sol.d_b[:n]) - s * (op.y_bottom + sol.d_b[n:])
@@ -60,7 +60,7 @@ def _rel(a: float, b: float) -> float:
 
 # 1. No contact: zeros and status no_contact.
 def test_no_contact_returns_zero(rocker_model) -> None:
-    r = compute_out_of_plane_stiffness(rocker_model.operator, _state(rocker_model, (0.0, 0.0)), _settings())
+    r = compute_out_of_plane_stiffness(rocker_model.contact_operator, _state(rocker_model, (0.0, 0.0)), _settings())
     assert r.status == STATUS_NO_CONTACT
     assert (r.lateral_translation_stiffness, r.roll_stiffness, r.yaw_stiffness) == (0.0, 0.0, 0.0)
     assert r.active_contact_node_count == 0
@@ -71,7 +71,7 @@ def test_no_contact_returns_zero(rocker_model) -> None:
 def test_single_region_finite_nonnegative(request, sole) -> None:
     model = request.getfixturevalue(sole)
     sol = _state(model)
-    r = compute_out_of_plane_stiffness(model.operator, sol, _settings())
+    r = compute_out_of_plane_stiffness(model.contact_operator, sol, _settings())
     assert r.status == STATUS_OK and sol.diagnostics["n_patches"] == 1
     assert np.all(np.isfinite(r.diagonal)) and np.all(r.diagonal > 0.0)
     assert r.min_eigenvalue > 0.0 and r.symmetry_error < 1e-10 and not r.augmented and not r.regularized
@@ -80,8 +80,8 @@ def test_single_region_finite_nonnegative(request, sole) -> None:
 # 3-5. eta_t scales k_z and k_yaw linearly and leaves k_roll unchanged.
 def test_eta_scaling(rocker_model) -> None:
     sol = _state(rocker_model)
-    r1 = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings(lateral_to_normal_stiffness_ratio=0.3))
-    r2 = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings(lateral_to_normal_stiffness_ratio=0.9))
+    r1 = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings(lateral_to_normal_stiffness_ratio=0.3))
+    r2 = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings(lateral_to_normal_stiffness_ratio=0.9))
     assert _rel(r2.lateral_translation_stiffness, 3.0 * r1.lateral_translation_stiffness) < 1e-12
     assert _rel(r2.yaw_stiffness, 3.0 * r1.yaw_stiffness) < 1e-12
     assert _rel(r2.roll_stiffness, r1.roll_stiffness) < 1e-14
@@ -93,11 +93,11 @@ def test_roll_constant_width(rocker_model) -> None:
     K = _K_active(rocker_model, sol)
     one = np.ones(K.shape[0])
     for b in (0.08, 0.16):
-        r = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings(shoe_width_m=b))
+        r = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings(shoe_width_m=b))
         k_vertical = b * float(one @ K @ one)  # physical vertical tangent, N/m
         assert _rel(r.roll_stiffness, b**2 / 12.0 * k_vertical) < 1e-9
-    r1 = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings(shoe_width_m=0.08))
-    r2 = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings(shoe_width_m=0.16))
+    r1 = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings(shoe_width_m=0.08))
+    r2 = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings(shoe_width_m=0.16))
     kv1, kv2 = 0.08 * float(one @ K @ one), 0.16 * float(one @ K @ one)
     # Holding the physical vertical tangent fixed, doubling b gives x4; the per-metre model also doubles it (x8 total).
     assert _rel((r2.roll_stiffness / kv2) / (r1.roll_stiffness / kv1), 4.0) < 1e-9
@@ -108,7 +108,7 @@ def test_roll_constant_width(rocker_model) -> None:
 def test_lateral_and_yaw_match_quadratic_forms(rocker_model) -> None:
     sol = _state(rocker_model, F=(150.0, -2500.0), varphi=0.03)
     K_t = ETA * B * _K_active(rocker_model, sol)
-    r = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings())
+    r = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings())
     one = np.ones(K_t.shape[0])
     rx = _x_fixed(rocker_model, sol)[sol.active] - r.yaw_reference_x
     assert _rel(r.lateral_translation_stiffness, float(one @ K_t @ one)) < 1e-9
@@ -122,8 +122,8 @@ def test_yaw_translation_invariance(rocker_model) -> None:
     sol = _state(rocker_model)
     shifted = dataclasses.replace(sol, T=sol.T + np.array([0.37, 0.0]))
     for ref in ("center_of_pressure", "shoe_reference"):
-        a = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings(yaw_reference=ref))
-        b = compute_out_of_plane_stiffness(rocker_model.operator, shifted, _settings(yaw_reference=ref))
+        a = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings(yaw_reference=ref))
+        b = compute_out_of_plane_stiffness(rocker_model.contact_operator, shifted, _settings(yaw_reference=ref))
         assert _rel(a.yaw_stiffness, b.yaw_stiffness) < 1e-9
         assert b.yaw_reference_x == pytest.approx(a.yaw_reference_x + 0.37, abs=1e-14)
 
@@ -131,7 +131,7 @@ def test_yaw_translation_invariance(rocker_model) -> None:
 # 11-12. Yaw stiffness vs reference: quadratic in the offset, symmetric about the stiffness centroid.
 def test_yaw_reference_dependence_and_symmetry(rocker_model) -> None:
     sol = _state(rocker_model)
-    op = rocker_model.operator
+    op = rocker_model.contact_operator
     K_t = ETA * B * _K_active(rocker_model, sol)
     xa = _x_fixed(rocker_model, sol)[sol.active]
     one = np.ones(xa.size)
@@ -156,8 +156,8 @@ def test_yaw_reference_dependence_and_symmetry(rocker_model) -> None:
 def test_active_set_dependence_and_no_mutation(rocker_model) -> None:
     light, heavy = _state(rocker_model, (0.0, -800.0)), _state(rocker_model, (0.0, -6000.0))
     assert light.active.sum() != heavy.active.sum()
-    a = compute_out_of_plane_stiffness(rocker_model.operator, light, _settings())
-    b = compute_out_of_plane_stiffness(rocker_model.operator, heavy, _settings())
+    a = compute_out_of_plane_stiffness(rocker_model.contact_operator, light, _settings())
+    b = compute_out_of_plane_stiffness(rocker_model.contact_operator, heavy, _settings())
     assert a.active_contact_node_count != b.active_contact_node_count
     assert not np.allclose(a.diagonal, b.diagonal)
 
@@ -179,7 +179,7 @@ def test_step_sagittal_results_unchanged(rocker_model) -> None:
 def test_solution_object_not_modified(rocker_model) -> None:
     sol = _state(rocker_model, (100.0, -3000.0), 0.02, 0.1)
     snap = {k: np.array(v, copy=True) for k, v in vars(sol).items() if isinstance(v, np.ndarray)}
-    compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings())
+    compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings())
     for k, v in snap.items():
         np.testing.assert_array_equal(getattr(sol, k), v)
 
@@ -190,12 +190,12 @@ def test_plot_independence(rocker_model) -> None:
 
     sol = _state(rocker_model)
     before = build_shape_plot_data(rocker_model, selection_proxy(rocker_model, sol), scale_mode="manual", manual_scale=7.0)
-    k0 = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings())
+    k0 = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings())
     after = build_shape_plot_data(rocker_model, selection_proxy(rocker_model, sol), scale_mode="manual", manual_scale=7.0)
     for name in ("x_top_def", "y_top_def", "x_bottom_def", "y_bottom_def", "bottom_node_x", "bottom_node_y"):
         np.testing.assert_array_equal(getattr(before, name), getattr(after, name))
     build_shape_plot_data(rocker_model, selection_proxy(rocker_model, sol), scale_mode="manual", manual_scale=50.0)
-    k1 = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings())
+    k1 = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings())
     np.testing.assert_array_equal(k0.diagonal, k1.diagonal)
 
 
@@ -213,7 +213,7 @@ def test_no_additional_solves(rocker_model, monkeypatch) -> None:
     monkeypatch.setattr(continuous_contact, "solve_contact_state", forbid)
     monkeypatch.setattr(active_set, "solve_mixed_lcp", forbid)
     monkeypatch.setattr(oop_module.np.linalg, "inv", forbid)
-    r = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings())
+    r = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings())
     assert r.status == STATUS_OK
 
 
@@ -242,7 +242,7 @@ def test_gui_values_match_step(rocker_model) -> None:
     state = SoleModel(rocker_model, shoe_width_m=B, out_of_plane=_settings()).step(-20.0, -300.0, 2.0)
     # The GUI evaluates the same pose with the same (cold-started) coupled solve.
 
-    fr = solve_toe_contact(rocker_model.operator, np.array([-20.0, -300.0]) / B, np.deg2rad(2.0), ToeSpringConfig(), B)
+    fr = solve_toe_contact(rocker_model.contact_operator, np.array([-20.0, -300.0]) / B, np.deg2rad(2.0), ToeSpringConfig(), B)
     app._out_of_plane_section(rocker_model, fr.contact, _settings())
     gui = stl.session_state["gui_oop_result"]
     assert state.out_of_plane_stiffness is not None
@@ -267,7 +267,7 @@ def test_replay_stores_one_value_per_frame(replay, rocker_model) -> None:
     assert np.all(np.isfinite(replay.roll_stiffness[ok]))
     # The stored value is the one computed from that frame's converged state.
     i = int(np.flatnonzero(ok)[ok.sum() // 2])
-    ref = compute_out_of_plane_stiffness(rocker_model.operator, replay.frames[i].contact, _settings())
+    ref = compute_out_of_plane_stiffness(rocker_model.contact_operator, replay.frames[i].contact, _settings())
     assert ref.roll_stiffness == pytest.approx(replay.roll_stiffness[i], rel=1e-12)
     assert ref.yaw_stiffness == pytest.approx(replay.yaw_stiffness[i], rel=1e-12)
 
@@ -311,13 +311,13 @@ def test_csv_export_has_units_and_status(replay, tmp_path) -> None:
 # 26-27. Uniform profile == constant width; the width enters exactly once.
 def test_width_profile_and_single_scaling(rocker_model) -> None:
     sol = _state(rocker_model)
-    const = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings())
+    const = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings())
     prof = compute_out_of_plane_stiffness(
-        rocker_model.operator, sol, _settings(shoe_width_x=(0.0, 0.1, 0.25), shoe_width_values=(B, B, B))
+        rocker_model.contact_operator, sol, _settings(shoe_width_x=(0.0, 0.1, 0.25), shoe_width_values=(B, B, B))
     )
     np.testing.assert_allclose(prof.diagonal, const.diagonal, rtol=1e-12)
     assert prof.shoe_width_summary["mode"] == "profile"
-    double = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings(shoe_width_m=2 * B))
+    double = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings(shoe_width_m=2 * B))
     assert _rel(double.lateral_translation_stiffness, 2.0 * const.lateral_translation_stiffness) < 1e-12
     assert _rel(double.yaw_stiffness, 2.0 * const.yaw_stiffness) < 1e-12
     with pytest.raises(ValueError):
@@ -331,10 +331,10 @@ def test_width_profile_and_single_scaling(rocker_model) -> None:
 # 28. Ill-conditioning: warning above the threshold, NaN when numerically singular.
 def test_conditioning_policy(rocker_model, monkeypatch) -> None:
     sol = _state(rocker_model)
-    warn = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings(condition_number_warning=1.0001))
+    warn = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings(condition_number_warning=1.0001))
     assert warn.status == STATUS_ILL_CONDITIONED and warn.warnings and np.all(np.isfinite(warn.diagonal))
     monkeypatch.setattr(oop_module, "SINGULAR_CONDITION", 1.0)
-    sing = compute_out_of_plane_stiffness(rocker_model.operator, sol, _settings())
+    sing = compute_out_of_plane_stiffness(rocker_model.contact_operator, sol, _settings())
     assert sing.status == STATUS_SINGULAR and np.all(np.isnan(sing.diagonal))
 
 
@@ -352,7 +352,7 @@ def test_old_replay_without_stiffness_loads(replay, tmp_path) -> None:
 
 
 def test_matrix_structure(rocker_model) -> None:
-    r = compute_out_of_plane_stiffness(rocker_model.operator, _state(rocker_model), _settings())
+    r = compute_out_of_plane_stiffness(rocker_model.contact_operator, _state(rocker_model), _settings())
     m = r.as_matrix()
     np.testing.assert_array_equal(np.diag(m), r.diagonal)
     assert np.all(np.isnan(m[~np.eye(3, dtype=bool)]))

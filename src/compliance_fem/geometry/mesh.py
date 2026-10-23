@@ -27,7 +27,6 @@ from compliance_fem.geometry.gmsh_util import gmsh_session, initialize_gmsh
 from compliance_fem.geometry.profile import (
     REGION_LOWER,
     REGION_UPPER,
-    SHARED_TOE_POLICY,
     TAG_BOTTOM,
     TAG_HEEL,
     TAG_INTERFACE,
@@ -38,7 +37,7 @@ from compliance_fem.geometry.profile import (
     turning_angles,
 )
 
-REGION_CODES = {REGION_UPPER: 0, REGION_LOWER: 1}
+REGION_IDS = {REGION_UPPER: 0, REGION_LOWER: 1}
 
 
 class MeshQualityError(RuntimeError):
@@ -50,9 +49,8 @@ class SoleMeshData:
     """Measured-sole mesh with explicit, heel-to-toe ordered tag node lists."""
 
     mesh: MeshTri
-    config: object
     geometry: SoleGeometry
-    element_region: np.ndarray  # (n_el,) REGION_CODES
+    triangle_id_to_region_id: np.ndarray  # (n_el,) REGION_CODES
     top_curve_nodes: np.ndarray  # heel_top -> toe_tip (includes the toe)
     bottom_curve_nodes: np.ndarray  # heel_bottom -> toe_tip (includes the toe)
     heel_edge_nodes: np.ndarray  # heel_top -> heel_bottom
@@ -61,34 +59,35 @@ class SoleMeshData:
     toe_node_id: int
     region_loops: dict[str, np.ndarray]
     quality: dict = field(default_factory=dict)
-    msh_path: Path | None = None
-
-    # Shared-toe convention: the bottom/contact selector owns the toe vertex.
-    shared_toe_policy: str = SHARED_TOE_POLICY
 
     @property
     def top_selector_nodes(self) -> np.ndarray:
+        """Heel-to-toe nodes along the top curve, excluding the toe node."""
         nodes = np.asarray(self.top_curve_nodes, dtype=int)
         return nodes[nodes != int(self.toe_node_id)]
 
     @property
     def bottom_selector_nodes(self) -> np.ndarray:
+        """Heel-to-toe nodes along the bottom curve, including the toe node."""
         return np.asarray(self.bottom_curve_nodes, dtype=int)
 
     @property
     def x_plate(self) -> np.ndarray:
+        """Heel-to-toe x coordinates of the plate nodes."""
         return np.asarray(self.mesh.p[0, self.plate_node_ids], dtype=float)
 
     @property
     def y_plate(self) -> np.ndarray:
+        """Heel-to-toe y coordinates of the plate nodes."""
         return np.asarray(self.mesh.p[1, self.plate_node_ids], dtype=float)
 
     @property
     def plate_element_ids(self) -> np.ndarray:
+        """Element ids of the (triangular) plate elements, in heel-to-toe order."""
         return np.arange(int(self.plate_node_ids.size) - 1, dtype=int)
 
     def region_elements(self, name: str) -> np.ndarray:
-        return np.flatnonzero(self.element_region == REGION_CODES[name])
+        return np.flatnonzero(self.triangle_id_to_region_id == REGION_IDS[name])
 
 
 def _local_sizes(geom: SoleGeometry, config) -> dict[tuple[float, float], float]:
@@ -130,7 +129,7 @@ def _refined_points(geom: SoleGeometry, config) -> list[tuple[np.ndarray, float]
     ]
 
 
-def _triangle_quality(p: np.ndarray, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _measure_triangles(p: np.ndarray, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Signed areas (input orientation) and minimum interior angles (deg)."""
     a, b, c = p[:, t[0]], p[:, t[1]], p[:, t[2]]
     area = 0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]))
@@ -170,27 +169,27 @@ def generate_mesh(config, output_msh: Path | None = None) -> SoleMeshData:
             initialize_gmsh()
             gmsh.option.setNumber("General.Terminal", 0)
             gmsh.model.add("measured_sole")
-            point_ids: dict[tuple[float, float], int] = {}
+            point_tags: dict[tuple[float, float], int] = {}
 
             def pt(p) -> int:
                 key = (float(p[0]), float(p[1]))
-                if key not in point_ids:
-                    point_ids[key] = gmsh.model.geo.addPoint(key[0], key[1], 0.0, sizes.get(key, h))
-                return point_ids[key]
+                if key not in point_tags:
+                    point_tags[key] = gmsh.model.geo.addPoint(key[0], key[1], 0.0, sizes.get(key, h))
+                return point_tags[key]
 
-            line_ids: dict[tuple[int, int], int] = {}
+            line_tags: dict[tuple[int, int], int] = {}
 
             def polyline(points) -> list[int]:
                 pt_ids = [pt(p) for p in points]
                 out = []
                 for a, b in zip(pt_ids[:-1], pt_ids[1:]):
-                    if (a, b) in line_ids:
-                        out.append(line_ids[(a, b)])
-                    elif (b, a) in line_ids:
-                        out.append(-line_ids[(b, a)])
+                    if (a, b) in line_tags:
+                        out.append(line_tags[(a, b)])
+                    elif (b, a) in line_tags:
+                        out.append(-line_tags[(b, a)])
                     else:
-                        line_ids[(a, b)] = gmsh.model.geo.addLine(a, b)
-                        out.append(line_ids[(a, b)])
+                        line_tags[(a, b)] = gmsh.model.geo.addLine(a, b)
+                        out.append(line_tags[(a, b)])
                 return out
 
             # Define interior and exterior curves as polylines
@@ -206,16 +205,18 @@ def generate_mesh(config, output_msh: Path | None = None) -> SoleMeshData:
 
             # Define the two foam regions as plane surfaces
             surface_ids = {}
+            loop_lines: dict[str, list[int]] = {}
             for name in (REGION_UPPER, REGION_LOWER):
-                loop = gmsh.model.geo.addCurveLoop(polyline_loop(geom.region_polygons[name]))
+                loop_lines[name] = polyline_loop(geom.region_polygons[name])
+                loop = gmsh.model.geo.addCurveLoop(loop_lines[name])
                 surface_ids[name] = gmsh.model.geo.addPlaneSurface([loop])
             gmsh.model.geo.synchronize()
 
             # Refine the mesh near the corners, interface ends, and plate ends using distance fields.
             fields = []
-            for p, factor in _refined_points(geom, config):
+            for node_xy_renumbered, factor in _refined_points(geom, config):
                 fd = gmsh.model.mesh.field.add("Distance")
-                gmsh.model.mesh.field.setNumbers(fd, "PointsList", [pt(p)])
+                gmsh.model.mesh.field.setNumbers(fd, "PointsList", [pt(node_xy_renumbered)])
                 ft = gmsh.model.mesh.field.add("Threshold")
                 gmsh.model.mesh.field.setNumber(ft, "InField", fd)
                 gmsh.model.mesh.field.setNumber(ft, "SizeMin", float(factor) * h)
@@ -255,6 +256,7 @@ def generate_mesh(config, output_msh: Path | None = None) -> SoleMeshData:
                 gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
                 gmsh.write(str(output_msh))
 
+            # List of triangles (3-tuples of node ids) per foam region
             tri_by_region: dict[str, np.ndarray] = {}
             for name, surf in surface_ids.items():
                 etypes, _, enodes = gmsh.model.mesh.getElements(2, surf)
@@ -262,92 +264,100 @@ def generate_mesh(config, output_msh: Path | None = None) -> SoleMeshData:
                     raise MeshQualityError("Measured-sole mesh contains non-triangular elements.")
                 tri_by_region[name] = np.asarray(enodes[0], dtype=np.int64).reshape(-1, 3)
 
-            def curve_nodes(points: np.ndarray) -> np.ndarray:
-                """Gmsh node tags along the polyline through ``points``, in order."""
-                chain: list[int] = []
-                for a, b in zip(points[:-1], points[1:]):
-                    chain.append(int(gmsh.model.mesh.getNodes(0, pt(a))[0][0]))
-                    line = line_ids.get((pt(a), pt(b))) or line_ids[(pt(b), pt(a))]
-                    tags, xyz, _ = gmsh.model.mesh.getNodes(1, line)
-                    # Lines are straight, so interior nodes order by distance from ``a``.
-                    along = (np.asarray(xyz).reshape(-1, 3)[:, :2] - a) @ (b - a)
-                    chain.extend(int(t) for t in np.asarray(tags)[np.argsort(along)])
-                chain.append(int(gmsh.model.mesh.getNodes(0, pt(points[-1]))[0][0]))
-                return np.asarray(chain, dtype=np.int64)
+            # Create a mapping from line tag to its endpoint point tags
+            line_end_tags = {line: ends for ends, line in line_tags.items()}
 
-            ih, it = geom.plate_heel_index, geom.plate_toe_index
-            chains = {
-                TAG_TOP: curve_nodes(geom.top),
-                TAG_BOTTOM: curve_nodes(geom.bottom),
-                TAG_HEEL: curve_nodes(geom.heel_edge),
-                TAG_INTERFACE: curve_nodes(geom.interface),
-                TAG_PLATE: curve_nodes(geom.interface[ih : it + 1]),
+            def get_vertex_node_id(point_tag: int) -> int:
+                return int(gmsh.model.mesh.getNodes(0, point_tag)[0][0])
+
+            def get_curve_node_ids(polyline: list[int]) -> np.ndarray:
+                """Gmsh node ids along a chain of signed line tags (as returned by ``polyline``), in order."""
+                node_ids: list[int] = []
+                for line_signed in polyline:
+                    start_pt, end_pt = line_end_tags[abs(line_signed)]
+                    interior_ids_unsorted, _, parametric_coord = gmsh.model.mesh.getNodes(1, abs(line_signed))
+                    # Sort by parametric coordinate so they go from the start point to the end point
+                    interior_ids = np.asarray(interior_ids_unsorted, dtype=np.int64)[np.argsort(parametric_coord)]
+                    # If line_signed is negative, reverse the order of the interior tags and swap the start and end points
+                    if line_signed < 0: 
+                        start_pt, end_pt, interior_ids = end_pt, start_pt, interior_ids[::-1]
+                    # If the chain is empty, add the start point; otherwise, the start point is already in the chain
+                    if not node_ids:
+                        node_ids.append(get_vertex_node_id(start_pt))
+                    node_ids.extend(interior_ids.tolist())
+                    node_ids.append(get_vertex_node_id(end_pt))
+                return np.asarray(node_ids, dtype=np.int64)
+
+            line_node_ids = {
+                TAG_TOP: get_curve_node_ids(top_lines),
+                TAG_BOTTOM: get_curve_node_ids(bottom_lines),
+                TAG_HEEL: get_curve_node_ids(heel_lines),
+                TAG_INTERFACE: get_curve_node_ids(iface_lines),
+                TAG_PLATE: get_curve_node_ids(plate_lines),
             }
             # Counterclockwise region loops, closed polygon minus the repeated start node.
-            loops = {
-                name: curve_nodes(np.vstack([poly, poly[:1]]))[:-1] for name, poly in geom.region_polygons.items()
-            }
+            loop_node_ids = {name: get_curve_node_ids(lines)[:-1] for name, lines in loop_lines.items()}
             node_ids, node_xyz, _ = gmsh.model.mesh.getNodes()
         finally:
             if gmsh.isInitialized():
                 gmsh.finalize()
 
-    # Renumber the gmsh node tags used by triangles to 0..n-1 (``used`` is sorted).
-    used = np.unique(np.vstack(list(tri_by_region.values())))
-    xy_of = dict(zip(np.asarray(node_ids).tolist(), np.asarray(node_xyz, dtype=float).reshape(-1, 3)[:, :2]))
-    p = np.array([xy_of[t] for t in used.tolist()]).T
+    # Renumber the gmsh node tags used by triangles to 0..n-1 (``node_ids_used`` is sorted).
+    node_ids_used = np.unique(np.vstack(list(tri_by_region.values())))
+    node_id_to_xy = dict(zip(np.asarray(node_ids).tolist(), np.asarray(node_xyz, dtype=float).reshape(-1, 3)[:, :2]))
+    node_xy_renumbered = np.array([node_id_to_xy[t] for t in node_ids_used.tolist()]).T
 
     def renumber(tags: np.ndarray) -> np.ndarray:
-        return np.searchsorted(used, tags)
+        return np.searchsorted(node_ids_used, tags)
 
-    t_upper = renumber(tri_by_region[REGION_UPPER]).T
-    t_lower = renumber(tri_by_region[REGION_LOWER]).T
-    t_all = np.hstack([t_upper, t_lower])
-    element_region = np.repeat(
-        [REGION_CODES[REGION_UPPER], REGION_CODES[REGION_LOWER]], [t_upper.shape[1], t_lower.shape[1]]
+    tri_upper_renumbered = renumber(tri_by_region[REGION_UPPER]).T
+    tri_lower_renumbered = renumber(tri_by_region[REGION_LOWER]).T
+    tri_all = np.hstack([tri_upper_renumbered, tri_lower_renumbered])
+    triangle_id_to_region_id = np.repeat(
+        [REGION_IDS[REGION_UPPER], REGION_IDS[REGION_LOWER]], [tri_upper_renumbered.shape[1], tri_lower_renumbered.shape[1]]
     )
-    chains = {k: renumber(v) for k, v in chains.items()}
-    loops = {k: renumber(v) for k, v in loops.items()}
+    line_node_ids = {k: renumber(v) for k, v in line_node_ids.items()}
+    loop_node_ids = {k: renumber(v) for k, v in loop_node_ids.items()}
 
-    area, _ = _triangle_quality(p, t_all)
+    # Verify that the mesh is valid: no degenerate or inverted triangles, and the triangle orientation matches the input curves.
+    area, _ = _measure_triangles(node_xy_renumbered, tri_all)
     sign = np.sign(area)
     if np.any(sign == 0) or not (np.all(sign > 0) or np.all(sign < 0)):
         raise MeshQualityError("Measured-sole mesh has degenerate or inverted triangles.")
     if np.all(sign < 0):
-        t_all = t_all[[0, 2, 1]]
+        tri_all = tri_all[[0, 2, 1]]
 
-    mesh = MeshTri(np.ascontiguousarray(p), np.ascontiguousarray(t_all), sort_t=False)
+    mesh = MeshTri(np.ascontiguousarray(node_xy_renumbered), np.ascontiguousarray(tri_all), sort_t=False)
+
+    # Create mapping from facet (node pair) to its index in the mesh facets array. 
+    # We sort the node ids in each facet as (a, b) where a < b to ensure that the mapping is independent of the order of the nodes in the facet.
     facet_index = {(int(a), int(b)): k for k, (a, b) in enumerate(np.sort(mesh_facets(mesh), axis=0).T)}
 
-    def facets_of(chain: np.ndarray) -> np.ndarray:
+    def get_facets(node_ids: np.ndarray) -> np.ndarray:
         """Facet ids of the consecutive node pairs of ``chain``."""
-        keys = [(int(min(a, b)), int(max(a, b))) for a, b in zip(chain[:-1], chain[1:])]
-        if any(k not in facet_index for k in keys):
+        node_id_pairs = [(int(min(a, b)), int(max(a, b))) for a, b in zip(node_ids[:-1], node_ids[1:])]
+        if any(node_id_pair not in facet_index for node_id_pair in node_id_pairs):
             raise MeshQualityError("A tagged curve edge is not a mesh facet.")
-        return np.sort([facet_index[k] for k in keys])
+        return np.sort([facet_index[node_id_pair] for node_id_pair in node_id_pairs])
 
-    # Annotated loosely: MeshTri.with_boundaries takes an invariant Dict of arrays or callables.
-    boundaries: dict[str, Any] = {tag: facets_of(chain) for tag, chain in chains.items()}
+    boundaries: dict[str, Any] = {tag: get_facets(chain) for tag, chain in line_node_ids.items()}
     mesh = mesh.with_subdomains(
-        {name: np.flatnonzero(element_region == code) for name, code in REGION_CODES.items()}
+        {name: np.flatnonzero(triangle_id_to_region_id == region_id) for name, region_id in REGION_IDS.items()}
     ).with_boundaries(boundaries)
 
     data = SoleMeshData(
         mesh=mesh,
-        config=config,
         geometry=geom,
-        element_region=element_region,
-        top_curve_nodes=chains[TAG_TOP],
-        bottom_curve_nodes=chains[TAG_BOTTOM],
-        heel_edge_nodes=chains[TAG_HEEL],
-        interface_nodes=chains[TAG_INTERFACE],
-        plate_node_ids=chains[TAG_PLATE],
-        toe_node_id=int(chains[TAG_BOTTOM][-1]),
-        region_loops=loops,
-        msh_path=output_msh,
+        triangle_id_to_region_id=triangle_id_to_region_id,
+        top_curve_nodes=line_node_ids[TAG_TOP],
+        bottom_curve_nodes=line_node_ids[TAG_BOTTOM],
+        heel_edge_nodes=line_node_ids[TAG_HEEL],
+        interface_nodes=line_node_ids[TAG_INTERFACE],
+        plate_node_ids=line_node_ids[TAG_PLATE],
+        toe_node_id=int(line_node_ids[TAG_BOTTOM][-1]),
+        region_loops=loop_node_ids,
     )
     data.quality = verify_mesh(data, min_area=0.0, min_angle_deg=float(config.min_angle_deg))
-    print("rebuilt")
     return data
 
 
@@ -358,13 +368,13 @@ def verify_mesh(data: SoleMeshData, min_area: float = 0.0, min_angle_deg: float 
     p = np.asarray(mesh.p, dtype=float)
     t = np.asarray(mesh.t, dtype=int)
     L = float(geom.shoe_length_m)
-    area, min_ang = _triangle_quality(p, t)
+    area, min_ang = _measure_triangles(p, t)
     abs_area = np.abs(area)
     report: dict = {
         "n_nodes": int(p.shape[1]),
         "n_elements": int(t.shape[1]),
-        "n_elements_upper": int(np.count_nonzero(data.element_region == REGION_CODES[REGION_UPPER])),
-        "n_elements_lower": int(np.count_nonzero(data.element_region == REGION_CODES[REGION_LOWER])),
+        "n_elements_upper": int(np.count_nonzero(data.triangle_id_to_region_id == REGION_IDS[REGION_UPPER])),
+        "n_elements_lower": int(np.count_nonzero(data.triangle_id_to_region_id == REGION_IDS[REGION_LOWER])),
         "min_element_area_m2": float(abs_area.min()),
         "min_angle_deg": float(min_ang.min()),
         "mean_min_angle_deg": float(min_ang.mean()),
@@ -393,20 +403,20 @@ def verify_mesh(data: SoleMeshData, min_area: float = 0.0, min_angle_deg: float 
     report["n_connected_components"] = n_comp
     if n_comp != 1:
         raise MeshQualityError(f"Mesh has {n_comp} disconnected components.")
-    for name, code in REGION_CODES.items():
-        sub = t[:, data.element_region == code]
+    for name, code in REGION_IDS.items():
+        sub = t[:, data.triangle_id_to_region_id == code]
         if sub.shape[1] == 0:
             raise MeshQualityError(f"Foam region {name} has no elements.")
         if _components(sub, p.shape[1]) != 1:
             raise MeshQualityError(f"Foam region {name} is disconnected.")
     for name, poly_area in geom.region_areas.items():
-        mesh_area = float(abs_area[data.element_region == REGION_CODES[name]].sum())
+        mesh_area = float(abs_area[data.triangle_id_to_region_id == REGION_IDS[name]].sum())
         report[f"area_{name}_m2"] = mesh_area
         if abs(mesh_area - poly_area) > 1e-9 * geom.total_area:
             raise MeshQualityError(f"Region {name} mesh area {mesh_area} differs from geometry {poly_area}.")
 
-    upper_nodes = set(np.unique(t[:, data.element_region == 0]).tolist())
-    lower_nodes = set(np.unique(t[:, data.element_region == 1]).tolist())
+    upper_nodes = set(np.unique(t[:, data.triangle_id_to_region_id == 0]).tolist())
+    lower_nodes = set(np.unique(t[:, data.triangle_id_to_region_id == 1]).tolist())
     shared = upper_nodes & lower_nodes
     iface = set(int(n) for n in data.interface_nodes)
     if shared != iface:

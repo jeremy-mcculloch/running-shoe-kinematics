@@ -1,10 +1,11 @@
 """Internal plate response: influence matrices, Hermite postprocess, runtime fields.
 
 The plate is the Euler–Bernoulli / Hermite interface between the two foams.
-At build time one multi-RHS solve of the factorized augmented free-body
-operator (the same one behind the compliance blocks) gives the plate nodal
-fields per unit boundary load and per unit rigid amplitude
-(:class:`PlateInfluence`). At runtime one continuous contact solution supplies
+At build time the shared unit-boundary-load solve of the factorized augmented
+free-body operator (``contact_model.build_field_recovery``, which also builds the
+render section) gives the plate rotation and axial force per unit boundary load
+and per unit rigid amplitude (:class:`PlateResponse`); the plate nodal ``u, v``
+are rows of the render influence. At runtime one continuous contact solution supplies
 ``[F_t; f_b]`` and the rigid amplitudes, the plate fields are two small matrix
 products (``contact_model.plate_fields``) and the centreline is rebuilt with
 cubic Hermite interpolation.
@@ -23,62 +24,122 @@ Sign conventions (must match ``plate.py``)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy import sparse
 
-from compliance_fem.fem.boundaries import build_vector_selector
 from compliance_fem.contact.corotation import transform_to_fixed_frame
-from compliance_fem.fem.plate import plate_translational_dofs
+from compliance_fem.fem.plate import plate_element_frames
 
 if TYPE_CHECKING:
     from compliance_fem.fem.compliance import ComplianceResult
 
 DEFAULT_SAMPLES_PER_ELEMENT = 16
+PLATE_KEY_PREFIX = "plate_"
+# Stored arrays (the reference coordinates come from the render mesh points).
+PLATE_ARRAY_FIELDS = (
+    "node_ids",
+    "theta",
+    "plate_tension",
+    "inextensibility_residual",
+    "rigid_theta",
+    "rigid_inextensibility_residual",
+)
 
-@dataclass(frozen=True)
-class PlateMeshInfo:
-    """Reference plate mesh shared by every contact record."""
+@dataclass
+class PlateResponse:
+    """Plate geometry and its fields per unit boundary load / unit rigid amplitude.
 
-    node_ids: np.ndarray
-    reference_x: np.ndarray
-    reference_y: np.ndarray
-    reference_arc_length: np.ndarray
-    element_connectivity: np.ndarray
-    element_lengths: np.ndarray
-    element_tangents: np.ndarray
-    element_normals: np.ndarray
-    u_dof_ids: np.ndarray
-    v_dof_ids: np.ndarray
-    rotation_dof_ids: np.ndarray
-    constraint_ids: np.ndarray
-    plate_tangent: np.ndarray
-    plate_normal: np.ndarray
+    Load columns follow the stacked boundary load ``[F_t (2 n_t); F_bottom (2 n_b)]``
+    (component-major); rigid columns are the three ``vector_rigid_mode_matrix`` modes
+    about ``(x_r, y_r)``. Plate recovery for one contact solution is a pair of small
+    matrix products. The plate nodal ``u, v`` are not stored here: the plate nodes are
+    mesh vertices, so they are rows of the render influence. Element frames come from
+    :func:`~compliance_fem.fem.plate.plate_element_frames`, as in the FEM assembly.
+    """
+
+    node_ids: np.ndarray  # (n_plate,) mesh vertices, heel to toe
+    reference_x: np.ndarray  # (n_plate,)
+    reference_y: np.ndarray  # (n_plate,)
     EI_plate_Nm2_per_m: float
-    n_foam: int
-    n_primal: int
-    n_lambda: int
+    theta: np.ndarray  # (n_plate, 2 n_t + 2 n_b) rotation dw/ds
+    plate_tension: np.ndarray  # (n_el, 2 n_t + 2 n_b) element axial force, positive = tension
+    inextensibility_residual: np.ndarray  # (n_el, 2 n_t + 2 n_b) B_p q, zero up to roundoff
+    rigid_theta: np.ndarray  # (n_plate, 3)
+    rigid_inextensibility_residual: np.ndarray  # (n_el, 3)
 
     @property
     def n_nodes(self) -> int:
-        return int(self.reference_x.size)
+        return int(self.node_ids.size)
 
     @property
     def n_elements(self) -> int:
-        return int(self.element_connectivity.shape[0])
+        return self.n_nodes - 1
+
+    @cached_property
+    def element_connectivity(self) -> np.ndarray:
+        """(n_el, 2) consecutive node pairs."""
+        return np.column_stack([np.arange(self.n_elements), np.arange(1, self.n_nodes)])
+
+    @cached_property
+    def _frames(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return plate_element_frames(np.vstack([self.reference_x, self.reference_y]))
+
+    @property
+    def element_lengths(self) -> np.ndarray:
+        return self._frames[0]
+
+    @property
+    def element_tangents(self) -> np.ndarray:
+        """(n_el, 2) unit tangents, heel -> toe."""
+        return self._frames[1]
+
+    @property
+    def element_normals(self) -> np.ndarray:
+        """(n_el, 2) unit normals ``(-t_y, t_x)``."""
+        return self._frames[2]
+
+    @cached_property
+    def reference_arc_length(self) -> np.ndarray:
+        s = np.zeros(self.n_nodes, dtype=float)
+        s[1:] = np.cumsum(self.element_lengths)
+        return s
+
+    def to_payload(self) -> dict[str, np.ndarray]:
+        out = {PLATE_KEY_PREFIX + k: np.asarray(getattr(self, k)) for k in PLATE_ARRAY_FIELDS}
+        out[PLATE_KEY_PREFIX + "EI_plate_Nm2_per_m"] = np.asarray(float(self.EI_plate_Nm2_per_m))
+        return out
+
+    @classmethod
+    def from_payload(cls, data, mesh_points: np.ndarray) -> PlateResponse:
+        files = set(getattr(data, "files", data.keys()))
+        missing = [k for k in (*PLATE_ARRAY_FIELDS, "EI_plate_Nm2_per_m") if PLATE_KEY_PREFIX + k not in files]
+        if missing:
+            raise KeyError(f"plate arrays missing: {missing}")
+        node_ids = np.asarray(data[PLATE_KEY_PREFIX + "node_ids"], dtype=int)
+        return cls(
+            node_ids=node_ids,
+            reference_x=np.asarray(mesh_points[0, node_ids], dtype=float),
+            reference_y=np.asarray(mesh_points[1, node_ids], dtype=float),
+            EI_plate_Nm2_per_m=float(np.asarray(data[PLATE_KEY_PREFIX + "EI_plate_Nm2_per_m"]).reshape(-1)[0]),
+            **{
+                k: np.asarray(data[PLATE_KEY_PREFIX + k], dtype=float)
+                for k in PLATE_ARRAY_FIELDS
+                if k != "node_ids"
+            },
+        )
 
 
 @dataclass
 class PlateRuntimeState:
-    """Superposed plate response for the selected contact record."""
+    """Superposed plate response for one contact solution."""
 
-    mesh: PlateMeshInfo
+    mesh: PlateResponse
     u_local: np.ndarray
     v_local: np.ndarray
     rotation_local: np.ndarray
-    constraint_multiplier: np.ndarray
-    axial_force: np.ndarray
+    plate_tension: np.ndarray  # (n_el,) element axial force, positive = tension
     u_tangential: np.ndarray
     w_normal: np.ndarray
     maximum_plate_axial_displacement_difference: float
@@ -93,7 +154,7 @@ class PlateRuntimeState:
     sample_curvature: np.ndarray
     sample_bending_moment: np.ndarray
     sample_shear_force: np.ndarray
-    sample_axial_force: np.ndarray
+    sample_plate_tension: np.ndarray
     sample_w: np.ndarray
     sample_u_s: np.ndarray
     sample_element_id: np.ndarray
@@ -199,129 +260,11 @@ def hermite_shear(
 
 
 # ---------------------------------------------------------------------------
-# Mesh extraction and primal recovery
+# Build-time rigid recovery
 # ---------------------------------------------------------------------------
 
 
-def _arc_length(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    dx = np.diff(x)
-    dy = np.diff(y)
-    seg = np.hypot(dx, dy)
-    s = np.zeros(x.size, dtype=float)
-    s[1:] = np.cumsum(seg)
-    return s
-
-
-def extract_plate_mesh_info(result: ComplianceResult) -> PlateMeshInfo:
-    """Build plate mesh / DOF index arrays from a ComplianceResult."""
-    if result.basis is None or result.B_p is None or result.n_primal is None:
-        raise ValueError("ComplianceResult must retain basis, B_p, and n_primal for plate recovery.")
-    if result.x_plate is None or result.y_plate is None:
-        raise ValueError("ComplianceResult is missing plate reference coordinates.")
-    if result.plate_node_ids is None:
-        raise ValueError("Plate mesh extraction requires ComplianceResult.plate_node_ids.")
-    node_ids = np.asarray(result.plate_node_ids, dtype=int)
-    p = np.asarray(result.basis.mesh.p, dtype=float)
-    x = p[0, node_ids].copy()
-    y = p[1, node_ids].copy()
-    chord = np.array([x[-1] - x[0], y[-1] - y[0]], dtype=float)
-    t_ref = chord / float(np.linalg.norm(chord))
-    n_ref = np.array([-t_ref[1], t_ref[0]], dtype=float)
-    if not np.allclose(x, result.x_plate, atol=1e-8) or not np.allclose(y, result.y_plate, atol=1e-8):
-        raise ValueError(
-            "Live plate coordinates disagree with ComplianceResult.x_plate/y_plate; "
-            "refusing to recover plate fields from a mismatched mesh."
-        )
-
-    u_dofs, v_dofs = plate_translational_dofs(result.basis, node_ids)
-    n_plate = int(u_dofs.size)
-    n_foam = int(result.basis.N)
-    n_theta = int(result.n_plate_rotation_dofs or 0)
-    if n_theta not in (0, n_plate):
-        raise ValueError(f"Unexpected n_plate_rotation_dofs={n_theta} for n_plate={n_plate}.")
-    rotation_dofs = (
-        np.arange(n_foam, n_foam + n_plate, dtype=int)
-        if n_theta == n_plate
-        else np.full(n_plate, -1, dtype=int)
-    )
-    n_constraints = n_plate - 1
-    constraint_ids = np.arange(n_constraints, dtype=int)
-    conn = np.column_stack([np.arange(n_constraints), np.arange(1, n_plate)])
-    lengths = np.zeros(n_constraints, dtype=float)
-    tangents = np.zeros((n_constraints, 2), dtype=float)
-    normals = np.zeros((n_constraints, 2), dtype=float)
-    t_cfg = t_ref
-    n_cfg = n_ref
-    for e in range(n_constraints):
-        i, j = int(conn[e, 0]), int(conn[e, 1])
-        delta = np.array([x[j] - x[i], y[j] - y[i]], dtype=float)
-        length = float(np.linalg.norm(delta))
-        if length <= 0.0:
-            raise ValueError(f"Degenerate plate element {e}.")
-        t_e = delta / length
-        n_e = np.array([-t_e[1], t_e[0]], dtype=float)
-        # Match assembly orientation: flip if opposite the config normal.
-        if float(np.dot(n_e, n_cfg)) < 0.0:
-            n_e = -n_e
-            t_e = -t_e
-        lengths[e] = length
-        tangents[e] = t_e
-        normals[e] = n_e
-
-    return PlateMeshInfo(
-        node_ids=np.asarray(node_ids, dtype=int),
-        reference_x=x,
-        reference_y=y,
-        reference_arc_length=_arc_length(x, y),
-        element_connectivity=conn,
-        element_lengths=lengths,
-        element_tangents=tangents,
-        element_normals=normals,
-        u_dof_ids=u_dofs,
-        v_dof_ids=v_dofs,
-        rotation_dof_ids=rotation_dofs,
-        constraint_ids=constraint_ids,
-        plate_tangent=t_cfg,
-        plate_normal=n_cfg,
-        EI_plate_Nm2_per_m=float(result.config.EI_plate_Nm2_per_m),
-        n_foam=n_foam,
-        n_primal=int(result.n_primal),
-        n_lambda=int(result.n_lambda or n_constraints),
-    )
-
-
-def axial_force_from_multiplier(lambda_p: np.ndarray) -> np.ndarray:
-    """Convert raw B_p multipliers to axial forces.
-
-    With unscaled rows ``t · (u_{j+1} - u_j)``, the multiplier already has force
-    units. Both arrays are stored; this identity documents the convention.
-    """
-    return np.asarray(lambda_p, dtype=float).copy()
-
-
-def verify_plate_orientation(mesh: PlateMeshInfo) -> None:
-    """Assert postprocess normals/tangents match assembly signs."""
-    for e in range(mesh.n_elements):
-        t = mesh.element_tangents[e]
-        n = mesh.element_normals[e]
-        cross = t[0] * n[1] - t[1] * n[0]
-        if abs(cross - 1.0) > 1e-6 and abs(cross + 1.0) > 1e-6:
-            # Should be a positively oriented orthonormal pair (det = +1).
-            if abs(abs(cross) - 1.0) > 1e-6:
-                raise ValueError(f"Element {e} tangent/normal are not orthonormal (det={cross}).")
-        if abs(cross - 1.0) > 1e-6:
-            raise ValueError(
-                f"Element {e} normal does not equal (-t_y, t_x); det(t,n)={cross}."
-            )
-
-
-def rigid_primal_from_alpha(
-    result: ComplianceResult,
-    mesh: PlateMeshInfo,
-    alpha: np.ndarray,
-    x_r: float,
-    y_r: float,
-) -> np.ndarray:
+def rigid_primal_from_alpha(result: ComplianceResult, alpha: np.ndarray, x_r: float, y_r: float) -> np.ndarray:
     """Continuum rigid displacement matching ``vector_rigid_mode_matrix`` about ``(x_r, y_r)``.
 
     Free-body force recovery returns the particular solution ``q = C F`` in the FEM
@@ -331,8 +274,6 @@ def rigid_primal_from_alpha(
     """
     from compliance_fem.fem.rigid_modes import _component_dofs
 
-    if result.basis is None or result.n_primal is None:
-        raise ValueError("ComplianceResult must retain basis and n_primal.")
     alpha = np.asarray(alpha, dtype=float).reshape(3)
     ax, ay, omega = float(alpha[0]), float(alpha[1]), float(alpha[2])
     q_r = np.zeros(int(result.n_primal), dtype=float)
@@ -340,91 +281,9 @@ def rigid_primal_from_alpha(
     y_dofs = _component_dofs(result.basis, 1)
     q_r[x_dofs] = ax - omega * (result.basis.doflocs[1, x_dofs] - float(y_r))
     q_r[y_dofs] = ay + omega * (result.basis.doflocs[0, y_dofs] - float(x_r))
-    if np.all(mesh.rotation_dof_ids >= 0):
-        # For θ = dw/ds with w = n·(u,v), a plane rigid rotation has θ ≡ ω.
-        q_r[mesh.rotation_dof_ids] = omega
+    # For theta = dw/ds with w = n.(u, v), a plane rigid rotation has theta == omega.
+    q_r[result.plate_rotation_dof_ids] = omega
     return q_r
-
-
-@dataclass
-class PlateInfluence:
-    """Plate fields per unit boundary load / unit rigid amplitude.
-
-    Columns of the load blocks follow the stacked boundary load
-    ``[F_t (2 n_t); F_bottom (2 n_b)]`` (component-major); the rigid blocks have
-    the three columns of ``vector_rigid_mode_matrix`` about ``(x_r, y_r)``. All
-    blocks come from one multi-RHS solve of the factorized augmented free-body
-    operator, so per-record plate recovery is a pair of small matrix products.
-    """
-
-    n_top: int
-    n_bottom: int
-    u: np.ndarray  # (n_plate, 2 n_t + 2 n_b)
-    v: np.ndarray
-    theta: np.ndarray
-    lam: np.ndarray  # (n_el, 2 n_t + 2 n_b)
-    bp: np.ndarray  # (n_constraint_rows, 2 n_t + 2 n_b)
-    top: np.ndarray  # (2 n_t, 2 n_t + 2 n_b)
-    bottom: np.ndarray  # (2 n_b, 2 n_t + 2 n_b)
-    rigid_u: np.ndarray  # (n_plate, 3)
-    rigid_v: np.ndarray
-    rigid_theta: np.ndarray
-    rigid_bp: np.ndarray
-    rigid_top: np.ndarray
-    rigid_bottom: np.ndarray
-
-
-def build_plate_influence(
-    result: ComplianceResult,
-    mesh: PlateMeshInfo,
-    *,
-    x_r: float,
-    y_r: float,
-) -> PlateInfluence:
-    """Precompute plate influence matrices with a single multi-RHS factorized solve."""
-    if result.factorization is None or result.basis is None or result.n_primal is None:
-        raise ValueError("ComplianceResult must retain factorization, basis, and n_primal.")
-    verify_plate_orientation(mesh)
-    n_q = int(result.n_primal)
-    n_lambda = int(result.n_lambda or 0)
-    n_extra = n_lambda + 3
-    u_top, v_top = result.selector_dofs("top")
-    u_bot, v_bot = result.selector_dofs("bottom")
-    S_top = build_vector_selector(u_top, v_top, n_q)
-    S_bottom = build_vector_selector(u_bot, v_bot, n_q)
-    loads = sparse.hstack([S_top.T, S_bottom.T]).tocsc()
-    rhs = np.zeros((n_q + n_extra, loads.shape[1]), dtype=float)
-    rhs[:n_q] = loads.toarray()
-    sol = np.asarray(result.factorization.solve(rhs), dtype=float)
-    q = sol[:n_q]
-    lam_raw = sol[n_q : n_q + n_lambda] if n_lambda else np.zeros((0, loads.shape[1]))
-    lam = np.zeros((mesh.n_elements, loads.shape[1]), dtype=float)
-    n_copy = min(lam_raw.shape[0], mesh.n_elements)
-    lam[:n_copy] = lam_raw[:n_copy]
-    has_theta = bool(np.all(mesh.rotation_dof_ids >= 0))
-    B = result.B_p
-    assert B is not None
-
-    q_rigid = np.column_stack(
-        [rigid_primal_from_alpha(result, mesh, e, x_r, y_r) for e in np.eye(3)]
-    )
-    return PlateInfluence(
-        n_top=int(u_top.size),
-        n_bottom=int(u_bot.size),
-        u=q[mesh.u_dof_ids],
-        v=q[mesh.v_dof_ids],
-        theta=q[mesh.rotation_dof_ids] if has_theta else np.zeros((mesh.n_nodes, q.shape[1])),
-        lam=lam,
-        bp=np.asarray(B @ q, dtype=float),
-        top=np.asarray(S_top @ q, dtype=float),
-        bottom=np.asarray(S_bottom @ q, dtype=float),
-        rigid_u=q_rigid[mesh.u_dof_ids],
-        rigid_v=q_rigid[mesh.v_dof_ids],
-        rigid_theta=q_rigid[mesh.rotation_dof_ids] if has_theta else np.zeros((mesh.n_nodes, 3)),
-        rigid_bp=np.asarray(B @ q_rigid, dtype=float),
-        rigid_top=np.asarray(S_top @ q_rigid, dtype=float),
-        rigid_bottom=np.asarray(S_bottom @ q_rigid, dtype=float),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +299,7 @@ COLOR_UNITS = {
     "curvature": "1/length",
     "bending_moment": "force·length",
     "shear_force": "force",
-    "axial_constraint_force": "force",
+    "plate_tension": "force",
     "strain_energy_density": "energy/length",
 }
 
@@ -448,7 +307,7 @@ COLOR_UNITS = {
 def nodal_tangential_normal(
     u: np.ndarray,
     v: np.ndarray,
-    mesh: PlateMeshInfo,
+    mesh: PlateResponse,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return nodal (u_s, w) in node-averaged element frames.
 
@@ -457,25 +316,22 @@ def nodal_tangential_normal(
     """
     u = np.asarray(u, dtype=float)
     v = np.asarray(v, dtype=float)
-    if mesh.n_elements == 0:
-        t = np.broadcast_to(mesh.plate_tangent, (u.size, 2))
-    else:
-        acc = np.zeros((mesh.n_nodes, 2), dtype=float)
-        conn = mesh.element_connectivity
-        np.add.at(acc, conn[:, 0], mesh.element_tangents)
-        np.add.at(acc, conn[:, 1], mesh.element_tangents)
-        t = acc / np.linalg.norm(acc, axis=1, keepdims=True)
+    acc = np.zeros((mesh.n_nodes, 2), dtype=float)
+    conn = mesh.element_connectivity
+    np.add.at(acc, conn[:, 0], mesh.element_tangents)
+    np.add.at(acc, conn[:, 1], mesh.element_tangents)
+    t = acc / np.linalg.norm(acc, axis=1, keepdims=True)
     u_s = t[:, 0] * u + t[:, 1] * v
     w = -t[:, 1] * u + t[:, 0] * v
     return u_s, w
 
 
 def sample_plate_centerline(
-    mesh: PlateMeshInfo,
+    mesh: PlateResponse,
     u: np.ndarray,
     v: np.ndarray,
     theta: np.ndarray,
-    axial_force: np.ndarray,
+    plate_tension: np.ndarray,
     samples_per_element: int = DEFAULT_SAMPLES_PER_ELEMENT,
 ) -> dict[str, np.ndarray]:
     """Hermite-sample the plate centerline without duplicating shared nodes."""
@@ -491,7 +347,7 @@ def sample_plate_centerline(
     curv_list: list[float] = []
     mom_list: list[float] = []
     shear_list: list[float] = []
-    ax_list: list[float] = []
+    tension_list: list[float] = []
     w_list: list[float] = []
     us_list: list[float] = []
     eid_list: list[int] = []
@@ -532,7 +388,7 @@ def sample_plate_centerline(
         curv_list.extend(kappa.tolist())
         mom_list.extend((EI * kappa).tolist())
         shear_list.extend([V] * int(xi.size))
-        ax_list.extend([float(axial_force[e])] * int(xi.size))
+        tension_list.extend([float(plate_tension[e])] * int(xi.size))
         w_list.extend(w.tolist())
         us_list.extend(us.tolist())
         eid_list.extend([e] * int(xi.size))
@@ -545,7 +401,7 @@ def sample_plate_centerline(
         "curvature": np.asarray(curv_list, dtype=float),
         "bending_moment": np.asarray(mom_list, dtype=float),
         "shear_force": np.asarray(shear_list, dtype=float),
-        "axial_force": np.asarray(ax_list, dtype=float),
+        "plate_tension": np.asarray(tension_list, dtype=float),
         "w": np.asarray(w_list, dtype=float),
         "u_s": np.asarray(us_list, dtype=float),
         "element_id": np.asarray(eid_list, dtype=int),
@@ -555,12 +411,11 @@ def sample_plate_centerline(
 
 
 def build_plate_runtime_state(
-    mesh: PlateMeshInfo,
+    mesh: PlateResponse,
     u: np.ndarray,
     v: np.ndarray,
     th: np.ndarray,
-    lam: np.ndarray,
-    ax: np.ndarray,
+    plate_tension: np.ndarray,
     *,
     anchor_x: float,
     d_ax: float,
@@ -574,25 +429,25 @@ def build_plate_runtime_state(
 ) -> PlateRuntimeState:
     """Build Hermite fixed-frame samples from local plate nodal fields.
 
-    ``u, v, th`` are nodal (local frame), ``lam`` / ``ax`` per element. The
+    ``u, v, th`` are nodal (local frame), ``plate_tension`` per element. The
     fixed-frame placement is ``transform_to_fixed_frame`` about the material
     point ``(anchor_x, anchor_y)`` with local displacement ``(d_ax, d_ay)`` and
     true position ``anchor``; ``elastic_scale`` multiplies only the elastic part.
     """
     u, v, th = (np.asarray(a, dtype=float) for a in (u, v, th))
-    lam, ax = np.asarray(lam, dtype=float), np.asarray(ax, dtype=float)
+    plate_tension = np.asarray(plate_tension, dtype=float)
     u_s, w = nodal_tangential_normal(u, v, mesh)
     axial_diff = float(np.max(np.abs(np.diff(u_s)))) if u_s.size > 1 else 0.0
     # Constraint residual from nodal tangential differences (kinematic form).
-    bp_terms = np.zeros(mesh.n_elements)
+    inextensibility_terms = np.zeros(mesh.n_elements)
     for e in range(mesh.n_elements):
         i, j = mesh.element_connectivity[e]
         t = mesh.element_tangents[e]
         du = np.array([u[j] - u[i], v[j] - v[i]])
-        bp_terms[e] = float(t @ du)
-    bp_norm = float(np.linalg.norm(bp_terms))
+        inextensibility_terms[e] = float(t @ du)
+    inextensibility_residual_norm = float(np.linalg.norm(inextensibility_terms))
 
-    samples = sample_plate_centerline(mesh, u, v, th, ax, samples_per_element)
+    samples = sample_plate_centerline(mesh, u, v, th, plate_tension, samples_per_element)
     # Reconstruct reference chord points and elastic displacements so the shared
     # foam/plate transform applies s_d only to the elastic part (never to varphi).
     x_ref = np.zeros_like(samples["x_local"])
@@ -635,7 +490,7 @@ def build_plate_runtime_state(
         "curvature": samples["curvature"],
         "bending_moment": samples["bending_moment"],
         "shear_force": samples["shear_force"],
-        "axial_constraint_force": samples["axial_force"],
+        "plate_tension": samples["plate_tension"],
         # Inextensible plate: bending only, 1/2 M kappa = 1/2 EI kappa^2 per unit length.
         "strain_energy_density": 0.5 * samples["bending_moment"] * samples["curvature"],
     }
@@ -653,8 +508,8 @@ def build_plate_runtime_state(
         "max_abs_curvature": float(np.max(np.abs(samples["curvature"]))) if samples["curvature"].size else 0.0,
         "max_abs_bending_moment": float(np.max(abs_M)) if abs_M.size else 0.0,
         "max_abs_shear_force": float(np.max(np.abs(samples["shear_force"]))) if samples["shear_force"].size else 0.0,
-        "max_abs_axial_constraint_force": float(np.max(np.abs(ax))) if ax.size else 0.0,
-        "plate_constraint_residual": bp_norm,
+        "max_abs_plate_tension": float(np.max(np.abs(plate_tension))) if plate_tension.size else 0.0,
+        "plate_constraint_residual": inextensibility_residual_norm,
         "max_moment_reference_s": float(samples["s"][i_max]) if samples["s"].size else float("nan"),
         "max_moment_local_x": float(samples["x_local"][i_max]) if samples["x_local"].size else float("nan"),
         "max_moment_local_y": float(samples["y_local"][i_max]) if samples["y_local"].size else float("nan"),
@@ -665,12 +520,11 @@ def build_plate_runtime_state(
         u_local=u,
         v_local=v,
         rotation_local=th,
-        constraint_multiplier=lam,
-        axial_force=ax,
+        plate_tension=plate_tension,
         u_tangential=u_s,
         w_normal=w,
         maximum_plate_axial_displacement_difference=axial_diff,
-        plate_constraint_residual_norm=bp_norm,
+        plate_constraint_residual_norm=inextensibility_residual_norm,
         sample_s=samples["s"],
         sample_x_local=samples["x_local"],
         sample_y_local=samples["y_local"],
@@ -681,7 +535,7 @@ def build_plate_runtime_state(
         sample_curvature=samples["curvature"],
         sample_bending_moment=samples["bending_moment"],
         sample_shear_force=samples["shear_force"],
-        sample_axial_force=samples["axial_force"],
+        sample_plate_tension=samples["plate_tension"],
         sample_w=samples["w"],
         sample_u_s=samples["u_s"],
         sample_element_id=samples["element_id"],
@@ -689,59 +543,4 @@ def build_plate_runtime_state(
         color_values=None if color_values is None else np.asarray(color_values, dtype=float),
         color_units=COLOR_UNITS[color],
         summary=summary,
-    )
-
-
-def plate_mesh_from_lookup(lookup) -> PlateMeshInfo | None:
-    """Reconstruct ``PlateMeshInfo`` from saved lookup arrays.
-
-    Runtime Hermite sampling only needs geometry, ``EI_plate_Nm2_per_m``, and
-    tangents/normals. ``n_foam`` / ``n_primal`` are not required at runtime and
-    default to zero when absent from ``plate_metadata``.
-    """
-    if not getattr(lookup, "has_plate_response", False):
-        return None
-    required = (
-        lookup.plate_node_ids,
-        lookup.plate_reference_x,
-        lookup.plate_reference_y,
-        lookup.plate_reference_arc_length,
-        lookup.plate_element_connectivity,
-        lookup.plate_element_lengths,
-        lookup.plate_element_tangents,
-        lookup.plate_element_normals,
-        lookup.plate_u_dof_ids,
-        lookup.plate_v_dof_ids,
-        lookup.plate_rotation_dof_ids,
-        lookup.plate_constraint_ids,
-        lookup.plate_tangent,
-        lookup.plate_normal,
-    )
-    if any(arr is None for arr in required) or not np.isfinite(lookup.EI_plate_Nm2_per_m):
-        return None
-
-    meta = dict(getattr(lookup, "plate_metadata", None) or {})
-    n_foam = int(meta.get("n_foam", 0) or 0)
-    n_primal = int(meta.get("n_primal", 0) or 0)
-    n_lambda = int(np.asarray(lookup.plate_constraint_ids).size)
-
-    return PlateMeshInfo(
-        node_ids=np.asarray(lookup.plate_node_ids, dtype=int),
-        reference_x=np.asarray(lookup.plate_reference_x, dtype=float),
-        reference_y=np.asarray(lookup.plate_reference_y, dtype=float),
-        reference_arc_length=np.asarray(lookup.plate_reference_arc_length, dtype=float),
-        element_connectivity=np.asarray(lookup.plate_element_connectivity, dtype=int),
-        element_lengths=np.asarray(lookup.plate_element_lengths, dtype=float),
-        element_tangents=np.asarray(lookup.plate_element_tangents, dtype=float),
-        element_normals=np.asarray(lookup.plate_element_normals, dtype=float),
-        u_dof_ids=np.asarray(lookup.plate_u_dof_ids, dtype=int),
-        v_dof_ids=np.asarray(lookup.plate_v_dof_ids, dtype=int),
-        rotation_dof_ids=np.asarray(lookup.plate_rotation_dof_ids, dtype=int),
-        constraint_ids=np.asarray(lookup.plate_constraint_ids, dtype=int),
-        plate_tangent=np.asarray(lookup.plate_tangent, dtype=float).reshape(2),
-        plate_normal=np.asarray(lookup.plate_normal, dtype=float).reshape(2),
-        EI_plate_Nm2_per_m=float(lookup.EI_plate_Nm2_per_m),
-        n_foam=n_foam,
-        n_primal=n_primal,
-        n_lambda=n_lambda,
     )

@@ -133,7 +133,7 @@ class SoleModel:
         # Constant 2.5D strip width defaults to the sagittal shoe width (same physical width).
         self.out_of_plane = out_of_plane or OutOfPlaneSettings(shoe_width_m=width)
         self.setup = None
-        op = self.model.operator
+        op = self.model.contact_operator
         self.x_top, self.y_top = op.x_top, op.y_top
         self.x_bottom, self.y_bottom = op.x_bottom, op.y_bottom
         self.reset()
@@ -208,7 +208,7 @@ class SoleModel:
         w = self.shoe_width_m
         F_model = np.array([float(Fx_N), float(Fy_N)]) / w
         low_load = float(np.hypot(Fx_N, Fy_N)) < float(self.toe_config.toe_low_force_threshold_N)
-        op = self.model.operator
+        op = self.model.contact_operator
         t_step = time.perf_counter()
         fr = solve_toe_contact(
             op, F_model, float(np.deg2rad(phi_deg)), self.toe_config, w, warm=self._warm,

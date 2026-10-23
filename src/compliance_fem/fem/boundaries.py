@@ -44,12 +44,6 @@ def split_uv(stacked: np.ndarray, n_nodes: int) -> tuple[np.ndarray, np.ndarray]
     return stacked[:n_nodes], stacked[n_nodes:]
 
 
-def yy_block(matrix: np.ndarray, n_row_nodes: int, n_col_nodes: int) -> np.ndarray:
-    """Extract the vertical-vertical block of a component-major operator."""
-    matrix = np.asarray(matrix, dtype=float)
-    return matrix[n_row_nodes:, n_col_nodes:]
-
-
 def vector_rigid_mode_matrix(
     x: np.ndarray,
     y: np.ndarray,

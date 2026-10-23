@@ -66,7 +66,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from compliance_fem.contact.basis import shape_mode_phi1
+from compliance_fem.contact.basis import shape_mode_toe_bend
 
 TOE_MODEL_PASSIVE_SPRING = "passive_spring"
 TOE_MODEL_PASSIVE_SPRING_ELASTIC_EQUIVALENT = "passive_spring_elastic_equivalent"
@@ -173,54 +173,55 @@ def q_theta_from_q_alpha(q_alpha, alpha):
 class RearfootGeometry:
     """Rearfoot line (heel x=0 -> MTP x=L - toe_length) in the reference chord frame.
 
-    ``L`` and ``toe_length`` are in metres. ``phi1_mtp`` is the shape mode at the
-    MTP point (m, < 0) and ``dy_mtp`` the reference top rise
-    ``y_top(L - toe_length) - y_top(0)`` (m).
+    ``L`` and ``toe_length`` are in metres. ``y_mtp_shape_mode`` is the toe-bend shape
+    mode at the MTP point (m, < 0) and ``y_mtp_0`` the reference top rise
+    ``y_top(L - toe_length) - y_top(0)`` (m), so the deformed rise is
+    ``y_mtp_0 + alpha y_mtp_shape_mode``.
     """
 
     L: float
     toe_length: float
-    phi1_mtp: float
-    dy_mtp: float
+    y_mtp_shape_mode: float
+    y_mtp_0: float
 
     def __post_init__(self) -> None:
         if not (np.isfinite(self.L) and np.isfinite(self.toe_length) and 0.0 < self.toe_length < self.L):
             raise ValueError(f"toe_length must lie inside (0, L={self.L}), got {self.toe_length}.")
-        if not (np.isfinite(self.phi1_mtp) and np.isfinite(self.dy_mtp)):
+        if not (np.isfinite(self.y_mtp_shape_mode) and np.isfinite(self.y_mtp_0)):
             raise ValueError("Rearfoot geometry must be finite.")
 
     @property
     def reference_angle(self) -> float:
-        """Reference rearfoot-line angle in the mesh frame, atan2(dy_mtp, L - toe_length)."""
-        return float(np.arctan2(self.dy_mtp, self.L - self.toe_length))
+        """Reference rearfoot-line angle in the mesh frame, atan2(y_mtp_0, L - toe_length)."""
+        return float(np.arctan2(self.y_mtp_0, self.L - self.toe_length))
 
     def chord_rotation(self, phi_rearfoot: float, alpha):
-        """varphi(alpha) = phi_rearfoot - atan2(dy_mtp + alpha phi1_mtp, L - toe_length)."""
+        """varphi(alpha) = phi_rearfoot - atan2(y_mtp_0 + alpha y_mtp_shape_mode, L - toe_length)."""
         a = np.asarray(alpha, dtype=float)
-        return float(phi_rearfoot) - np.arctan2(self.dy_mtp + a * self.phi1_mtp, self.L - self.toe_length)
+        return float(phi_rearfoot) - np.arctan2(self.y_mtp_0 + a * self.y_mtp_shape_mode, self.L - self.toe_length)
 
     def chord_rotation_derivative(self, alpha):
-        """d varphi / d alpha = -x_mtp phi1_mtp / (x_mtp^2 + (dy_mtp + alpha phi1_mtp)^2), x_mtp = L - toe_length."""
+        """d varphi / d alpha = -x_mtp y_mtp_shape_mode / (x_mtp^2 + (y_mtp_0 + alpha y_mtp_shape_mode)^2), x_mtp = L - toe_length."""
         a = np.asarray(alpha, dtype=float)
         x_mtp = self.L - self.toe_length
-        h = self.dy_mtp + a * self.phi1_mtp
-        return -x_mtp * self.phi1_mtp / (x_mtp * x_mtp + h * h)
+        h = self.y_mtp_0 + a * self.y_mtp_shape_mode
+        return -x_mtp * self.y_mtp_shape_mode / (x_mtp * x_mtp + h * h)
 
     def to_dict(self) -> dict:
         return {
             "L": float(self.L),
             "toe_length": float(self.toe_length),
-            "phi1_mtp": float(self.phi1_mtp),
-            "dy_mtp": float(self.dy_mtp),
+            "y_mtp_shape_mode": float(self.y_mtp_shape_mode),
+            "y_mtp_0": float(self.y_mtp_0),
         }
 
 
 def rearfoot_toe_mode(
-    phi1_top: np.ndarray, x_top: np.ndarray, L: float, toe_length: float, phi1_mtp: float
+    shape_mode_toe_bend_top: np.ndarray, x_top: np.ndarray, L: float, toe_length: float, y_mtp_shape_mode: float
 ) -> np.ndarray:
-    """psi(x) = phi1(x) - (x/(L - toe_length)) phi1_mtp: sole motion relative to the heel->MTP line."""
+    """psi(x) = phi1(x) - (x/(L - toe_length)) y_mtp_shape_mode: sole motion relative to the heel->MTP line."""
     x = np.asarray(x_top, dtype=float)
-    return np.asarray(phi1_top, dtype=float) - (x / (float(L) - float(toe_length))) * float(phi1_mtp)
+    return np.asarray(shape_mode_toe_bend_top, dtype=float) - (x / (float(L) - float(toe_length))) * float(y_mtp_shape_mode)
 
 
 def ramp_virtual_displacement(x_top: np.ndarray, x_mtp: float) -> np.ndarray:
@@ -285,16 +286,15 @@ def warn_if_mtp_not_on_top_grid(x_top: np.ndarray, L: float, toe_length: float) 
 
 def rearfoot_geometry(
     x_top: np.ndarray,
-    y_top: np.ndarray | None,
+    y_top: np.ndarray,
     L: float,
     toe_length: float,
     kappa: float,
 ) -> RearfootGeometry:
-    """Heel->MTP line of the reference top, with the MTP point at ``x = L - toe_length``."""
+    """
+    Find the coefficients such that 
+    y_mtp - y_heel = y_mtp_shape_mode * toe_bend_coefficient + y_mtp_0"""
     x_mtp = float(L) - float(toe_length)
-    phi1_mtp = float(shape_mode_phi1(np.array([x_mtp]), float(L), float(toe_length), float(kappa))[0])
-    if y_top is None:
-        dy_mtp = 0.0
-    else:
-        dy_mtp = interpolate_top_height(x_top, y_top, x_mtp) - interpolate_top_height(x_top, y_top, 0.0)
-    return RearfootGeometry(L=float(L), toe_length=float(toe_length), phi1_mtp=phi1_mtp, dy_mtp=float(dy_mtp))
+    y_mtp_shape_mode = float(shape_mode_toe_bend(np.array([x_mtp]), float(L), float(toe_length), float(kappa))[0])
+    y_mtp_0 = interpolate_top_height(x_top, y_top, x_mtp) - interpolate_top_height(x_top, y_top, 0.0)
+    return RearfootGeometry(L=float(L), toe_length=float(toe_length), y_mtp_shape_mode=y_mtp_shape_mode, y_mtp_0=float(y_mtp_0))

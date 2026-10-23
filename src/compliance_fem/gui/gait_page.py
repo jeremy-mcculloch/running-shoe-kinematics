@@ -30,7 +30,7 @@ from compliance_fem.contact.toe_spring import (
 
 def _frame_q_alpha_curve(model: ContactModel, result, i: int, theta: np.ndarray) -> np.ndarray:
     """Exact Q_alpha,shoe->foot(theta) at frame ``i``: one contact solve per theta (chord follows alpha)."""
-    op = model.operator
+    op = model.contact_operator
     width = float(result.model_info.get("shoe_width_m", 1.0))
     F = np.array([float(result.elastic_Fx[i]), float(result.elastic_Fy[i])])
     phi = float(result.phi[i]) if np.isfinite(result.phi[i]) else 0.0

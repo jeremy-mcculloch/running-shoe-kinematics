@@ -581,7 +581,7 @@ def replay_stance(
         Fe[i, :2] = material.update(Fve[i, :2], float(times[i]))
         Fe[i, 2] = Fve[i, 2]
 
-    op = contact_model.operator
+    op = contact_model.contact_operator
     n_b = op.n_bottom
     toe_low_force_model = float(toe_cfg.toe_low_force_threshold_N) * inv_w
     model_info["contact_formulation"] = CONTACT_FORMULATION
@@ -593,7 +593,7 @@ def replay_stance(
     )
     model_info["toe_rearfoot_kinematics"] = {
         "phi_is": "fixed-frame heel -> MTP (rearfoot) marker angle",
-        "chord_rotation": "varphi(alpha) = phi - atan2(dy_mtp + alpha*phi1_mtp, L - toe_length)",
+        "chord_rotation": "varphi(alpha) = phi - atan2(y_mtp_0 + alpha*y_mtp_shape_mode, L - toe_length)",
         "varphi_column": "chord-frame rotation at the solved toe angle",
         **op.rearfoot.to_dict(),
     }

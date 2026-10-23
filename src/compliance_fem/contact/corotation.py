@@ -40,13 +40,11 @@ import numpy as np
 # constant (and nothing else) if the softplus convention ever changes.
 SHAPE_MODE_SIGN = 1.0
 
-def reference_chord_angle(x_top: np.ndarray, y_top: np.ndarray | None) -> float:
+def reference_chord_angle(x_top: np.ndarray, y_top: np.ndarray) -> float:
     """Reference heel-to-toe chord angle phi_ref = atan2(y_top(L) - y_top(0), L).
 
-    Returns 0.0 for a horizontal (or missing) top profile.
+    Returns 0.0 for a horizontal top profile.
     """
-    if y_top is None:
-        return 0.0
     x = np.asarray(x_top, dtype=float).reshape(-1)
     y = np.asarray(y_top, dtype=float).reshape(-1)
     if x.size < 2 or y.size != x.size:

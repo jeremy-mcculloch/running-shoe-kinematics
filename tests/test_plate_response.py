@@ -9,7 +9,6 @@ import pytest
 
 from compliance_fem.contact.contact_model import (
     LOOKUP_SCHEMA_VERSION,
-    PLATE_INFLUENCE_ARRAY_FIELDS,
     REGENERATE_LOOKUP_MESSAGE,
     ContactModel,
     build_contact_model,
@@ -24,8 +23,7 @@ from compliance_fem.contact.sole_config import SoleConfig
 from compliance_fem.fem.compliance import compute_compliance
 from compliance_fem.fem.plate_response import (
     COLOR_UNITS,
-    axial_force_from_multiplier,
-    extract_plate_mesh_info,
+    PLATE_ARRAY_FIELDS,
     hermite_curvature,
     hermite_deflection,
     hermite_rotation,
@@ -53,21 +51,19 @@ def fem_result(sole_config: SoleConfig):
 
 @pytest.fixture(scope="module")
 def model(fem_result) -> ContactModel:
-    m = build_contact_model(fem_result, toe_length=SMALL_TOE_LENGTH, kappa=30.0)
-    assert m.has_plate_response
-    return m
+    return build_contact_model(fem_result, toe_length=SMALL_TOE_LENGTH, kappa=30.0)
 
 
 @pytest.fixture(scope="module")
-def plate_mesh(fem_result):
-    return extract_plate_mesh_info(fem_result)
+def plate_mesh(model):
+    return model.plate
 
 
 @pytest.fixture(scope="module")
 def solution(model: ContactModel) -> ContactSolution:
     # Moderate compressive load (per metre width) with small rotations.
     return solve_contact_state(
-        model.operator, np.deg2rad(-2.0), np.tan(np.deg2rad(1.5)), np.array([50.0, -2.0e3])
+        model.contact_operator, np.deg2rad(-2.0), np.tan(np.deg2rad(1.5)), np.array([50.0, -2.0e3])
     )
 
 
@@ -90,19 +86,18 @@ def _rel_atol(ref: np.ndarray | float, cfg: SoleConfig, rtol: float = 1e-8) -> f
 # ---------------------------------------------------------------------------
 
 
-def test_plate_dof_indices_identify_continuum_and_rotations(fem_result, plate_mesh) -> None:
-    n_foam = plate_mesh.n_foam
-    n_plate = plate_mesh.n_nodes
-    assert n_foam == int(fem_result.basis.N)
-    assert np.all(plate_mesh.u_dof_ids >= 0)
-    assert np.all(plate_mesh.u_dof_ids < n_foam)
-    assert np.all(plate_mesh.v_dof_ids >= 0)
-    assert np.all(plate_mesh.v_dof_ids < n_foam)
+def test_plate_dof_indices_identify_continuum_and_rotations(fem_result) -> None:
+    n_foam = int(fem_result.basis.N)
+    n_plate = fem_result.n_plate_nodes
+    assert np.all(fem_result.plate_u_dof_ids >= 0)
+    assert np.all(fem_result.plate_u_dof_ids < n_foam)
+    assert np.all(fem_result.plate_v_dof_ids >= 0)
+    assert np.all(fem_result.plate_v_dof_ids < n_foam)
     np.testing.assert_array_equal(
-        plate_mesh.rotation_dof_ids,
+        fem_result.plate_rotation_dof_ids,
         np.arange(n_foam, n_foam + n_plate, dtype=int),
     )
-    assert plate_mesh.n_primal == n_foam + n_plate
+    assert fem_result.n_primal == n_foam + n_plate
 
 
 
@@ -113,22 +108,20 @@ def test_plate_dof_indices_identify_continuum_and_rotations(fem_result, plate_me
 
 
 def test_serialization_preserves_plate_fields(model, tmp_path: Path, sole_config) -> None:
-    """save / load roundtrip preserves the plate influence and plate mesh."""
+    """save / load roundtrip preserves the plate response and its reference geometry."""
     npz_path = save_contact_model(model, tmp_path / "lookup_plate")
     reloaded = load_contact_model(npz_path)
-    assert reloaded.has_plate_response
     assert reloaded.schema_version == LOOKUP_SCHEMA_VERSION
-    for name in PLATE_INFLUENCE_ARRAY_FIELDS:
-        ref = getattr(model.plate_influence, name)
-        np.testing.assert_allclose(getattr(reloaded.plate_influence, name), ref, atol=_rel_atol(ref, sole_config))
-    np.testing.assert_allclose(reloaded.plate_mesh.reference_x, model.plate_mesh.reference_x)
-    np.testing.assert_allclose(reloaded.plate_mesh.reference_y, model.plate_mesh.reference_y)
-    np.testing.assert_array_equal(reloaded.plate_mesh.node_ids, model.plate_mesh.node_ids)
-    assert reloaded.plate_mesh.n_nodes == model.plate_mesh.n_nodes
+    for name in PLATE_ARRAY_FIELDS:
+        ref = getattr(model.plate, name)
+        np.testing.assert_allclose(getattr(reloaded.plate, name), ref, atol=_rel_atol(ref, sole_config))
+    np.testing.assert_allclose(reloaded.plate.reference_x, model.plate.reference_x)
+    np.testing.assert_allclose(reloaded.plate.reference_y, model.plate.reference_y)
+    np.testing.assert_allclose(reloaded.plate.element_tangents, model.plate.element_tangents)
     assert reloaded.EI_plate_Nm2_per_m == pytest.approx(model.EI_plate_Nm2_per_m)
 
 
-@pytest.mark.parametrize("version", (5, 11, 12))
+@pytest.mark.parametrize("version", (5, 11, 12, 13, 14, 15, 16))
 def test_other_schema_versions_rejected(model, tmp_path: Path, version: int) -> None:
     npz_path = save_contact_model(model, tmp_path / "lookup")
     with np.load(npz_path, allow_pickle=True) as npz:
@@ -250,14 +243,7 @@ def test_infinite_ea_tangential_differences_below_tolerance(model, solution, sol
     ) + 1e-8 * max(1.0, float(np.max(np.abs(state.u_tangential))))
     f = plate_fields(model, solution)
     scale = max(1.0, float(np.max(np.abs(np.concatenate([f["u"], f["v"]])))))
-    assert float(f["bp_residual"][0]) < 1e-8 * scale
-
-
-def test_axial_force_from_multiplier_is_identity() -> None:
-    """16. Multiplier-to-axial-force is identity for unscaled rows."""
-    lam = np.array([1.5, -0.2, 3.0])
-    np.testing.assert_array_equal(axial_force_from_multiplier(lam), lam)
-    assert axial_force_from_multiplier(lam) is not lam  # returns a copy
+    assert float(f["inextensibility_residual_norm"][0]) < 1e-8 * scale
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +270,7 @@ def test_fixed_frame_plate_coordinates_agree_with_foam_transform(model, solution
         y_ref[idx] = X[1]
     u_samp = state.sample_x_local - x_ref
     v_samp = state.sample_y_local - y_ref
-    x_f, y_f = fixed_frame_positions(model.operator, solution, x_ref, y_ref, u_samp, v_samp)
+    x_f, y_f = fixed_frame_positions(model.contact_operator, solution, x_ref, y_ref, u_samp, v_samp)
     np.testing.assert_allclose(state.sample_x_fixed, x_f, atol=_rel_atol(x_f, sole_config, rtol=1e-12))
     np.testing.assert_allclose(state.sample_y_fixed, y_f, atol=_rel_atol(y_f, sole_config, rtol=1e-12))
 
@@ -339,7 +325,7 @@ def test_plate_color_quantities_and_units(model, solution) -> None:
         "curvature": "1/length",
         "bending_moment": "force·length",
         "shear_force": "force",
-        "axial_constraint_force": "force",
+        "plate_tension": "force",
         "strain_energy_density": "energy/length",
     }
     assert COLOR_UNITS == expected

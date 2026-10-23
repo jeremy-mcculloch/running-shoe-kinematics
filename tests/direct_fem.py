@@ -3,9 +3,9 @@
 Given the top shape amplitude ``alpha`` and the local bottom nodal forces
 ``f_b`` of a contact state, the full sparse system ``K u = f`` (plus the plate
 inextensibility constraints ``B_p``) is solved with the top selector clamped to
-``alpha * w_alpha``. It shares no code with the condensed boundary operators
-except the assembled stiffness, so it independently checks ``G_bb``,
-``d_alpha``, the top forces, the full-field (render) recovery and the plate
+``alpha * shape_mode_toe_bend``. It shares no code with the condensed boundary operators
+except the assembled stiffness, so it independently checks ``db_fb``,
+``db_toe``, the top forces, the full-field (render) recovery and the plate
 recovery. Must not be imported from ``src/``.
 """
 
@@ -50,17 +50,17 @@ def solve_top_clamped(result: ComplianceResult, w_top: np.ndarray, f_bottom: np.
     np.add.at(f, u_bot, f_b[:n_b])
     np.add.at(f, v_bot, f_b[n_b:])
     D = np.unique(np.concatenate([u_top, v_top]))
-    if result.B_p is not None:
-        B = result.B_p.tocsc()
-        n_l = B.shape[0]
-        A = sparse.bmat([[K0, B.T], [B, sparse.csc_matrix((n_l, n_l))]], format="csc")
+    if result.plate_inextensibility_constraint is not None:
+        plate_inextensibility_constraint = result.plate_inextensibility_constraint.tocsc()
+        n_l = plate_inextensibility_constraint.shape[0]
+        A = sparse.bmat([[K0, plate_inextensibility_constraint.T], [plate_inextensibility_constraint, sparse.csc_matrix((n_l, n_l))]], format="csc")
         rhs = np.concatenate([f, np.zeros(n_l)])
         x0a = np.concatenate([x0, np.zeros(n_l)])
         A_c, f_c, x_out, I_out = cast(_Condensed, condense(A, rhs, x=x0a, D=D))
         x = x_out.copy()
         x[I_out] = spsolve(A_c.tocsc(), f_c)
         u, lam = x[:n_q], x[n_q:]
-        residual = np.asarray(K0 @ u + B.T @ lam - f, dtype=float)
+        residual = np.asarray(K0 @ u + plate_inextensibility_constraint.T @ lam - f, dtype=float)
     else:
         K_c, f_c, x_out, I_out = cast(_Condensed, condense(K0, f, x=x0, D=D))
         u = x_out.copy()

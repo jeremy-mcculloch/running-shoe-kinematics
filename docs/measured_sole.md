@@ -186,17 +186,16 @@ because the top selector is no longer at constant height.
 
 ## Lookup schema and compatibility
 
-The contact model file `contact_lookup.npz` uses `schema_version = 13` and the
-compliance NPZ uses `compliance_schema_version = 5`. The contact model stores
+The contact model file `contact_lookup.npz` uses `schema_version = 17` and the
+compliance NPZ uses `compliance_schema_version = 7`. The contact model stores
 the shared contact operator (`contact_operator_*`: top-clamped bottom
-compliance `G_bb` and the related top-force, rigid-amplitude and toe-mode
-operators, with rigid amplitudes about \(x_r=L/2,\ y_r=0\)), the plate mesh and
-plate influence matrices, and a measured geometry section (mesh points,
-triangles, element regions, curve / loop node ids, render influence matrices,
-`geometry_metadata_json`). Files with any other
-schema version (including the older per-interval lookups) are rejected with a
-regenerate message, and a file with only part of the render section is
-rejected.
+compliance `db_fb` and the related top-force, rigid-amplitude and toe-mode
+operators, with rigid amplitudes about \(x_r=L/2,\ y_r=0\)), the render section
+(`render_*`: mesh points, triangles, element regions and moduli, curve / loop
+node ids, render influence matrices), the plate response (`plate_*`) and
+`geometry_metadata_json` (layout in `docs/continuous_contact.md`). Files with any
+other schema version (including the older per-interval lookups) are rejected
+with a regenerate message, and so is a file missing part of any section.
 
 The render influence covers **every mesh vertex** (not only the region
 loops), and the section also stores per-element plane-strain moduli
@@ -205,7 +204,7 @@ centroid). The GUI uses them to draw the deformed mesh and colour each
 triangle by its strain energy density
 \(W=\tfrac{\lambda}{2}(\operatorname{tr}\varepsilon)^2+\mu\,\varepsilon:\varepsilon\)
 (J/m³, from the true displacement, P1 strain per triangle;
-`geometry.render.element_strain_energy_density`). The plate is coloured by
+`RenderSection.strain_energy_density`). The plate is coloured by
 its bending energy per unit length \(\tfrac12 EI\kappa^2\) (plate colour
 quantity `strain_energy_density`; the plate is inextensible, so there is no
 membrane term). Both colour scales are separate and cap at the 99th
@@ -267,7 +266,7 @@ compliance-fem-contact-lookup configs/setup.json [--force] [--save-fem] [--skip-
 ```
 
 `compliance-fem-contact-lookup` skips the build if `lookup.output_dir` already
-holds a schema-13 file with the same fingerprint, unless `--force` is given. It
+holds a schema-17 file with the same fingerprint, unless `--force` is given. It
 uses the config file as is: there are no per-parameter override flags, so edit
 (or copy) the config to change a value.
 
@@ -305,7 +304,7 @@ to the interface. The deformed shape of every mesh vertex comes from the
 solved boundary loads and rigid amplitudes through the stored influence
 matrices, \(\mathbf d=G_{\mathrm{loads}}\,[\mathbf F_t;\mathbf f_b]+G_{\mathrm{rigid}}\,\mathbf a\)
 (`render_influence_loads`, `render_influence_rigid`), and the plate fields
-likewise from the plate influence matrices, so no FEM solve is needed at
+likewise from the plate response, so no FEM solve is needed at
 runtime. The display scale \(s_d\) exaggerates only the elastic part, about
 the reaction-weighted contact centroid, so the drawn shape does not jump when
 the contact set changes.

@@ -71,24 +71,24 @@ def assemble_axial_constraints(
         rows.extend([row, row, row, row])
         cols.extend([int(u_dofs[j]), int(v_dofs[j]), int(u_dofs[jp1]), int(v_dofs[jp1])])
         data.extend([-t_e[0], -t_e[1], t_e[0], t_e[1]])
-    B = sparse.csc_matrix((data, (rows, cols)), shape=(n_constraints, n_q))
-    if n_theta > 0 and sparse.linalg.norm(B[:, n_foam:]) != 0.0:
+    plate_inextensibility_constraint = sparse.csc_matrix((data, (rows, cols)), shape=(n_constraints, n_q))
+    if n_theta > 0 and sparse.linalg.norm(plate_inextensibility_constraint[:, n_foam:]) != 0.0:
         raise ValueError("Axial constraints must not act on plate rotation DOFs.")
-    return B
+    return plate_inextensibility_constraint
 
 
-def constraint_rank(B: sparse.csc_matrix | np.ndarray, tol: float | None = None) -> int:
+def constraint_rank(plate_inextensibility_constraint: sparse.csc_matrix | np.ndarray, tol: float | None = None) -> int:
     """Return the numerical rank of B_p."""
-    dense = B.toarray() if sparse.issparse(B) else np.asarray(B, dtype=float)
+    dense = plate_inextensibility_constraint.toarray() if sparse.issparse(plate_inextensibility_constraint) else np.asarray(plate_inextensibility_constraint, dtype=float)
     return int(np.linalg.matrix_rank(dense, tol=tol))
 
 
-def verify_constraint_rank(B: sparse.csc_matrix, n_plate: int, tol: float | None = None) -> int:
+def verify_constraint_rank(plate_inextensibility_constraint: sparse.csc_matrix, n_plate: int, tol: float | None = None) -> int:
     """Assert that B_p has n_plate - 1 independent rows."""
     expected = n_plate - 1
-    if B.shape[0] != expected:
-        raise ValueError(f"B_p has {B.shape[0]} rows; expected {expected}.")
-    rank = constraint_rank(B, tol=tol)
+    if plate_inextensibility_constraint.shape[0] != expected:
+        raise ValueError(f"plate_inextensibility_constraint has {plate_inextensibility_constraint.shape[0]} rows; expected {expected}.")
+    rank = constraint_rank(plate_inextensibility_constraint, tol=tol)
     if rank != expected:
-        raise ValueError(f"B_p has numerical rank {rank}; expected {expected}.")
+        raise ValueError(f"plate_inextensibility_constraint has numerical rank {rank}; expected {expected}.")
     return rank

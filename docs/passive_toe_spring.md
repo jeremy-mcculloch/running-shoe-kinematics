@@ -55,7 +55,7 @@ warning is issued if it is nonzero, and it never enters the solve.
 
 The top surface is glued to the foot: in the top-attached frame its
 displacement is prescribed as \(u_{\mathrm{top}}=0\),
-\(v_{\mathrm{top}}=\alpha\,\varphi_1(x)\) (`w_alpha` of the contact operator),
+\(v_{\mathrm{top}}=\alpha\,\varphi_1(x)\) (`shape_mode_toe_bend` of the contact operator),
 so \(\alpha\) is the only top degree of freedom. Here
 
 \[
@@ -117,7 +117,7 @@ therefore:
    \]
    which is \(\approx\max(0,x-x_{\mathrm{mtp}})\): a rotation of the toe segment about the
    MTP point. \(\psi-\varphi_1\) is linear in \(x\) (a rigid rotation about the
-   heel). \(\psi\) at the top nodes is stored as `psi_top` in the contact
+   heel). \(\psi\) at the top nodes is stored as `toe_shape_mode_flat_rearfoot` in the contact
    operator (`toe_spring.rearfoot_toe_mode`).
 
 ### Generalized force
@@ -281,11 +281,11 @@ ODE/DAE per frame; (3) consistent state updates when the contact set changes.
 
 ## Stored data
 
-The contact model file (`contact_lookup.npz`, `schema_version = 13`) stores
+The contact model file (`contact_lookup.npz`, `schema_version = 17`) stores
 no per-contact-set toe data. The toe solve uses the contact operator's
-`w_alpha` (top shape mode), `f_alpha`, `P_tb`, `psi_top`, the softplus toe
-length and `kappa`, and the rearfoot geometry scalars `rearfoot_phi1_mtp`,
-`rearfoot_dy_mtp`. Files with a different schema version are rejected and
+`shape_mode_toe_bend` (top shape mode), `ft_toe`, `ft_fb`, `toe_shape_mode_flat_rearfoot`, the softplus toe
+length and `kappa`, and the rearfoot geometry scalars `rearfoot_y_mtp_shape_mode`,
+`rearfoot_y_mtp_0`. Files with a different schema version are rejected and
 must be regenerated.
 
 ## Outputs
@@ -304,7 +304,7 @@ chord offset). The GUI redraws the \(Q_\alpha(\theta)\) and
 \(\partial U/\partial\alpha\) curves of a frame with one exact contact solve per
 plotted \(\theta\). `model_info.json` includes `toe_config`, `toe_equation`,
 `toe_generalized_force`, `toe_rearfoot_kinematics` (`L`, `toe_length`,
-`phi1_mtp` \(=\varphi_1(L-\ell_{\mathrm{toe}})\), `dy_mtp`) and `toe_summary`
+`y_mtp_shape_mode` \(=\varphi_1(L-\ell_{\mathrm{toe}})\), `y_mtp_0`) and `toe_summary`
 (θ range, maximum residuals, multiple-root / no-root / unstable / low-load
 frame counts, mean toe iterations, maximum spring energy).
 

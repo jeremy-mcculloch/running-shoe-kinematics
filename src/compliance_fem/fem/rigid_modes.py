@@ -112,13 +112,13 @@ def build_enlarged_rigid_modes(
 
 
 def verify_constraint_on_modes(
-    B: sparse.csc_matrix,
+    plate_inextensibility_constraint: sparse.csc_matrix,
     R: sparse.csc_matrix,
     rtol: float = 1e-8,
 ) -> float:
-    """Verify B @ R ≈ 0 and return a relative residual."""
-    residual = B @ R
-    scale = max(sparse.linalg.norm(B) * sparse.linalg.norm(R), 1e-30)
+    """Verify plate_inextensibility_constraint @ R ≈ 0 and return a relative residual."""
+    residual = plate_inextensibility_constraint @ R
+    scale = max(sparse.linalg.norm(plate_inextensibility_constraint) * sparse.linalg.norm(R), 1e-30)
     rel = sparse.linalg.norm(residual) / scale
     if rel > rtol:
         raise ValueError(

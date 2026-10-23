@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from compliance_fem.contact.basis import shape_mode_phi1
+from compliance_fem.contact.basis import shape_mode_toe_bend
 from compliance_fem.contact.contact_model import ContactModel, build_contact_model
 from compliance_fem.contact.continuous_toe import solve_toe_contact
 from compliance_fem.contact.toe_spring import (
@@ -30,7 +30,7 @@ from conftest import small_config
 
 K = 25.0
 TOE_LENGTH_SOFT = 0.4
-KAPPA = 30.0
+TOE_BEND_SCALE_FACTOR = 30.0
 
 
 @pytest.fixture(scope="module")
@@ -51,26 +51,26 @@ def fem():
 
 @pytest.fixture(scope="module")
 def model(fem) -> ContactModel:
-    return build_contact_model(fem, toe_length=TOE_LENGTH_SOFT, kappa=KAPPA)
+    return build_contact_model(fem, toe_length=TOE_LENGTH_SOFT, kappa=TOE_BEND_SCALE_FACTOR)
 
 
 def test_rearfoot_mode_vanishes_at_heel_and_mtp(model) -> None:
-    op = model.operator
-    geo = rearfoot_geometry(op.x_top, op.y_top, model.L, TOE_LENGTH_SOFT, KAPPA)
+    op = model.contact_operator
+    geo = rearfoot_geometry(op.x_top, op.y_top, model.L, TOE_LENGTH_SOFT, TOE_BEND_SCALE_FACTOR)
     assert geo == op.rearfoot
     x = np.array([0.0, geo.L - geo.toe_length, model.L])
-    phi1 = shape_mode_phi1(x, model.L, TOE_LENGTH_SOFT, KAPPA)
-    psi = rearfoot_toe_mode(phi1, x, geo.L, geo.toe_length, geo.phi1_mtp)
+    phi1 = shape_mode_toe_bend(x, model.L, TOE_LENGTH_SOFT, TOE_BEND_SCALE_FACTOR)
+    psi = rearfoot_toe_mode(phi1, x, geo.L, geo.toe_length, geo.y_mtp_shape_mode)
     assert psi[0] == pytest.approx(0.0, abs=1e-15)
     assert psi[1] == pytest.approx(0.0, abs=1e-15)
     # Toe tip rises relative to the rearfoot line by ~ toe_length per unit alpha.
     assert psi[2] > 0.0
     assert psi[2] == pytest.approx(geo.toe_length, rel=0.1)
     psi_top = rearfoot_toe_mode(
-        shape_mode_phi1(op.x_top, model.L, TOE_LENGTH_SOFT, KAPPA), op.x_top, geo.L, geo.toe_length, geo.phi1_mtp
+        shape_mode_toe_bend(op.x_top, model.L, TOE_LENGTH_SOFT, TOE_BEND_SCALE_FACTOR), op.x_top, geo.L, geo.toe_length, geo.y_mtp_shape_mode
     )
-    np.testing.assert_allclose(op.psi_top, psi_top, atol=1e-14)
-    assert np.all(op.psi_top[op.x_top >= geo.L - geo.toe_length] >= -1e-12)
+    np.testing.assert_allclose(op.toe_shape_mode_flat_rearfoot, psi_top, atol=1e-14)
+    assert np.all(op.toe_shape_mode_flat_rearfoot[op.x_top >= geo.L - geo.toe_length] >= -1e-12)
 
 
 # Units: phi1 is a length (scales with the sole), so Q = -psi^T f is force x length.
@@ -78,8 +78,8 @@ def test_shape_mode_scales_as_a_length() -> None:
     x = np.linspace(0.0, 1.0, 17)
     s = 3.7
     np.testing.assert_allclose(
-        shape_mode_phi1(s * x, s * 1.0, s * TOE_LENGTH_SOFT, KAPPA),
-        s * shape_mode_phi1(x, 1.0, TOE_LENGTH_SOFT, KAPPA),
+        shape_mode_toe_bend(s * x, s * 1.0, s * TOE_LENGTH_SOFT, TOE_BEND_SCALE_FACTOR),
+        s * shape_mode_toe_bend(x, 1.0, TOE_LENGTH_SOFT, TOE_BEND_SCALE_FACTOR),
         rtol=1e-12,
     )
 
@@ -109,8 +109,8 @@ def test_no_small_angle_substitution(model) -> None:
     assert spring_dU_dalpha(1.0, K) == pytest.approx(K * np.pi / 8.0)
     assert abs(spring_dU_dalpha(1.0, K) - K * 1.0 / 2.0) > 2.0
     cfg = ToeSpringConfig()
-    phi = model.operator.rearfoot.reference_angle
-    fr = solve_toe_contact(model.operator, np.array([500.0, -6.0e3]), phi, cfg, 0.1)
+    phi = model.contact_operator.rearfoot.reference_angle
+    fr = solve_toe_contact(model.contact_operator, np.array([500.0, -6.0e3]), phi, cfg, 0.1)
     assert fr.converged
     assert abs(fr.theta_rad) > 1e-3
     assert fr.alpha == pytest.approx(np.tan(fr.theta_rad), rel=1e-14)
@@ -132,12 +132,12 @@ def test_no_small_angle_substitution(model) -> None:
 # lies exactly along the prescribed angle.
 def test_solved_configuration_keeps_measured_rearfoot_angle(model) -> None:
     phi = 0.12
-    op = model.operator
+    op = model.contact_operator
     fr = solve_toe_contact(op, np.array([500.0, -6.0e3]), phi, ToeSpringConfig(), 0.1)
     assert fr.converged
     geo = op.rearfoot
     x = np.array([0.0, geo.L - geo.toe_length])
-    phi1 = shape_mode_phi1(x, model.L, TOE_LENGTH_SOFT, KAPPA)
+    phi1 = shape_mode_toe_bend(x, model.L, TOE_LENGTH_SOFT, TOE_BEND_SCALE_FACTOR)
     v = np.interp(x, op.x_top, op.y_top) + fr.alpha * phi1
     rearfoot_local = np.arctan2(v[1] - v[0], x[1] - x[0])
     assert fr.varphi + rearfoot_local == pytest.approx(phi, abs=1e-12)

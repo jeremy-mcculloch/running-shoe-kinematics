@@ -200,7 +200,7 @@ PLATE_COLOR_OPTIONS = {
     "Curvature": "curvature",
     "Bending moment": "bending_moment",
     "Shear force": "shear_force",
-    "Axial constraint force": "axial_constraint_force",
+    "Plate tension": "plate_tension",
     "Strain energy density": "strain_energy_density",
 }
 
@@ -211,7 +211,7 @@ PLATE_SUMMARY_LABELS = {
     "max_abs_curvature": "Max |κ|",
     "max_abs_bending_moment": "Max |M|",
     "max_abs_shear_force": "Max |V|",
-    "max_abs_axial_constraint_force": "Max |N_ax|",
+    "max_abs_plate_tension": "Max |plate tension|",
     "plate_constraint_residual": "‖B_p u‖",
     "max_moment_reference_s": "s at max |M|",
 }
@@ -219,7 +219,7 @@ PLATE_SUMMARY_LABELS = {
 HELP_TEXT = """
 **phi** is the fixed-frame pitch, counterclockwise positive. With the passive toe
 spring it is the rearfoot (heel → MTP) angle and the chord rotation follows from
-the solved toe angle, `varphi(alpha) = phi − atan2(dy_mtp + alpha phi1_mtp, L − toe length)`.
+the solved toe angle, `varphi(alpha) = phi − atan2(y_mtp_0 + alpha y_mtp_shape_mode, L − toe length)`.
 With a prescribed θ it is the heel-to-toe chord angle, `varphi = phi − phi_ref`.
 
 **theta** drives the single endpoint-fixed softplus shape mode through
@@ -396,10 +396,9 @@ def _draw_shape(
             )
         )
 
-    if shape.has_render_mesh:
-        _draw_regions(fig, shape, _line, show_reference_geometry)
+    _draw_regions(fig, shape, _line, show_reference_geometry)
 
-    # Plate: Hermite superposition when available, otherwise schematic interface.
+    # Plate: Hermite superposition from the shared plate response.
     if shape.has_plate:
         if (
             shape.show_undeformed_plate
@@ -414,8 +413,7 @@ def _draw_shape(
                 width=1.5,
                 dash="dash",
             )
-        px = shape.plate_x_def if shape.plate_x_def is not None else shape.x_plate_def
-        py = shape.plate_y_def if shape.plate_y_def is not None else shape.y_plate_def
+        px, py = shape.plate_x_def, shape.plate_y_def
         if px is not None and py is not None:
             color_vals = shape.plate_color_values
             if (
@@ -494,14 +492,6 @@ def _draw_shape(
                     hoverinfo="skip",
                 )
             )
-    elif shape.x_plate_def is not None and shape.y_plate_def is not None:
-        _line(
-            shape.x_plate_def,
-            shape.y_plate_def,
-            name="plate (schematic)",
-            color="#262626",
-            width=2,
-        )
 
     _line(x_top_d, shape.y_top_def, name="deformed top", color=_C0, width=2)
     _line(x_bot_d, shape.y_bottom_def, name="deformed bottom", color=_C1, width=2)
@@ -657,7 +647,7 @@ def _solve(model: ContactModel, *, toe_mode: str, Fx: float, Fy: float, phi_deg:
 
     Returns the contact solution and, with the passive toe spring, the coupled toe frame.
     """
-    op = model.operator
+    op = model.contact_operator
     warm_key = f"gui_warm_{id(model)}_{toe_mode}"
     warm: WarmStart | None = st.session_state.get(warm_key)
     F = np.array([float(Fx), float(Fy)])
@@ -742,7 +732,7 @@ def _out_of_plane_section(
         st.caption("Unavailable: fix the 2.5D settings in the sidebar.")
         return
     nu = model.contact_foam_poisson_ratio if model.contact_foam_poisson_ratio is not None else poisson_ratio
-    oop = compute_out_of_plane_stiffness(model.operator, sol, settings, poisson_ratio=nu)
+    oop = compute_out_of_plane_stiffness(model.contact_operator, sol, settings, poisson_ratio=nu)
     st.session_state["gui_oop_result"] = oop
     if oop.status == "disabled":
         st.caption("2.5D stiffness calculation disabled.")
@@ -1178,60 +1168,46 @@ def main() -> None:
 
     with st.sidebar:
         with st.expander("Plate display", expanded=False):
-            has_plate_model = bool(getattr(model, "has_plate_response", False))
-            if not has_plate_model:
-                st.caption(
-                    "Plate response unavailable (N/A). The rebuild did not attach "
-                    "plate_response — check FEM factorization / plate recovery."
-                )
-                show_plate = False
-                show_undeformed_plate = False
-                show_plate_nodes = False
-                show_plate_rotations = False
-                plate_color_key = "None"
-                samples_per_element = 16
-            else:
-                show_plate = st.checkbox("Show plate", value=True, key="gui_show_plate")
-                show_undeformed_plate = st.checkbox(
-                    "Show undeformed plate",
-                    value=False,
-                    key="gui_show_undeformed_plate_v2",
-                )
-                show_plate_nodes = st.checkbox(
-                    "Show plate nodes",
-                    value=False,
-                    key="gui_show_plate_nodes",
-                )
-                show_plate_rotations = st.checkbox(
-                    "Show plate rotations",
-                    value=False,
-                    key="gui_show_plate_rotations",
-                )
-                plate_color_key = st.selectbox(
-                    "Plate color by",
-                    list(PLATE_COLOR_OPTIONS),
-                    index=list(PLATE_COLOR_OPTIONS).index("Strain energy density"),
-                    key="gui_plate_color",
-                )
-                samples_per_element = st.slider(
-                    "Samples per plate element",
-                    min_value=4,
-                    max_value=32,
-                    value=16,
-                    step=1,
-                    key="gui_plate_samples",
-                )
+            show_plate = st.checkbox("Show plate", value=True, key="gui_show_plate")
+            show_undeformed_plate = st.checkbox(
+                "Show undeformed plate",
+                value=False,
+                key="gui_show_undeformed_plate_v2",
+            )
+            show_plate_nodes = st.checkbox(
+                "Show plate nodes",
+                value=False,
+                key="gui_show_plate_nodes",
+            )
+            show_plate_rotations = st.checkbox(
+                "Show plate rotations",
+                value=False,
+                key="gui_show_plate_rotations",
+            )
+            plate_color_key = st.selectbox(
+                "Plate color by",
+                list(PLATE_COLOR_OPTIONS),
+                index=list(PLATE_COLOR_OPTIONS).index("Strain energy density"),
+                key="gui_plate_color",
+            )
+            samples_per_element = st.slider(
+                "Samples per plate element",
+                min_value=4,
+                max_value=32,
+                value=16,
+                step=1,
+                key="gui_plate_samples",
+            )
         plate_color_quantity = PLATE_COLOR_OPTIONS[plate_color_key]
         foam_energy = st.checkbox(
             "Color foam by strain energy density",
-            value=bool(getattr(model, "render_section", None)),
-            disabled=not bool(getattr(model, "render_section", None)),
+            value=True,
             key="gui_foam_energy",
-            help="Per-element plane-strain energy density from the stored render influence (measured sole only).",
+            help="Per-element plane-strain energy density from the stored render influence.",
         )
 
         st.subheader("Model summary (SI)")
-        op = model.operator
+        op = model.contact_operator
         st.write(
             {
                 "L": float(model.L),
@@ -1243,10 +1219,9 @@ def main() -> None:
                 "contact_set_model": "continuous node-to-ground complementarity",
                 "tangential_contact_law": model.metadata.get("tangential_contact_law"),
                 "n_bottom_nodes": int(model.n_bottom_nodes),
-                "G symmetry error": float(op.G_symmetry_error),
-                "eig(G) min / max": [float(op.G_min_eigenvalue), float(op.G_max_eigenvalue)],
+                "G symmetry error": model.metadata.get("G_symmetry_error"),
+                "eig(G) min / max": [model.metadata.get("G_min_eigenvalue"), model.metadata.get("G_max_eigenvalue")],
                 "build_time_s": float(model.build_time_s),
-                "has_plate_response": bool(model.has_plate_response),
             }
         )
         gm = model.geometry_metadata
@@ -1395,9 +1370,7 @@ def main() -> None:
     _out_of_plane_section(model, sol, oop_settings, poisson_ratio=None if lower_nu is None else float(lower_nu))
 
     with st.expander("Plate results", expanded=False):
-        if not has_plate_model:
-            st.caption("Plate response unavailable (N/A).")
-        elif not show_plate or not shape.has_plate:
+        if not show_plate or not shape.has_plate:
             st.caption("Plate display disabled or no plate state for this selection (N/A).")
         else:
             summary = shape.plate_summary or {}
